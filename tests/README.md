@@ -55,3 +55,38 @@ extension and test environments.
 The PoC's main user-visible behavior (Insert Prompt populating the Gemini
 textbox) is validated separately by the headless Playwright check at the
 top of this repo. That check is not part of this Node-based suite.
+
+## End-to-end modal tests
+
+The Replace confirmation modal is a fragile piece of UI (CSS vs the
+`hidden` attribute is a common source of "modal that won't close" bugs).
+It has its own browser-driven test:
+
+```bash
+python3 tests/e2e_modal.py
+```
+
+Requires `playwright` (Python). Covers 6 scenarios:
+
+1. Empty state — modal invisible; importing does not open it.
+2. With a project loaded — clicking Replace opens the modal.
+3. Modal open — Cancel closes it and preserves the current project.
+4. Modal open — Replace closes it and the file picker, then loads the new
+   project on success.
+5. Invalid JSON — current project stays intact and modal stays closed.
+6. Reopen the popup after a replace — modal starts hidden.
+
+The test inspects `computedStyle.display` rather than just the `hidden`
+attribute, so a CSS regression that breaks the attribute's `display: none`
+behavior will fail the test (this is exactly the bug that motivated the
+test).
+
+Verifying the test catches the original bug:
+
+```bash
+cp src/popup/popup.css /tmp/popup.css.fixed
+git show v0.2.0:src/popup/popup.css > src/popup/popup.css
+python3 tests/e2e_modal.py    # expect 5/6 to fail
+cp /tmp/popup.css.fixed src/popup/popup.css
+python3 tests/e2e_modal.py    # expect 6/6 to pass
+```

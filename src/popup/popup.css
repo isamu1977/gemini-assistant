@@ -35,6 +35,15 @@
 
 * { box-sizing: border-box; }
 
+/*
+ * The HTML `hidden` attribute applies `display: none` via the UA stylesheet
+ * with specificity (0,1,0). Any author rule with the same specificity that
+ * sets `display: ...` (e.g. `.overlay { display: flex }`) wins by source
+ * order, so the element would never actually hide. Force the attribute to
+ * always take precedence.
+ */
+[hidden] { display: none !important; }
+
 body {
   width: 380px;
   margin: 0;

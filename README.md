@@ -165,6 +165,28 @@ nothing about projects, status, or storage. The protocol between the
 popup and the content script is documented in
 `src/content/content.js`.
 
+## Bug history
+
+### v0.2.1 — Replace modal stuck open
+
+**Symptom:** the "Replace current project?" modal was visible the whole
+time, including after the first import and after Cancel/Replace.
+
+**Root cause:** `src/popup/popup.css` declared `.overlay { display: flex }`.
+The HTML attribute `hidden` applies `display: none` via the UA
+stylesheet, but the author rule had the same specificity and came later
+in source order, so it won. The modal was rendered at all times.
+
+**Fix:** a single generic rule at the top of `popup.css`:
+
+```css
+[hidden] { display: none !important; }
+```
+
+**Regression guard:** `tests/e2e_modal.py` inspects `getComputedStyle(...).display`
+on every scenario, so a regression that re-introduces the same problem
+will fail the test (verified — 5/6 scenarios fail when the rule is removed).
+
 ---
 
 ## Files
