@@ -1,0 +1,31 @@
+# OS / Editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node / npm (not used yet, but cheap insurance)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Build artifacts (not used yet)
+dist/
+build/
+.cache/
+.turbo/
+
+# Python (for the validation script)
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local Playwright traces
+.playwright-mcp/
+/tmp/gemini-assistant-validate*.png
+
+# Local extension validation profiles
+/tmp/gemini-assistant-ext-profile/

@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini Assistant",
+  "version": "0.0.1",
+  "description": "PoC: assists the image generation workflow by populating the Gemini prompt field on gemini.google.com. No automatic submission.",
+  "minimum_chrome_version": "116",
+
+  "host_permissions": [
+    "https://gemini.google.com/*"
+  ],
+
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "Gemini Assistant",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/*"],
+      "js": ["src/dom/geminiDomAdapter.js", "src/content/content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}
