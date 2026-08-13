@@ -1,9 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.0.1",
-  "description": "PoC: assists the image generation workflow by populating the Gemini prompt field on gemini.google.com. No automatic submission.",
+  "version": "0.2.0",
+  "description": "Generic project and task manager for gemini.google.com. Loads a Project JSON, lets you navigate tasks, edit prompts locally, and insert them into Gemini without auto-submit.",
   "minimum_chrome_version": "116",
+
+  "permissions": ["storage"],
 
   "host_permissions": [
     "https://gemini.google.com/*"

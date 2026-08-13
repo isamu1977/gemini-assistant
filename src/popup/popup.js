@@ -1,29 +1,73 @@
 /*
  * popup.js
  *
- * UI side of the PoC.
- * - Reads the active tab.
- * - If it is on gemini.google.com, the popup enables the Insert button.
- * - The button sends a message to the content script, which (via the DOM
- *   adapter) places the text into Gemini's prompt field.
- * - We never auto-submit.
+ * UI orchestration for the Project & Task Manager.
+ *
+ * Responsibilities:
+ *   - Load/save state from chrome.storage.local.
+ *   - Import Project JSON, validate, confirm replacement.
+ *   - Render the loaded project: task selector, title, status, prompt.
+ *   - Handle Previous/Next navigation and per-task prompt edits.
+ *   - Hand off "Insert Prompt" to the content script (which calls the
+ *     DOM adapter). Never auto-submits.
+ *
+ * The popup knows nothing about Gemini's DOM. The DOM adapter lives in
+ * src/dom/geminiDomAdapter.js and is invoked only via the content script
+ * message bridge.
  */
 
 (function () {
   "use strict";
 
+  const projectLib = globalThis.GeminiAssistantProject;
+  const storageLib = globalThis.GeminiAssistantStorage;
+
+  if (!projectLib || !storageLib) {
+    document.body.textContent =
+      "Internal error: GeminiAssistantProject / Storage libs not loaded.";
+    return;
+  }
+
+  // ----- DOM refs ---------------------------------------------------------
+
   const $ = (sel) => document.querySelector(sel);
 
+  const emptyStateEl = $("#empty-state");
+  const loadedStateEl = $("#loaded-state");
+  const importBtn = $("#import-btn");
+  const reimportBtn = $("#reimport-btn");
+  const fileInput = $("#file-input");
+
+  const projectNameEl = $("#project-name");
+  const projectDescEl = $("#project-desc");
+  const taskSelectEl = $("#task-select");
+  const statusSelectEl = $("#status-select");
+  const taskTitleEl = $("#task-title");
+  const taskCurrentEls = [$("#task-current"), $("#task-current-2")];
+  const taskTotalEls = [$("#task-total"), $("#task-total-2")];
   const promptEl = $("#prompt");
   const insertBtn = $("#insert-btn");
-  const clearBtn = $("#clear-btn");
+  const prevBtn = $("#prev-btn");
+  const nextBtn = $("#next-btn");
+  const progressSummaryEl = $("#progress-summary");
+
   const statusEl = $("#status");
   const statusText = $("#status-text");
   const selfTestEl = $("#selftest");
 
-  const GEMINI_HOST = "gemini.google.com";
+  const overlayEl = $("#confirm-overlay");
+  const confirmCancelBtn = $("#confirm-cancel");
+  const confirmOkBtn = $("#confirm-ok");
 
-  function setStatus(state, text) {
+  // ----- state (in-memory) ------------------------------------------------
+
+  let state = storageLib.emptyState();
+  // last user-typed prompt (debounced-saved)
+  let promptSaveTimer = null;
+
+  // ----- helpers ----------------------------------------------------------
+
+  function setStatusLine(state, text) {
     statusEl.dataset.state = state;
     statusText.textContent = text;
   }
@@ -49,6 +93,8 @@
     });
   }
 
+  const GEMINI_HOST = "gemini.google.com";
+
   function isGeminiUrl(url) {
     try {
       const u = new URL(url);
@@ -70,65 +116,252 @@
     });
   }
 
-  async function checkTab() {
-    let tab;
+  function currentTaskIndex() {
+    if (!state.source) return -1;
+    return projectLib.indexOfTaskId(state.source.project, state.currentTaskId);
+  }
+
+  function currentTask() {
+    const idx = currentTaskIndex();
+    if (idx === -1) return null;
+    return state.source.project.tasks[idx];
+  }
+
+  function currentMutable() {
+    const id = state.currentTaskId;
+    if (!id || !state.tasks) return null;
+    return state.tasks[id] ?? null;
+  }
+
+  // ----- render -----------------------------------------------------------
+
+  function render() {
+    if (!state.source) {
+      emptyStateEl.hidden = false;
+      loadedStateEl.hidden = true;
+      setStatusLine("idle", "Idle");
+      return;
+    }
+    emptyStateEl.hidden = true;
+    loadedStateEl.hidden = false;
+
+    const proj = state.source.project;
+
+    projectNameEl.textContent = proj.project.name;
+    if (proj.project.description) {
+      projectDescEl.textContent = proj.project.description;
+      projectDescEl.hidden = false;
+    } else {
+      projectDescEl.hidden = true;
+    }
+
+    // Task selector
+    taskSelectEl.innerHTML = "";
+    for (const t of proj.tasks) {
+      const opt = document.createElement("option");
+      opt.value = t.id;
+      opt.textContent = t.title ? `${t.id} — ${t.title}` : t.id;
+      taskSelectEl.appendChild(opt);
+    }
+    taskSelectEl.value = state.currentTaskId ?? proj.tasks[0].id;
+
+    // Status selector
+    statusSelectEl.innerHTML = "";
+    for (const s of projectLib.STATUSES) {
+      const opt = document.createElement("option");
+      opt.value = s;
+      opt.textContent = s.charAt(0).toUpperCase() + s.slice(1);
+      statusSelectEl.appendChild(opt);
+    }
+    const cur = currentMutable();
+    if (cur) statusSelectEl.value = cur.status;
+
+    // Title + counters
+    const idx = currentTaskIndex();
+    const total = proj.tasks.length;
+    const curNum = idx >= 0 ? idx + 1 : 1;
+    for (const el of taskCurrentEls) el.textContent = String(curNum);
+    for (const el of taskTotalEls) el.textContent = String(total);
+    taskTitleEl.textContent = currentTask()?.title ?? "";
+
+    // Prompt
+    promptEl.value = cur?.prompt ?? currentTask()?.prompt ?? "";
+
+    // Prev/Next enable state
+    prevBtn.disabled = projectLib.prevTaskId(proj, state.currentTaskId) === null;
+    nextBtn.disabled = projectLib.nextTaskId(proj, state.currentTaskId) === null;
+
+    // Progress
+    renderProgress();
+  }
+
+  function renderProgress() {
+    if (!state.tasks) {
+      progressSummaryEl.textContent = "";
+      return;
+    }
+    const s = projectLib.summarizeProgress(state.tasks);
+    const cells = [
+      ["Pending", s.pending],
+      ["Generated", s.generated],
+      ["Approved", s.approved],
+      ["Redo", s.redo],
+    ];
+    progressSummaryEl.innerHTML = cells
+      .map(
+        ([label, value]) =>
+          `<div class="progress-cell"><span class="label">${label}</span><span class="value">${value}</span></div>`,
+      )
+      .join("");
+  }
+
+  // ----- persist ----------------------------------------------------------
+
+  async function persistState() {
     try {
-      tab = await getActiveTab();
+      await storageLib.saveState(state);
     } catch (e) {
-      setStatus("error", e.message);
-      insertBtn.disabled = true;
-      return;
-    }
-
-    if (!isGeminiUrl(tab.url)) {
-      setStatus("idle", `Open ${GEMINI_HOST} to use this extension`);
-      insertBtn.disabled = true;
-      return;
-    }
-
-      // Ping the content script to confirm it's alive.
-      try {
-        const res = await sendMessage(tab.id, { type: "GEMINI_ASSISTANT_PING" });
-      if (res && res.ok) {
-        setStatus("ok", "Ready");
-        selfTestEl.textContent = JSON.stringify(res.selfTest, null, 2);
-      } else {
-        setStatus("error", "Content script not responding");
-      }
-      insertBtn.disabled = !res?.ok;
-    } catch (e) {
-      // Most common cause: the user is on gemini.google.com but the
-      // content script didn't load (e.g. extension was just installed
-      // and the page was already open).
-      setStatus(
-        "error",
-        "Reload the Gemini tab to activate the extension."
-      );
-      insertBtn.disabled = true;
+      setStatusLine("error", `Failed to save state: ${e.message}`);
     }
   }
+
+  // Debounced save when user types in the prompt textarea.
+  function schedulePromptSave() {
+    if (promptSaveTimer) clearTimeout(promptSaveTimer);
+    promptSaveTimer = setTimeout(async () => {
+      const id = state.currentTaskId;
+      if (!id || !state.tasks) return;
+      state.tasks[id].prompt = promptEl.value;
+      await persistState();
+      setStatusLine("info", "Prompt edit saved locally.");
+    }, 350);
+  }
+
+  // ----- import -----------------------------------------------------------
+
+  function showConfirmModal() {
+    overlayEl.hidden = false;
+    confirmOkBtn.focus();
+  }
+
+  function hideConfirmModal() {
+    overlayEl.hidden = true;
+  }
+
+  function triggerImport() {
+    if (state.source) {
+      // Confirm before replacing.
+      showConfirmModal();
+      return;
+    }
+    fileInput.click();
+  }
+
+  function readFileAsText(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+      reader.onload = () => resolve(String(reader.result ?? ""));
+      reader.readAsText(file);
+    });
+  }
+
+  async function handleFileSelected(file) {
+    if (!file) return;
+    let raw;
+    try {
+      raw = await readFileAsText(file);
+    } catch (e) {
+      setStatusLine("error", `Cannot read file: ${e.message}`);
+      return;
+    }
+    const parsed = projectLib.parseProjectJson(raw);
+    if (!parsed.ok) {
+      setStatusLine(
+        "error",
+        `Invalid Project JSON${parsed.field ? ` (${parsed.field})` : ""}: ${parsed.error}`,
+      );
+      return;
+    }
+
+    // Replace state. Existing progress is intentionally discarded.
+    const project = projectLib.normalizeImportedProject(parsed.project);
+    const newState = {
+      schemaVersion: storageLib.STORAGE_SCHEMA_VERSION,
+      source: { project, importedAt: Date.now() },
+      tasks: projectLib.buildInitialTaskState(project),
+      currentTaskId: projectLib.firstTaskId(project),
+    };
+    state = newState;
+    await persistState();
+    setStatusLine("ok", `Imported "${project.project.name}" (${project.tasks.length} tasks).`);
+    render();
+    refreshSelfTest();
+  }
+
+  // ----- navigation -------------------------------------------------------
+
+  async function navigate(taskId) {
+    if (!taskId) return;
+    // Persist current prompt before leaving.
+    const cur = currentMutable();
+    if (cur) {
+      cur.prompt = promptEl.value;
+    }
+    state.currentTaskId = taskId;
+    await persistState();
+    render();
+  }
+
+  function goNext() {
+    const id = projectLib.nextTaskId(state.source.project, state.currentTaskId);
+    if (id) navigate(id);
+  }
+
+  function goPrev() {
+    const id = projectLib.prevTaskId(state.source.project, state.currentTaskId);
+    if (id) navigate(id);
+  }
+
+  async function onChangeStatus(newStatus) {
+    if (!projectLib.isValidStatus(newStatus)) return;
+    const cur = currentMutable();
+    if (!cur) return;
+    cur.status = newStatus;
+    await persistState();
+    renderProgress();
+    setStatusLine("info", `Status: ${newStatus}.`);
+  }
+
+  // ----- insert prompt ----------------------------------------------------
 
   async function onInsert() {
     const text = promptEl.value;
     if (!text.trim()) {
-      setStatus("error", "Prompt is empty");
+      setStatusLine("error", "Prompt is empty.");
       return;
+    }
+    // Persist the latest edit before sending.
+    const cur = currentMutable();
+    if (cur && cur.prompt !== text) {
+      cur.prompt = text;
+      await persistState();
     }
 
     setBusy(true);
-    setStatus("idle", "Inserting…");
+    setStatusLine("info", "Inserting…");
 
     let tab;
     try {
       tab = await getActiveTab();
     } catch (e) {
-      setStatus("error", e.message);
+      setStatusLine("error", e.message);
       setBusy(false);
       return;
     }
 
     if (!isGeminiUrl(tab.url)) {
-      setStatus("error", `Not on ${GEMINI_HOST}`);
+      setStatusLine("error", `Open ${GEMINI_HOST} to insert the prompt.`);
       setBusy(false);
       return;
     }
@@ -140,24 +373,22 @@
       });
       if (result && result.ok) {
         const method = result.method ? ` (${result.method})` : "";
-        setStatus(
+        setStatusLine(
           "ok",
-          `Inserted (${result.length} chars${method}). Review and send.`,
+          `Inserted (${result.length} chars${method}). Review and send manually.`,
         );
-        // No auto-close: keep the popup open so the user can tweak and re-send.
-        // Refresh the self-test so the panel shows the new state.
-        await refreshSelfTest();
+        refreshSelfTest();
       } else {
         const diag = result?.diagnostics
-          ? `\n\nDiagnostics: ${result.diagnostics.candidateCount ?? 0} candidates, ` +
+          ? ` Diagnostics: ${result.diagnostics.candidateCount ?? 0} candidates, ` +
             `${result.diagnostics.qlEditorCount ?? 0} .ql-editor, ` +
-            `${result.diagnostics.textboxRoleCount ?? 0} [role=textbox]`
+            `${result.diagnostics.textboxRoleCount ?? 0} [role=textbox].`
           : "";
-        setStatus("error", (result?.error ?? "Insertion failed") + diag);
-        await refreshSelfTest();
+        setStatusLine("error", (result?.error ?? "Insertion failed.") + diag);
+        refreshSelfTest();
       }
     } catch (e) {
-      setStatus("error", e.message);
+      setStatusLine("error", e.message);
     } finally {
       setBusy(false);
     }
@@ -172,26 +403,81 @@
         selfTestEl.textContent = JSON.stringify(res.selfTest, null, 2);
       }
     } catch {
-      // Non-fatal: just don't update the panel.
+      // non-fatal
     }
   }
 
-  function onClear() {
-    promptEl.value = "";
-    promptEl.focus();
-    setStatus("ok", "Ready");
-  }
+  // ----- wiring -----------------------------------------------------------
 
-  insertBtn.addEventListener("click", onInsert);
-  clearBtn.addEventListener("click", onClear);
+  importBtn.addEventListener("click", triggerImport);
+  reimportBtn.addEventListener("click", triggerImport);
 
-  // Cmd/Ctrl + Enter to insert
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files && fileInput.files[0];
+    // reset so the same file can be selected again later
+    fileInput.value = "";
+    await handleFileSelected(file);
+  });
+
+  confirmCancelBtn.addEventListener("click", hideConfirmModal);
+  confirmOkBtn.addEventListener("click", () => {
+    hideConfirmModal();
+    fileInput.click();
+  });
+
+  taskSelectEl.addEventListener("change", (e) => navigate(e.target.value));
+  statusSelectEl.addEventListener("change", (e) => onChangeStatus(e.target.value));
+
+  prevBtn.addEventListener("click", goPrev);
+  nextBtn.addEventListener("click", goNext);
+
+  promptEl.addEventListener("input", () => {
+    // Update prev/next enabled state — none of these depend on prompt.
+    // Just schedule a debounced save.
+    schedulePromptSave();
+  });
+
+  // Cmd/Ctrl + Enter inserts; arrows navigate
   promptEl.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       onInsert();
+    } else if (e.altKey && e.key === "ArrowRight") {
+      e.preventDefault();
+      goNext();
+    } else if (e.altKey && e.key === "ArrowLeft") {
+      e.preventDefault();
+      goPrev();
     }
   });
 
-  checkTab();
+  // ----- init -------------------------------------------------------------
+
+  async function init() {
+    try {
+      state = await storageLib.loadState();
+    } catch (e) {
+      setStatusLine("error", `Failed to load state: ${e.message}`);
+      state = storageLib.emptyState();
+    }
+    render();
+
+    // Always try to populate the self-test panel for the dev/DevTools audience.
+    refreshSelfTest();
+
+    // Friendly hint if user is not on Gemini.
+    try {
+      const tab = await getActiveTab();
+      if (!isGeminiUrl(tab.url)) {
+        setStatusLine(
+          "info",
+          `Open ${GEMINI_HOST} to use Insert Prompt. Project manager works everywhere.`,
+        );
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  init();
 })();

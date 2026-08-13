@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "id": "example-project-001",
+    "name": "Example Project",
+    "description": "Smoke-test project for the Gemini Assistant PoC. Five tasks, each with a clearly identifiable prompt."
+  },
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "Task 1 test prompt",
+      "prompt": "Task 1 test prompt — please respond with the number one."
+    },
+    {
+      "id": "task-002",
+      "title": "Task 2 test prompt",
+      "prompt": "Task 2 test prompt — please respond with the number two."
+    },
+    {
+      "id": "task-003",
+      "title": "Task 3 test prompt",
+      "prompt": "Task 3 test prompt — please respond with the number three."
+    },
+    {
+      "id": "task-004",
+      "title": "Task 4 test prompt",
+      "prompt": "Task 4 test prompt — please respond with the number four."
+    },
+    {
+      "id": "task-005",
+      "title": "Task 5 test prompt",
+      "prompt": "Task 5 test prompt — please respond with the number five."
+    }
+  ]
+}

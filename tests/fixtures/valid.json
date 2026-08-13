@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "project": {
+    "id": "fixture-valid",
+    "name": "Valid fixture"
+  },
+  "tasks": [
+    { "id": "a", "title": "A", "prompt": "prompt A" },
+    { "id": "b", "prompt": "prompt B" }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "project": { "id": "x", "name": "x" },
+  "tasks": [
+    { "id": "dup", "prompt": "one" },
+    { "id": "dup", "prompt": "two" }
+  ]
+}
