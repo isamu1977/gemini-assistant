@@ -167,6 +167,36 @@ popup and the content script is documented in
 
 ## Bug history
 
+### v0.2.3 — Insert Prompt appends instead of replacing
+
+**Symptom:** clicking Insert Prompt twice (or for two different tasks) left
+both prompts concatenated in the Gemini editor. Dangerous because the
+user could accidentally send multiple tasks' prompts at once.
+
+**Root cause:** the `execCommand('insertText')` fallback in
+`src/dom/geminiDomAdapter.js` was setting up a Range with
+`range.collapse(false)`, which positions the caret at the **end** of
+the existing content. `execCommand('insertText')` then inserts at the
+caret — so each call appended. The primary Quill path (`setText('') +
+insertText(0, text)`) was correct, but the fallback wasn't.
+
+**Fix:** drop the `range.collapse(false)` call. Without it, the
+range covers the entire editor content; `execCommand('insertText')`
+then **replaces** the selection.
+
+Also:
+
+- Validate the result: if `lengthAfter` is much greater than
+  `lengthRequested`, return `{ ok: false, error: "...likely appended
+  instead of replaced" }` so a future regression is loud.
+- Add `lengthBefore` / `lengthAfter` to the result for debugging.
+- Add `contentLength` to the self-test diagnostic.
+
+**Regression guard:** `tests/e2e_replace.py` exercises both the Quill
+path and the fallback path against the live `gemini.google.com` editor
+in Portuguese. Scenario 7a asserts the buggy pattern still appends;
+scenario 7b asserts the fix replaces.
+
 ### v0.2.2 — Insert Prompt button does nothing
 
 **Symptom:** clicking *Insert Prompt* had no effect, no log, no status

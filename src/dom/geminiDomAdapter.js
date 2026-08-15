@@ -313,15 +313,20 @@
     }
 
     const quill = locateQuill(textbox);
+    const lengthBefore = textboxTextLength(textbox);
+
     if (!quill) {
-      // Fallback: focus + Selection API + execCommand('insertText').
-      // This bypasses TrustedHTML CSP because it does not write innerHTML.
-      warn("Quill instance not found; using execCommand fallback");
+      // Fallback: select ALL existing content, then execCommand('insertText').
+      // - Selecting all (NOT collapsing) is what makes this a REPLACE, not an
+      //   append. execCommand('insertText') replaces the current selection.
+      // - We do not write innerHTML (CSP/TrustedHTML would block it).
+      warn("Quill instance not found; using execCommand fallback (replace)");
       try {
         textbox.focus();
         const range = document.createRange();
         range.selectNodeContents(textbox);
-        range.collapse(false);
+        // Deliberately do NOT collapse the range. Collapsing would move
+        // the caret to one end and make insertText append.
         const sel = window.getSelection();
         sel.removeAllRanges();
         sel.addRange(range);
@@ -330,8 +335,28 @@
           return { ok: false, error: "execCommand('insertText') returned false" };
         }
         textbox.focus();
-        log("inserted via execCommand fallback");
-        return { ok: true, length: text.length, method: "execCommand" };
+        const lengthAfter = textboxTextLength(textbox);
+        log(
+          `inserted via execCommand fallback (length=${text.length}, ` +
+            `before=${lengthBefore}, after=${lengthAfter})`,
+        );
+        const verified = verifyReplacement(text, lengthAfter);
+        if (!verified.ok) {
+          return {
+            ok: false,
+            error: verified.error,
+            method: "execCommand",
+            lengthBefore,
+            lengthAfter,
+          };
+        }
+        return {
+          ok: true,
+          length: text.length,
+          method: "execCommand",
+          lengthBefore,
+          lengthAfter,
+        };
       } catch (e) {
         return { ok: false, error: `fallback failed: ${e.message}` };
       }
@@ -342,12 +367,68 @@
       quill.setText("");
       quill.insertText(0, text);
       quill.focus();
-      log(`inserted via Quill API (length=${text.length})`);
-      return { ok: true, length: text.length, method: "quill" };
+      const lengthAfter = quill.getText().replace(/\n$/, "").length;
+      log(
+        `inserted via Quill API (length=${text.length}, ` +
+          `before=${lengthBefore}, after=${lengthAfter})`,
+      );
+      // Note: getText() appends a trailing '\n' to every block; Quill's
+      // internal length matches our input char-for-char for non-newline
+      // content. We compare the un-trailing-newline length.
+      const verified = verifyReplacement(text, lengthAfter);
+      if (!verified.ok) {
+        return {
+          ok: false,
+          error: verified.error,
+          method: "quill",
+          lengthBefore,
+          lengthAfter,
+        };
+      }
+      return {
+        ok: true,
+        length: text.length,
+        method: "quill",
+        lengthBefore,
+        lengthAfter,
+      };
     } catch (e) {
       warn("Quill API insertion failed:", e.message);
       return { ok: false, error: `Quill insertion failed: ${e.message}` };
     }
+  }
+
+  /**
+   * Returns the user-visible text length of a textbox element, ignoring
+   * Quill's trailing newline and any <br> placeholders.
+   */
+  function textboxTextLength(textbox) {
+    const txt = (textbox.innerText || "").replace(/\u00a0/g, " ");
+    return txt.length;
+  }
+
+  /**
+   * Compare what we asked to insert vs what's currently in the textbox.
+   * We do not log content. We return an error if the lengths diverge
+   * in a way that signals appending (lengthAfter >> lengthRequested).
+   */
+  function verifyReplacement(requested, lengthAfter) {
+    const requestedLen = requested.length;
+    if (lengthAfter === requestedLen) return { ok: true };
+    // Allow tiny slack (e.g. trailing newlines Quill adds).
+    if (lengthAfter > requestedLen && lengthAfter - requestedLen <= 2) {
+      return { ok: true };
+    }
+    if (lengthAfter > requestedLen) {
+      return {
+        ok: false,
+        error: `replacement mismatch: editor has ${lengthAfter} chars, expected ${requestedLen} (likely appended instead of replaced)`,
+      };
+    }
+    return {
+      ok: false,
+      error: `replacement mismatch: editor has ${lengthAfter} chars, expected ${requestedLen}`,
+    };
   }
 
   /**
@@ -366,6 +447,7 @@
 
     const selected = findPromptInput();
     const selectedQuill = selected ? locateQuill(selected) : null;
+    const contentLength = selected ? textboxTextLength(selected) : null;
 
     return {
       url: location.href,
@@ -380,6 +462,7 @@
       sendButtonFound: !!findSendButton(),
       selected: selected ? describeEl(selected) : null,
       selectedQuillAttached: !!selectedQuill,
+      contentLength,
       candidates: scored,
     };
   }

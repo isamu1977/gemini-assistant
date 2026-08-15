@@ -117,6 +117,34 @@ then asserts:
 This test catches the v0.2.2 regression where the button's click
 listener was missing (reverting the listener makes 8/9 scenarios fail).
 
+## End-to-end Insert Replace tests
+
+The Insert Prompt must REPLACE the existing content, never append. This
+test runs the same DOM ops the adapter runs (Quill API and execCommand
+fallback) against the live `gemini.google.com` editor:
+
+```bash
+python3 tests/e2e_replace.py
+```
+
+Scenarios:
+
+1. Empty editor accepts the prompt (Quill path).
+2. Editor with text: REPLACED, not appended.
+3. Three consecutive inserts — only the last remains.
+4. Multiline preserved as separate paragraphs.
+5. Unicode (Japanese, accented Portuguese) preserved.
+6. Large prompt (~5000 chars) handled, then replaced by a small one.
+7. **Fallback path comparison** — explicit verification that the bug
+   (`range.collapse(false)`) appends and the fix (no collapse) replaces.
+8. Empty string insertion clears the editor (adapter allows; popup blocks).
+9. Send button remains in DOM and untouched.
+
+Scenario 7 proves the bug exists and the fix works against the real
+Gemini editor. The integration popup → adapter is covered by
+`tests/e2e_insert.py` (which asserts the payload reaches the content
+script contract correctly).
+
 ## Manual regression for the Gemini DOM adapter
 
 The PoC's main user-visible behavior (Insert Prompt populating the Gemini
