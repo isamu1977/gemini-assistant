@@ -67,6 +67,16 @@
 
   // ----- helpers ----------------------------------------------------------
 
+  const POPUP_LOG_PREFIX = "[Gemini Assistant:popup]";
+
+  function popupLog(...args) {
+    console.log(POPUP_LOG_PREFIX, ...args);
+  }
+
+  function popupWarn(...args) {
+    console.warn(POPUP_LOG_PREFIX, ...args);
+  }
+
   function setStatusLine(state, text) {
     statusEl.dataset.state = state;
     statusText.textContent = text;
@@ -337,8 +347,11 @@
 
   async function onInsert() {
     const text = promptEl.value;
+    popupLog(`Insert Prompt clicked (length=${text.length})`);
+
     if (!text.trim()) {
-      setStatusLine("error", "Prompt is empty.");
+      popupWarn("insert aborted: empty prompt");
+      setStatusLine("error", "Failed to insert prompt: prompt is empty.");
       return;
     }
     // Persist the latest edit before sending.
@@ -349,19 +362,21 @@
     }
 
     setBusy(true);
-    setStatusLine("info", "Inserting…");
+    setStatusLine("info", "Inserting into Gemini…");
 
     let tab;
     try {
       tab = await getActiveTab();
     } catch (e) {
-      setStatusLine("error", e.message);
+      popupWarn("insert aborted: no active tab", e.message);
+      setStatusLine("error", `Failed to insert prompt: ${e.message}`);
       setBusy(false);
       return;
     }
 
     if (!isGeminiUrl(tab.url)) {
-      setStatusLine("error", `Open ${GEMINI_HOST} to insert the prompt.`);
+      popupWarn("insert aborted: not on gemini.google.com", tab.url);
+      setStatusLine("error", `Failed to insert prompt: open ${GEMINI_HOST}.`);
       setBusy(false);
       return;
     }
@@ -372,23 +387,27 @@
         text,
       });
       if (result && result.ok) {
-        const method = result.method ? ` (${result.method})` : "";
+        const method = result.method ? ` via ${result.method}` : "";
+        popupLog(`inserted ${result.length} chars${method}`);
         setStatusLine(
           "ok",
-          `Inserted (${result.length} chars${method}). Review and send manually.`,
+          `Prompt inserted into Gemini (${result.length} chars${method}). Review and send.`,
         );
         refreshSelfTest();
       } else {
         const diag = result?.diagnostics
-          ? ` Diagnostics: ${result.diagnostics.candidateCount ?? 0} candidates, ` +
+          ? ` [${result.diagnostics.candidateCount ?? 0} candidates, ` +
             `${result.diagnostics.qlEditorCount ?? 0} .ql-editor, ` +
-            `${result.diagnostics.textboxRoleCount ?? 0} [role=textbox].`
+            `${result.diagnostics.textboxRoleCount ?? 0} [role=textbox]]`
           : "";
-        setStatusLine("error", (result?.error ?? "Insertion failed.") + diag);
+        const reason = result?.error ?? "unknown error";
+        popupWarn(`insert failed: ${reason}${diag}`);
+        setStatusLine("error", `Failed to insert prompt: ${reason}${diag}`);
         refreshSelfTest();
       }
     } catch (e) {
-      setStatusLine("error", e.message);
+      popupWarn("insert failed (exception)", e.message);
+      setStatusLine("error", `Failed to insert prompt: ${e.message}`);
     } finally {
       setBusy(false);
     }
@@ -430,6 +449,8 @@
 
   prevBtn.addEventListener("click", goPrev);
   nextBtn.addEventListener("click", goNext);
+
+  insertBtn.addEventListener("click", onInsert);
 
   promptEl.addEventListener("input", () => {
     // Update prev/next enabled state — none of these depend on prompt.

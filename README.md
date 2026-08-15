@@ -167,6 +167,30 @@ popup and the content script is documented in
 
 ## Bug history
 
+### v0.2.2 — Insert Prompt button does nothing
+
+**Symptom:** clicking *Insert Prompt* had no effect, no log, no status
+update. `Cmd/Ctrl+Enter` still worked, and the self-test still found
+the Gemini editor correctly.
+
+**Root cause:** when the popup was rewritten for the Project & Task
+Manager, the line `insertBtn.addEventListener("click", onInsert)` was
+dropped. The button existed but no handler was attached to it.
+
+**Fix:** added the missing listener. Also tightened the status messages:
+
+- success → `Prompt inserted into Gemini (N chars via <method>). Review and send.`
+- failure → `Failed to insert prompt: <reason>`.
+
+No more lingering "Prompt edit saved locally." after an Insert attempt.
+
+Added minimal instrumentation logs at `[Gemini Assistant:popup]` so future
+breakages in the popup→content→adapter chain are easier to localize.
+
+**Regression guard:** `tests/e2e_insert.py` mocks `chrome.tabs.sendMessage`,
+clicks the button, and asserts the captured message matches the popup's
+current textarea. Reverting the listener makes 8/9 scenarios fail.
+
 ### v0.2.1 — Replace modal stuck open
 
 **Symptom:** the "Replace current project?" modal was visible the whole

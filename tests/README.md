@@ -90,3 +90,35 @@ python3 tests/e2e_modal.py    # expect 5/6 to fail
 cp /tmp/popup.css.fixed src/popup/popup.css
 python3 tests/e2e_modal.py    # expect 6/6 to pass
 ```
+
+## End-to-end Insert Prompt tests
+
+The Insert Prompt flow runs through `popup → chrome.tabs.sendMessage →
+content script → DOM adapter`. The popup ↔ content-script contract is
+locked by the Insert button + payload test:
+
+```bash
+python3 tests/e2e_insert.py
+```
+
+The mock wraps `chrome.tabs.sendMessage` to capture the messages the
+popup would send and to stub the content script's response. The test
+then asserts:
+
+- Click on the Insert button fires `chrome.tabs.sendMessage` exactly once
+  with the correct `{ type: "GEMINI_ASSISTANT_INSERT_PROMPT", text }`.
+- The payload `text` matches the prompt visible in the textarea at the
+  moment of the click — original, locally edited, multiline, or large.
+- The popup status reflects success (`Prompt inserted into Gemini …`)
+  or failure (`Failed to insert prompt: <reason>`).
+- After `Next` / `Previous` / popup reload, the payload tracks the
+  current task.
+
+This test catches the v0.2.2 regression where the button's click
+listener was missing (reverting the listener makes 8/9 scenarios fail).
+
+## Manual regression for the Gemini DOM adapter
+
+The PoC's main user-visible behavior (Insert Prompt populating the Gemini
+textbox) is validated separately by the headless Playwright check at the
+top of this repo. That check is not part of this Node-based suite.
