@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.2.0",
-  "description": "Generic project and task manager for gemini.google.com. Loads a Project JSON, lets you navigate tasks, edit prompts locally, and insert them into Gemini without auto-submit.",
+  "version": "0.5.0",
+  "description": "Generic project and task manager for gemini.google.com. Loads a Project JSON, binds a project folder, and attaches individual reference images to Gemini's composer (single-file PoC). Insert Prompt and Attach are both manual — never auto-sends.",
   "minimum_chrome_version": "116",
 
   "permissions": ["storage"],

@@ -1,17 +1,19 @@
 # Gemini Assistant
 
 Chrome extension (Manifest V3) that turns `gemini.google.com` into a
-scriptable target for any workflow driven by a **Project JSON** and a
-**list of tasks**. The first use case is image generation, but the core
-is generic.
+scriptable target for any workflow driven by a **Project JSON**, a
+**bound project folder**, and a **list of tasks**. The first use case is
+image generation, but the core is generic.
 
-It does not call the Gemini API. It does not click Send. It does not
-upload images. It only:
+It does not call the Gemini API. It does not click Send. It only:
 
 1. Loads a Project JSON from disk.
-2. Shows the tasks, status, and editable prompts.
-3. Lets you navigate, edit, mark status, and insert the current task's
+2. Binds a local folder so reference paths resolve to real files.
+3. Shows the tasks, status, and editable prompts.
+4. Lets you navigate, edit, mark status, insert the current task's
    prompt into Gemini's textbox for manual review and sending.
+5. **v0.5 PoC:** attach one resolved reference image at a time to
+   Gemini's composer — manually, one per click, no batch.
 
 The Gemini DOM is touched only by `src/dom/geminiDomAdapter.js` — one
 file, isolated, language-independent (validated in EN and PT).
@@ -27,17 +29,19 @@ file, isolated, language-independent (validated in EN and PT).
 ├── src/
 │   ├── popup/                    popup.html, popup.css, popup.js
 │   ├── content/
-│   │   └── content.js            bridges popup <-> adapter
+│   │   └── content.js            bridges popup <-> adapter (Insert + Attach)
 │   ├── dom/
 │   │   └── geminiDomAdapter.js   ⭐ only file that touches Gemini's DOM
 │   └── lib/
 │       ├── project.js            Project JSON schema + validation
-│       └── storage.js            chrome.storage.local wrapper
+│       ├── storage.js            chrome.storage.local wrapper
+│       └── assets.js             asset resolver (resolved / missing / unsupported)
 ├── examples/
 │   └── example-project.json      5 tasks for manual testing
 └── tests/
     ├── run.js                    pure-Node test runner
     ├── fixtures/                 validation fixtures
+    ├── e2e_*.py                  Playwright DOM tests (mocked)
     └── README.md                 test docs
 ```
 
@@ -156,18 +160,31 @@ card in `chrome://extensions/`, then hard-reload any Gemini tab
 1. Open `https://gemini.google.com` and sign in.
 2. Click the **Gemini Assistant** icon.
 3. Click **Import Project** and pick a JSON file (try
-   `examples/example-project.json`).
-4. Use the dropdown or **Prev / Next** to navigate.
-5. Edit the prompt if needed — saves locally with a 350 ms debounce.
-6. Click **Insert Prompt** — the text lands in Gemini's prompt field.
+   `examples/example-project-v2.json` for the attachment flow).
+4. Click **Bind…** under *Project folder* and pick the folder that
+   contains your reference images. The popup shows the folder name and
+   resolves each reference against it. **Binding is session-only** —
+   closing and reopening the popup requires re-binding.
+5. Use the dropdown or **Prev / Next** to navigate.
+6. For each reference row you see one of:
+   - `✓` resolved (PNG/JPEG/WEBP found) → **Attach** enabled
+   - `✕` missing (file not found in the bound folder) → disabled
+   - `✕` unsupported (file found but wrong type, e.g. GIF/PDF) → disabled
+   - `·` unbound (no folder bound) → disabled
+7. Click **Attach** on a resolved row — the image is attached to the
+   current Gemini composer. **Review and send manually.**
+8. Edit the prompt if needed — saves locally with a 350 ms debounce.
+9. Click **Insert Prompt** — the text lands in Gemini's prompt field.
    Send manually.
-7. Change the task's status via the dropdown.
+10. Change the task's status via the dropdown.
 
 If you re-import while a project is already loaded, a confirmation modal
-appears. Re-importing **discards the current progress and prompt edits**.
+appears. Re-importing **discards the current progress, prompt edits, and
+the bound folder**.
 
-State persists across popup close and Chrome restart. Closing and
-reopening the extension at any time resumes where you left off.
+Project state (project, tasks, edits, status) persists across popup
+close and Chrome restart. Folder binding and the resolved-file cache
+are session-only.
 
 ### Keyboard shortcuts (in the prompt textarea)
 
@@ -224,6 +241,69 @@ popup and the content script is documented in
 `src/content/content.js`.
 
 ## Bug history
+
+### v0.5.0 — Single reference attachment (PoC)
+
+A resolved reference image can now be attached to Gemini's composer one
+at a time:
+
+1. The popup binds a local folder via `window.showDirectoryPicker`
+   (File System Access API, Chrome/Edge 86+).
+2. Each task's references resolve against the bound folder. The
+   resolver distinguishes three states:
+   - `resolved` — file found and is a PNG/JPEG/WEBP we support
+   - `missing` — file not found in the bound folder
+   - `unsupported` — file found but type not supported
+   - `unbound` — no folder bound yet
+3. The popup shows a per-row **Attach** button, enabled only when the
+   ref is `resolved`.
+4. Clicking **Attach** sends `{ type: "GEMINI_ASSISTANT_ATTACH", file }`
+   to the content script. The `File` crosses the `chrome.tabs.sendMessage`
+   boundary by structured clone — no base64, no `chrome.storage`, no
+   byte duplication outside the ephemeral message envelope.
+5. The DOM adapter finds Gemini's `<input type="file">`, builds a
+   `DataTransfer` with the file, sets `input.files`, and dispatches
+   `input` + `change` events.
+6. The adapter watches the upload area via a one-shot
+   `MutationObserver` (no polling) for up to 4 s, looking for a new
+   thumbnail (`<img src="data:...">` or attachment-class hints).
+7. Success → `Attached <name> (<size>) to Gemini. Review and send.`
+   Failure → `Attachment failed: <reason>` (loud and structured).
+
+**What v0.5 deliberately does NOT do:**
+
+- Attach All (multi-reference batch)
+- automatic Prepare Task / Send
+- queueing, retry, rename, download
+- image processing (no resize, no compression, no conversion — the
+  original bytes go through)
+- formats beyond PNG / JPEG / WEBP (everything else is `unsupported`)
+- persisting attachment state to disk (it is ephemeral — a reload of
+  Gemini, a Send, or removing the chip manually invalidates it; the
+  popup will not pretend otherwise)
+
+**Folder binding limitation:** the `FileSystemDirectoryHandle` cannot
+be reliably rehydrated across a popup close without re-prompting the
+user. v0.5 keeps the handle in popup memory only. Closing the popup and
+reopening it requires re-binding. This is documented in the UI.
+
+**File transfer note:** `File` is a `Blob`, and `Blob` is
+structured-cloneable. `chrome.tabs.sendMessage` uses structured clone
+in MV3 (since Chrome 80+), so the File travels as a single pass-by-value
+object. There is no byte copying into `chrome.storage.local`. The
+bytes only exist once on the heap: in the popup's `File` reference,
+then in the content script's `File` reference, then handed to the
+adapter. The mock in `tests/e2e_attach.py` confirms this end-to-end
+by reading `msg.file.name` / `.size` / `.type` after the message has
+crossed the boundary.
+
+### v0.4.0 — Project folder binding + asset resolver (inline with v0.5)
+
+Folder binding and asset resolution shipped inline with v0.5 because
+the attachment PoC depends on them. The resolver (`src/lib/assets.js`)
+is pure and unit-tested (15 new cases in `tests/run.js`). The popup
+adds a per-row state badge and an Attach button gated on
+`state === "resolved"`.
 
 ### v0.3.0 — Asset catalog + per-task references
 
@@ -323,15 +403,18 @@ will fail the test (verified — 5/6 scenarios fail when the rule is removed).
 
 | File | Purpose |
 |---|---|
-| `manifest.json` | Manifest V3 declaration. Adds `storage` permission in v0.2. |
+| `manifest.json` | Manifest V3 declaration. |
 | `src/popup/popup.html` | Popup markup (empty + loaded states). |
 | `src/popup/popup.css` | Popup styling. |
-| `src/popup/popup.js` | UI orchestration: storage, navigation, status, Insert Prompt. |
-| `src/content/content.js` | Message bridge between popup and adapter. |
-| `src/dom/geminiDomAdapter.js` | Sole point of contact with Gemini's DOM. |
+| `src/popup/popup.js` | UI orchestration: storage, navigation, status, Insert Prompt, Attach, folder binding. |
+| `src/content/content.js` | Message bridge between popup and adapter (Insert + Attach). |
+| `src/dom/geminiDomAdapter.js` | Sole point of contact with Gemini's DOM (Insert + Attach). |
 | `src/lib/project.js` | Project JSON schema, validation, helpers. |
 | `src/lib/storage.js` | `chrome.storage.local` wrapper with in-memory shim. |
+| `src/lib/assets.js` | Asset resolver: resolved / missing / unsupported / unbound. |
 | `examples/example-project.json` | 5-task example for manual testing. |
-| `tests/run.js` | Pure-Node test runner. |
+| `examples/example-project-v2.json` | 5-task v2 example with 5 assets. |
+| `tests/run.js` | Pure-Node test runner (60 tests). |
 | `tests/fixtures/*.json` | Validation fixtures. |
+| `tests/e2e_*.py` | Playwright DOM tests (mocked). |
 | `icons/icon*.png` | Toolbar and store icons. |

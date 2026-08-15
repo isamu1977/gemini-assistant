@@ -10,8 +10,8 @@ The runner exits `0` on success, `1` on failure.
 
 ## What's covered
 
-### `src/lib/project.js` (17 tests)
-- Parse valid JSON
+### `src/lib/project.js` (26 tests)
+- Parse valid JSON (v1 + v2)
 - Reject invalid syntax (`Invalid JSON: ...`)
 - Reject unsupported `schemaVersion`
 - Reject empty tasks array
@@ -25,6 +25,10 @@ The runner exits `0` on success, `1` on failure.
 - `normalizeImportedProject` fills missing title with empty string
 - `STATUSES` is frozen and in spec order
 - Shipped `examples/example-project.json` parses and contains the expected markers
+- v2 schema: assets, references, unknown-asset rejection, duplicate-ref
+  rejection, invalid type/label/file rejection, references-not-array
+  rejection, resolveReferences in declared order, shared asset across
+  tasks, countAssets, ASSET_TYPES frozen, normalize preserves assets
 
 ### `src/lib/storage.js` (7 tests)
 - `emptyState` has expected shape
@@ -34,6 +38,21 @@ The runner exits `0` on success, `1` on failure.
 - `coerceState` rejects unknown schemaVersion
 - `coerceState` accepts `null` / `undefined` / garbage
 - `clearAll` wipes the store
+
+### `src/lib/assets.js` (15 tests)
+- `normalizeRelativePath` strips `./`, `/`, backslashes; rejects `..`
+  segments; collapses `refs/./a.png` to `refs/a.png`
+- `isSupportedImage` matches by extension when MIME is missing
+- `isSupportedImage` trusts MIME when present (image/png/jpeg/webp only)
+- `SUPPORTED_IMAGE_MIME` and `SUPPORTED_IMAGE_EXTENSIONS` are frozen
+- `fileExtension` returns lowercase extension or empty
+- `deriveState` splits missing / unsupported / resolved
+- `resolveAssetFile` returns missing when no folder / invalid path / NotFoundError
+- `resolveAssetFile` returns resolved with File for PNG / JPEG / WEBP
+- `resolveAssetFile` returns unsupported for GIF
+- `resolveReferences` walks a nested path (`refs/chars/yuki.png`)
+- `resolveReferences` isolates failures (one missing ≠ others fail)
+- `filesFromResolved` extracts File objects in order
 
 ## Adding tests
 
@@ -49,6 +68,38 @@ The runner resets the storage shim between tests via
 `storageLib._resetForTests()`. The shim activates only when `chrome.*`
 APIs are not present (e.g., in Node), so the same code runs in both
 extension and test environments.
+
+## End-to-end Single Reference Attachment tests
+
+The v0.5 attach flow runs through `popup → chrome.tabs.sendMessage →
+content script → DOM adapter`. The popup ↔ content-script contract is
+locked by:
+
+```bash
+python3 tests/e2e_attach.py
+```
+
+The mock wraps `chrome.tabs.sendMessage` to capture the messages and
+stub the adapter response (success or failure). The test then asserts:
+
+- No folder bound → every Attach button disabled, refs show `·`.
+- Bound but missing → refs show `✕`, Attach disabled.
+- Bound and resolved → refs show `✓`, Attach enabled.
+- Unsupported extension (`.gif`) → `✕`, Attach disabled.
+- Click on Attach fires `GEMINI_ASSISTANT_ATTACH` with `{ file: File,
+  fileName, fileType, fileSize }`. The mock confirms the File
+  survives the boundary (reads `name/size/type` after structured clone).
+- Adapter returns `ok: true` → status `Attached <name> (<size>) to Gemini.
+  Review and send.`
+- Adapter returns `ok: false` → status `Attachment failed: <reason>`.
+- Insert Prompt remains unaffected by Attach (no cross-contamination
+  between the two flows).
+
+The actual DOM work — finding the file input, building a DataTransfer,
+firing events, observing for an attachment thumbnail — is exercised
+by `e2e_replace.py`-style tests against the live Gemini page (see
+"Manual regression" below). `e2e_attach.py` is the contract test; the
+real DOM is verified by you in Chrome.
 
 ## Manual regression for the Gemini DOM adapter
 

@@ -6,14 +6,27 @@
  * Responsibilities:
  *   - Load/save state from chrome.storage.local.
  *   - Import Project JSON, validate, confirm replacement.
+ *   - Bind a project folder via the File System Access API
+ *     (window.showDirectoryPicker) so asset paths can be resolved.
+ *   - Resolve each task's references against the bound folder; render
+ *     state (resolved / missing / unsupported / unbound) and a per-row
+ *     Attach button when the asset is an image we support.
  *   - Render the loaded project: task selector, title, status, prompt.
  *   - Handle Previous/Next navigation and per-task prompt edits.
  *   - Hand off "Insert Prompt" to the content script (which calls the
  *     DOM adapter). Never auto-submits.
+ *   - Hand off "Attach" (single reference) to the content script the
+ *     same way. Never auto-sends.
  *
  * The popup knows nothing about Gemini's DOM. The DOM adapter lives in
  * src/dom/geminiDomAdapter.js and is invoked only via the content script
  * message bridge.
+ *
+ * Folder binding is kept in-memory for the PoC: the
+ * FileSystemDirectoryHandle cannot be reliably rehydrated across a popup
+ * close without re-prompting the user. Closing and reopening the popup
+ * requires re-binding. This is documented in the UI ("bound to this
+ * session").
  */
 
 (function () {
@@ -21,10 +34,11 @@
 
   const projectLib = globalThis.GeminiAssistantProject;
   const storageLib = globalThis.GeminiAssistantStorage;
+  const assetsLib = globalThis.GeminiAssistantAssets;
 
-  if (!projectLib || !storageLib) {
+  if (!projectLib || !storageLib || !assetsLib) {
     document.body.textContent =
-      "Internal error: GeminiAssistantProject / Storage libs not loaded.";
+      "Internal error: GeminiAssistant libs not loaded.";
     return;
   }
 
@@ -56,6 +70,10 @@
   const referencesListEl = $("#references-list");
   const referencesEmptyEl = $("#references-empty");
 
+  const folderBindingEl = $("#folder-binding");
+  const folderBindingNameEl = $("#folder-binding-name");
+  const folderBindBtn = $("#folder-bind-btn");
+
   const assetsPanelEl = $("#assets-panel");
   const assetsListEl = $("#assets-list");
   const assetsSummaryEl = $("#assets-summary");
@@ -73,6 +91,13 @@
   let state = storageLib.emptyState();
   // last user-typed prompt (debounced-saved)
   let promptSaveTimer = null;
+  // Folder binding is intentionally session-only (see file header).
+  let folderHandle = null;
+  let folderName = "";
+  // Cache of resolved refs for the current task. Shape:
+  //   [{ id, label, type, file, state, fileObj|null, error|null, fileName?, fileType?, fileSize? }]
+  // fileObj is dropped on task navigation to avoid holding bytes.
+  let resolvedRefsCache = null;
 
   // ----- helpers ----------------------------------------------------------
 
@@ -152,6 +177,110 @@
     return state.tasks[id] ?? null;
   }
 
+  function isShowDirectoryPickerSupported() {
+    return typeof window !== "undefined" && typeof window.showDirectoryPicker === "function";
+  }
+
+  // ----- folder binding ---------------------------------------------------
+
+  async function bindFolder() {
+    if (!isShowDirectoryPickerSupported()) {
+      setStatusLine(
+        "error",
+        "Folder binding requires Chrome/Edge 86+ with the File System Access API. Update your browser.",
+      );
+      return;
+    }
+    let handle;
+    try {
+      handle = await window.showDirectoryPicker({ mode: "read" });
+    } catch (e) {
+      // User cancelled or denied. Not an error — just leave state as-is.
+      if (e && (e.name === "AbortError" || e.code === 20)) {
+        popupLog("folder bind: cancelled by user");
+        return;
+      }
+      popupWarn("folder bind failed", e?.message ?? String(e));
+      setStatusLine("error", `Failed to bind folder: ${e?.message ?? "unknown error"}`);
+      return;
+    }
+    folderHandle = handle;
+    folderName = handle?.name ?? "Bound folder";
+    setStatusLine("ok", `Bound to folder: ${folderName}.`);
+    renderFolderBinding();
+    // Re-resolve references for the current task, if any.
+    if (currentTask()) {
+      await resolveCurrentRefs();
+      renderReferences();
+    }
+  }
+
+  function unbindFolder() {
+    folderHandle = null;
+    folderName = "";
+    // Drop any cached File objects to free memory.
+    resolvedRefsCache = null;
+    setStatusLine("info", "Folder unbound.");
+    renderFolderBinding();
+    if (currentTask()) {
+      renderReferences();
+    }
+  }
+
+  function renderFolderBinding() {
+    if (folderHandle) {
+      folderBindingNameEl.textContent = folderName || "Bound";
+      folderBindingNameEl.classList.remove("unbound");
+      folderBindBtn.textContent = "Rebind";
+      folderBindBtn.title = "Re-bind this project to a folder";
+    } else {
+      folderBindingNameEl.textContent = "Not bound (session only)";
+      folderBindingNameEl.classList.add("unbound");
+      folderBindBtn.textContent = "Bind…";
+      folderBindBtn.title = "Bind a local folder so reference paths resolve";
+    }
+  }
+
+  // ----- asset resolution -------------------------------------------------
+
+  async function resolveCurrentRefs() {
+    resolvedRefsCache = null;
+    const task = currentTask();
+    if (!task) return;
+    const rawRefs = projectLib.resolveReferences(state.source.project, task.id);
+    if (rawRefs.length === 0) return;
+    if (!folderHandle) {
+      // No folder bound: cache as "unbound" placeholders so the UI can
+      // still render them with a disabled Attach button.
+      resolvedRefsCache = rawRefs.map((r) => ({
+        id: r.id,
+        label: r.label,
+        type: r.type,
+        file: r.file,
+        state: "unbound",
+        fileObj: null,
+        error: "Bind the project folder to enable Attach",
+      }));
+      return;
+    }
+    const results = await assetsLib.resolveReferences(folderHandle, rawRefs);
+    resolvedRefsCache = results.map((res, i) => {
+      const r = rawRefs[i];
+      return {
+        id: r.id,
+        label: r.label,
+        type: r.type,
+        file: r.file,
+        state: res.state,
+        fileObj: res.file ?? null,
+        error: res.error ?? null,
+        fileName: res.fileName ?? null,
+        fileType: res.fileType ?? null,
+        fileSize: res.fileSize ?? null,
+      };
+    });
+  }
+
   // ----- render -----------------------------------------------------------
 
   function render() {
@@ -183,6 +312,9 @@
       projectStatsEl.hidden = true;
     }
 
+    // Folder binding (always rendered when a project is loaded).
+    renderFolderBinding();
+
     // Task selector
     taskSelectEl.innerHTML = "";
     for (const t of proj.tasks) {
@@ -212,7 +344,8 @@
     for (const el of taskTotalEls) el.textContent = String(total);
     taskTitleEl.textContent = currentTask()?.title ?? "";
 
-    // References (current task)
+    // References (current task) — render from cache when available,
+    // otherwise from raw metadata with "unbound" state.
     renderReferences();
 
     // Asset catalog (collapsible)
@@ -258,20 +391,34 @@
       referencesEmptyEl.hidden = false;
       return;
     }
-    const refs = projectLib.resolveReferences(proj, cur.id);
-    if (refs.length === 0) {
+    const rawRefs = projectLib.resolveReferences(proj, cur.id);
+    if (rawRefs.length === 0) {
       referencesCountEl.textContent = "0";
       referencesEmptyEl.hidden = false;
       return;
     }
-    referencesCountEl.textContent = String(refs.length);
+    referencesCountEl.textContent = String(rawRefs.length);
     referencesEmptyEl.hidden = true;
-    for (const r of refs) {
+
+    for (let i = 0; i < rawRefs.length; i++) {
+      const r = rawRefs[i];
+      const cached = resolvedRefsCache && resolvedRefsCache[i];
       const li = document.createElement("li");
       li.className = "ref-item";
+
+      const stateIcon = document.createElement("span");
+      stateIcon.className = "ref-state";
+      const stateName = (cached && cached.state) || (folderHandle ? "missing" : "unbound");
+      stateIcon.classList.add(`state-${stateName}`);
+      stateIcon.textContent = stateGlyph(stateName);
+      stateIcon.title = stateTitle(stateName, cached);
+      li.appendChild(stateIcon);
+
       const badge = document.createElement("span");
       badge.className = `ref-badge type-${r.type}`;
       badge.textContent = r.type;
+      li.appendChild(badge);
+
       const meta = document.createElement("div");
       meta.className = "ref-meta";
       const label = document.createElement("div");
@@ -283,14 +430,91 @@
       file.title = r.file;
       meta.appendChild(label);
       meta.appendChild(file);
+      li.appendChild(meta);
+
       const idEl = document.createElement("span");
       idEl.className = "ref-id";
       idEl.textContent = r.id;
-      li.appendChild(badge);
-      li.appendChild(meta);
       li.appendChild(idEl);
+
+      // Attach button — present on every row, enabled only when resolved
+      // (i.e. supported image we can find in the bound folder).
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ref-attach ghost";
+      btn.textContent = "Attach";
+      btn.dataset.refIndex = String(i);
+      const canAttach = stateName === "resolved" && !!(cached && cached.fileObj);
+      btn.disabled = !canAttach;
+      if (!canAttach) {
+        btn.title = attachDisabledReason(stateName, cached);
+      } else {
+        btn.title = `Attach ${cached.fileName} (${formatSize(cached.fileSize)}) to Gemini`;
+      }
+      btn.addEventListener("click", () => onAttach(i, btn));
+      li.appendChild(btn);
+
+      // Optional one-line note for non-resolved rows so the user knows why.
+      if (stateName !== "resolved") {
+        const note = document.createElement("div");
+        note.className = "ref-state-note";
+        note.textContent = attachDisabledReason(stateName, cached);
+        li.appendChild(note);
+      }
+
       referencesListEl.appendChild(li);
     }
+  }
+
+  function stateGlyph(state) {
+    switch (state) {
+      case "resolved": return "✓";
+      case "missing": return "✕";
+      case "unsupported": return "✕";
+      case "unbound": return "·";
+      default: return "?";
+    }
+  }
+
+  function stateTitle(state, cached) {
+    switch (state) {
+      case "resolved":
+        return `Resolved (${cached?.fileName ?? "image"})`;
+      case "missing":
+        return `File not found at ${cached?.file ?? "(unknown path)"}`;
+      case "unsupported":
+        return `Unsupported file type (${cached?.fileType || "unknown"})`;
+      case "unbound":
+        return "Bind the project folder to enable attachment";
+      default:
+        return "Unknown state";
+    }
+  }
+
+  function attachDisabledReason(state, cached) {
+    switch (state) {
+      case "resolved":
+        return "";
+      case "missing":
+        return cached?.error
+          ? `Missing — ${cached.error}`
+          : "File not found in bound folder";
+      case "unsupported":
+        return cached?.error
+          ? `Unsupported — ${cached.error}`
+          : "Unsupported file type";
+      case "unbound":
+        return "Bind the project folder to enable attachment";
+      default:
+        return "Unavailable";
+    }
+  }
+
+  function formatSize(bytes) {
+    if (typeof bytes !== "number" || bytes < 0) return "?";
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   function renderAssetCatalog() {
@@ -411,8 +635,12 @@
       currentTaskId: projectLib.firstTaskId(project),
     };
     state = newState;
+    // Re-importing discards the bound folder too — it may not match.
+    folderHandle = null;
+    folderName = "";
+    resolvedRefsCache = null;
     await persistState();
-    setStatusLine("ok", `Imported "${project.project.name}" (${project.tasks.length} tasks).`);
+    setStatusLine("ok", `Imported "${project.project.name}" (${project.tasks.length} tasks). Bind a folder to attach images.`);
     render();
     refreshSelfTest();
   }
@@ -428,6 +656,8 @@
     }
     state.currentTaskId = taskId;
     await persistState();
+    // Resolve the new task's refs (if a folder is bound) and re-render.
+    await resolveCurrentRefs();
     render();
   }
 
@@ -521,6 +751,92 @@
     }
   }
 
+  // ----- attach reference -------------------------------------------------
+
+  async function onAttach(refIndex, btn) {
+    const cached = resolvedRefsCache && resolvedRefsCache[refIndex];
+    if (!cached) {
+      setStatusLine("error", "Attachment failed: reference not resolved.");
+      return;
+    }
+    if (cached.state !== "resolved" || !cached.fileObj) {
+      setStatusLine("error", `Attachment failed: ${attachDisabledReason(cached.state, cached) || "asset unavailable"}.`);
+      return;
+    }
+    const file = cached.fileObj;
+
+    popupLog(`Attach clicked for ref #${refIndex} (${cached.id} → ${file.name}, ${file.size} B, ${file.type})`);
+
+    // Verify we still have a live File handle. (Theoretically the user
+    // could have revoked permission between resolve and attach.)
+    if (!folderHandle) {
+      setStatusLine("error", "Attachment failed: Asset file is no longer available. Rebind the project folder.");
+      return;
+    }
+
+    let tab;
+    try {
+      tab = await getActiveTab();
+    } catch (e) {
+      popupWarn("attach aborted: no active tab", e.message);
+      setStatusLine("error", `Attachment failed: ${e.message}`);
+      return;
+    }
+    if (!isGeminiUrl(tab.url)) {
+      popupWarn("attach aborted: not on gemini.google.com", tab.url);
+      setStatusLine("error", `Attachment failed: open ${GEMINI_HOST} to attach images.`);
+      return;
+    }
+
+    btn.disabled = true;
+    const originalLabel = btn.textContent;
+    btn.textContent = "Attaching…";
+    setStatusLine("info", `Attaching ${file.name}…`);
+
+    try {
+      // The File is structured-cloneable (it is a Blob), so it survives
+      // the chrome.tabs.sendMessage boundary without base64 conversion.
+      // We do NOT persist bytes anywhere; the message envelope is
+      // ephemeral and goes from popup -> content script -> adapter.
+      const result = await sendMessage(tab.id, {
+        type: "GEMINI_ASSISTANT_ATTACH",
+        file,
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size,
+      });
+      if (result && result.ok) {
+        popupLog(`attached ${result.fileName ?? file.name} via ${result.method ?? "?"}`);
+        setStatusLine(
+          "ok",
+          `Attached ${result.fileName ?? file.name} (${formatSize(result.fileSize ?? file.size)}) to Gemini. Review and send.`,
+        );
+      } else {
+        const reason = result?.error ?? "unknown error";
+        const diag = result?.diagnostics
+          ? ` [inputs=${result.diagnostics.fileInputCount ?? 0}, ` +
+            `accept=${result.diagnostics.fileInputAccept ?? "?"}, ` +
+            `multiple=${result.diagnostics.fileInputMultiple ?? "?"}]`
+          : "";
+        popupWarn(`attach failed: ${reason}${diag}`);
+        setStatusLine("error", `Attachment failed: ${reason}${diag}`);
+      }
+    } catch (e) {
+      popupWarn("attach failed (exception)", e?.message ?? String(e));
+      setStatusLine("error", `Attachment failed: ${e?.message ?? "unknown error"}`);
+    } finally {
+      // Re-enable the button only if the ref is still attachable.
+      const stillResolved =
+        resolvedRefsCache &&
+        resolvedRefsCache[refIndex] &&
+        resolvedRefsCache[refIndex].state === "resolved" &&
+        resolvedRefsCache[refIndex].fileObj;
+      btn.disabled = !stillResolved;
+      btn.textContent = originalLabel;
+      refreshSelfTest();
+    }
+  }
+
   async function refreshSelfTest() {
     try {
       const tab = await getActiveTab();
@@ -545,6 +861,8 @@
     fileInput.value = "";
     await handleFileSelected(file);
   });
+
+  folderBindBtn.addEventListener("click", bindFolder);
 
   confirmCancelBtn.addEventListener("click", hideConfirmModal);
   confirmOkBtn.addEventListener("click", () => {
@@ -600,7 +918,7 @@
       if (!isGeminiUrl(tab.url)) {
         setStatusLine(
           "info",
-          `Open ${GEMINI_HOST} to use Insert Prompt. Project manager works everywhere.`,
+          `Open ${GEMINI_HOST} to use Insert / Attach. Project manager works everywhere.`,
         );
       }
     } catch {

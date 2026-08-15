@@ -267,6 +267,264 @@
     };
   }
 
+  // ---- Attachment (file upload) support --------------------------------
+
+  // Gemini's upload affordance is a hidden <input type="file"> rendered
+  // when the user clicks the "+" button near the composer. We don't try
+  // to drive the "+" button itself — we go straight for the input. If
+  // the input is not currently in the DOM, we return a structured error
+  // so the caller can show a meaningful message.
+  //
+  // The success signal we look for is language-independent and
+  // structural: an attachment thumbnail appears in the same input area
+  // as the prompt textbox. We watch that subtree with a one-shot
+  // MutationObserver for up to ATTACH_TIMEOUT_MS.
+
+  const ATTACH_TIMEOUT_MS = 4000;
+  const ATTACH_OBSERVER_QUIESCE_MS = 120;
+
+  // CSS / attribute hints that indicate an attachment thumbnail in the
+  // upload chip area. Locale-independent.
+  const ATTACHMENT_HINT_SELECTORS = [
+    'img[src^="data:"]',
+    'img[src^="blob:"]',
+    '[class*="thumbnail" i]',
+    '[class*="uploaded" i]',
+    '[class*="attachment" i]',
+  ];
+
+  function findFileInputs() {
+    return Array.from(document.querySelectorAll('input[type="file"]'));
+  }
+
+  function findPromptInputArea() {
+    // The upload area lives near the prompt composer. Walk up from the
+    // first file input (or, failing that, the send button) and pick the
+    // nearest container that also contains the composer textbox.
+    const tb = findPromptInput();
+    if (!tb) return null;
+    let p = tb.parentElement;
+    while (p && p !== document.body) {
+      // Prefer containers that look like the input area.
+      if (
+        p.tagName?.toLowerCase() === "input-area-v2" ||
+        p.tagName?.toLowerCase() === "input-container" ||
+        p.querySelector?.("input-area-v2, input-container")
+      ) {
+        return p;
+      }
+      p = p.parentElement;
+    }
+    // Fallback: walk up to the closest fieldset that contains an input.
+    p = tb.parentElement;
+    while (p && p !== document.body) {
+      if (p.tagName?.toLowerCase() === "fieldset" || p.tagName?.toLowerCase() === "form") {
+        return p;
+      }
+      p = p.parentElement;
+    }
+    return tb.parentElement || document.body;
+  }
+
+  function countAttachmentHints(root) {
+    if (!root) return 0;
+    let total = 0;
+    for (const sel of ATTACHMENT_HINT_SELECTORS) {
+      total += root.querySelectorAll(sel).length;
+    }
+    return total;
+  }
+
+  function attachmentDiagnostics() {
+    const inputs = findFileInputs();
+    const area = findPromptInputArea();
+    return {
+      attachmentButtonFound: !!document.querySelector(
+        '[aria-label*="upload" i], [aria-label*="file" i], button[aria-haspopup]',
+      ),
+      fileInputCount: inputs.length,
+      fileInputAccept: inputs[0]?.accept ?? null,
+      fileInputMultiple: inputs[0]?.multiple ?? false,
+      attachmentContainerFound: !!area,
+      currentAttachmentHints: countAttachmentHints(area),
+    };
+  }
+
+  /**
+   * Public API: attach a single image File to the Gemini composer.
+   * Does NOT submit. Does NOT remove existing attachments.
+   *
+   * @param {File} file
+   * @returns {Promise<{ ok, error?, method?, fileName?, fileType?, fileSize?, diagnostics?, observedAttachment? }>}
+   */
+  async function attachFileToGemini(file) {
+    if (!file || typeof file !== "object" || typeof file.name !== "string") {
+      return { ok: false, error: "No file provided" };
+    }
+
+    log(`attachFileToGemini called (name=${file.name}, size=${file.size}, type=${file.type})`);
+
+    // Pre-flight diagnostics so failures are loud.
+    const diag = attachmentDiagnostics();
+    const inputs = findFileInputs();
+    if (inputs.length === 0) {
+      return {
+        ok: false,
+        error: "Gemini upload control not found.",
+        diagnostics: diag,
+      };
+    }
+    const input = inputs[0];
+
+    // Build a DataTransfer carrying the file. DataTransfer is supported
+    // in all evergreen browsers and is the closest analog to "the user
+    // picked this file from a system dialog".
+    let dataTransfer;
+    try {
+      dataTransfer = new DataTransfer();
+      dataTransfer.items.add(file);
+    } catch (e) {
+      return {
+        ok: false,
+        error: `DataTransfer construction failed: ${e?.message ?? "unknown"}`,
+        diagnostics: diag,
+      };
+    }
+
+    // Set the file list on the input. Some browsers (and some Gemini
+    // versions) listen for either 'input' or 'change' or both.
+    try {
+      Object.defineProperty(input, "files", {
+        value: dataTransfer.files,
+        configurable: true,
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        error: `Could not assign file list to input: ${e?.message ?? "unknown"}`,
+        diagnostics: diag,
+      };
+    }
+
+    // Snapshot the upload area BEFORE firing events so we can detect
+    // new attachments reliably (we already had a count; we want the
+    // delta).
+    const area = findPromptInputArea();
+    const hintsBefore = countAttachmentHints(area);
+    log(`attachment hints before fire: ${hintsBefore}`);
+
+    // Fire the events Gemini's frontend is listening for. We dispatch on
+    // the input directly; this matches what the native file picker does.
+    const inputEvent = new Event("input", { bubbles: true });
+    const changeEvent = new Event("change", { bubbles: true });
+    input.dispatchEvent(inputEvent);
+    input.dispatchEvent(changeEvent);
+
+    // Observe the upload area for a new attachment chip / thumbnail.
+    const ok = await waitForAttachment(area, hintsBefore);
+    if (!ok.ok) {
+      return {
+        ok: false,
+        error: ok.error,
+        method: "datatransfer",
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size,
+        diagnostics: { ...diag, currentAttachmentHints: countAttachmentHints(area) },
+      };
+    }
+
+    log(
+      `attach success: name=${file.name} size=${file.size} ` +
+        `hintsBefore=${hintsBefore} hintsAfter=${ok.hintsAfter}`,
+    );
+    return {
+      ok: true,
+      method: "datatransfer",
+      fileName: file.name,
+      fileType: file.type,
+      fileSize: file.size,
+      observedAttachment: ok.observed,
+      diagnostics: { ...diag, currentAttachmentHints: ok.hintsAfter },
+    };
+  }
+
+  /**
+   * Wait up to ATTACH_TIMEOUT_MS for an attachment chip to appear.
+   * Resolves with { ok: true, hintsAfter, observed } on success or
+   * { ok: false, error } on timeout.
+   *
+   * Uses one MutationObserver (no polling). Disconnects on first
+   * detection OR on timeout — no leftover observers.
+   */
+  function waitForAttachment(area, hintsBefore) {
+    return new Promise((resolve) => {
+      if (!area) {
+        resolve({ ok: false, error: "Gemini did not acknowledge the attachment." });
+        return;
+      }
+      let resolved = false;
+      const finalize = (result) => {
+        if (resolved) return;
+        resolved = true;
+        try {
+          observer.disconnect();
+        } catch (_) {
+          // ignore
+        }
+        resolve(result);
+      };
+
+      const observer = new MutationObserver(() => {
+        const hintsAfter = countAttachmentHints(area);
+        if (hintsAfter > hintsBefore) {
+          // Found a new attachment indicator. Capture the first one as
+          // observed evidence (no content is logged, just structure).
+          const observed = describeNewAttachment(area, hintsBefore);
+          finalize({ ok: true, hintsAfter, observed });
+        }
+      });
+      observer.observe(area, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["src", "class"],
+      });
+
+      setTimeout(() => {
+        const hintsAfter = countAttachmentHints(area);
+        if (hintsAfter > hintsBefore) {
+          const observed = describeNewAttachment(area, hintsBefore);
+          finalize({ ok: true, hintsAfter, observed });
+          return;
+        }
+        finalize({
+          ok: false,
+          error: "Gemini did not acknowledge the attachment within the timeout.",
+        });
+      }, ATTACH_TIMEOUT_MS);
+    });
+  }
+
+  function describeNewAttachment(area, hintsBefore) {
+    // Return a tiny structural snapshot of the first new attachment-ish
+    // element. No file content, no base64. Just enough to debug.
+    for (const sel of ATTACHMENT_HINT_SELECTORS) {
+      const nodes = area.querySelectorAll(sel);
+      if (nodes.length > hintsBefore) {
+        const node = nodes[nodes.length - 1] || nodes[0];
+        return {
+          selector: sel,
+          tag: node?.tagName?.toLowerCase() ?? null,
+          srcPrefix:
+            node?.getAttribute?.("src")?.slice(0, 12) ?? null,
+          classHint: (node?.className || "").toString().slice(0, 80),
+        };
+      }
+    }
+    return null;
+  }
+
   /**
    * Locate the Quill instance for a given textbox element.
    */
@@ -448,6 +706,7 @@
     const selected = findPromptInput();
     const selectedQuill = selected ? locateQuill(selected) : null;
     const contentLength = selected ? textboxTextLength(selected) : null;
+    const attachment = attachmentDiagnostics();
 
     return {
       url: location.href,
@@ -463,14 +722,17 @@
       selected: selected ? describeEl(selected) : null,
       selectedQuillAttached: !!selectedQuill,
       contentLength,
+      attachment,
       candidates: scored,
     };
   }
 
   globalThis.RedSunDomAdapter = Object.freeze({
     insertPromptIntoGemini,
+    attachFileToGemini,
     selfTest,
     describeEl,
+    attachmentDiagnostics,
     CANDIDATE_SELECTORS,
     SCORE_BREAKDOWN: Object.freeze({
       insideRichTextarea: 50,

@@ -16,6 +16,7 @@ const path = require("path");
 const ROOT = path.resolve(__dirname, "..");
 const projectLib = require(path.join(ROOT, "src/lib/project.js"));
 const storageLib = require(path.join(ROOT, "src/lib/storage.js"));
+const assetsLib = require(path.join(ROOT, "src/lib/assets.js"));
 
 const FIXTURES = path.join(__dirname, "fixtures");
 
@@ -507,6 +508,265 @@ test("storage: clearAll wipes the store", async () => {
   await storageLib.clearAll();
   const after = await storageLib.loadState();
   assertEqual(after.source, null);
+});
+
+// ----- assets.js tests ---------------------------------------------------
+
+console.log(`\n${C.bold}assets.js${C.reset}`);
+
+test("assets: normalizeRelativePath strips leading ./, /, and backslashes", () => {
+  assertEqual(assetsLib.normalizeRelativePath("refs/a.png"), "refs/a.png");
+  assertEqual(assetsLib.normalizeRelativePath("./refs/a.png"), "refs/a.png");
+  assertEqual(assetsLib.normalizeRelativePath("/refs/a.png"), "refs/a.png");
+  assertEqual(assetsLib.normalizeRelativePath("refs\\a.png"), "refs/a.png");
+  assertEqual(assetsLib.normalizeRelativePath("  ./refs/a.png  "), "refs/a.png");
+});
+
+test("assets: normalizeRelativePath rejects .., empty, missing", () => {
+  assertEqual(assetsLib.normalizeRelativePath(""), null);
+  assertEqual(assetsLib.normalizeRelativePath("   "), null);
+  assertEqual(assetsLib.normalizeRelativePath(null), null);
+  assertEqual(assetsLib.normalizeRelativePath(undefined), null);
+  assertEqual(assetsLib.normalizeRelativePath("../etc/passwd"), null);
+  assertEqual(assetsLib.normalizeRelativePath("refs/../a.png"), null);
+  assertEqual(assetsLib.normalizeRelativePath("refs/./a.png"), "refs/a.png");
+});
+
+test("assets: isSupportedImage matches by extension when MIME missing", () => {
+  assert(assetsLib.isSupportedImage("a.png", ""));
+  assert(assetsLib.isSupportedImage("a.PNG", ""));
+  assert(assetsLib.isSupportedImage("a.jpg", ""));
+  assert(assetsLib.isSupportedImage("a.jpeg", ""));
+  assert(assetsLib.isSupportedImage("a.webp", ""));
+  assert(!assetsLib.isSupportedImage("a.gif", ""));
+  assert(!assetsLib.isSupportedImage("a.pdf", ""));
+  assert(!assetsLib.isSupportedImage("a.txt", ""));
+  assert(!assetsLib.isSupportedImage("a", ""));
+});
+
+test("assets: isSupportedImage trusts MIME when present and image/*", () => {
+  assert(assetsLib.isSupportedImage("a.png", "image/png"));
+  assert(assetsLib.isSupportedImage("a.jpg", "image/jpeg"));
+  assert(assetsLib.isSupportedImage("a.jpg", "image/jpg"));
+  assert(assetsLib.isSupportedImage("a.webp", "image/webp"));
+  // image/* but unsupported subtype
+  assert(!assetsLib.isSupportedImage("a.gif", "image/gif"));
+  // non-image MIME rejected
+  assert(!assetsLib.isSupportedImage("a.png", "application/pdf"));
+});
+
+test("assets: SUPPORTED_IMAGE_MIME is frozen and lists PNG/JPEG/WEBP", () => {
+  assert(Object.isFrozen(assetsLib.SUPPORTED_IMAGE_MIME));
+  assertEqual(
+    [...assetsLib.SUPPORTED_IMAGE_MIME].sort(),
+    ["image/jpeg", "image/png", "image/webp"],
+  );
+});
+
+test("assets: SUPPORTED_IMAGE_EXTENSIONS is frozen", () => {
+  assert(Object.isFrozen(assetsLib.SUPPORTED_IMAGE_EXTENSIONS));
+  assert(assetsLib.SUPPORTED_IMAGE_EXTENSIONS.includes(".png"));
+  assert(assetsLib.SUPPORTED_IMAGE_EXTENSIONS.includes(".jpg"));
+  assert(assetsLib.SUPPORTED_IMAGE_EXTENSIONS.includes(".jpeg"));
+  assert(assetsLib.SUPPORTED_IMAGE_EXTENSIONS.includes(".webp"));
+});
+
+test("assets: fileExtension returns lowercase extension or empty", () => {
+  assertEqual(assetsLib.fileExtension("foo.PNG"), ".png");
+  assertEqual(assetsLib.fileExtension("foo.bar.jpeg"), ".jpeg");
+  assertEqual(assetsLib.fileExtension("foo"), "");
+  assertEqual(assetsLib.fileExtension("foo."), "");
+  assertEqual(assetsLib.fileExtension(""), "");
+});
+
+test("assets: deriveState splits missing / unsupported / resolved", () => {
+  assertEqual(
+    assetsLib.deriveState({ found: false, fileName: "x.png", fileType: "image/png" }),
+    "missing",
+  );
+  assertEqual(
+    assetsLib.deriveState({ found: true, fileName: "x.gif", fileType: "image/gif" }),
+    "unsupported",
+  );
+  assertEqual(
+    assetsLib.deriveState({ found: true, fileName: "x.png", fileType: "image/png" }),
+    "resolved",
+  );
+  assertEqual(
+    assetsLib.deriveState({ found: true, fileName: "x.jpg", fileType: "" }),
+    "resolved",
+  );
+});
+
+test("assets: resolveAssetFile rejects when no directoryHandle", async () => {
+  const r = await assetsLib.resolveAssetFile(null, {
+    label: "X",
+    type: "character",
+    file: "refs/x.png",
+  });
+  assertEqual(r.state, "missing");
+});
+
+test("assets: resolveAssetFile returns missing for invalid path", async () => {
+  const fakeHandle = { getFileHandle: () => Promise.resolve({ getFile: () => ({}) }) };
+  const r = await assetsLib.resolveAssetFile(fakeHandle, {
+    label: "X",
+    type: "character",
+    file: "../escape/x.png",
+  });
+  assertEqual(r.state, "missing");
+});
+
+test("assets: resolveAssetFile returns missing when file handle throws", async () => {
+  const fakeHandle = {
+    getFileHandle: () => Promise.reject(new DOMException("nope", "NotFoundError")),
+  };
+  const r = await assetsLib.resolveAssetFile(fakeHandle, {
+    label: "X",
+    type: "character",
+    file: "refs/x.png",
+  });
+  assertEqual(r.state, "missing");
+});
+
+test("assets: resolveAssetFile returns resolved with File for PNG", async () => {
+  const fakeFile = {
+    name: "yuki.png",
+    type: "image/png",
+    size: 12345,
+  };
+  const fakeHandle = {
+    getFileHandle: () => Promise.resolve({ getFile: () => Promise.resolve(fakeFile) }),
+  };
+  const r = await assetsLib.resolveAssetFile(fakeHandle, {
+    label: "Yuki",
+    type: "character",
+    file: "refs/yuki.png",
+  });
+  assertEqual(r.state, "resolved");
+  assertEqual(r.file, fakeFile);
+  assertEqual(r.fileName, "yuki.png");
+  assertEqual(r.fileType, "image/png");
+  assertEqual(r.fileSize, 12345);
+});
+
+test("assets: resolveAssetFile returns resolved for JPEG and WEBP", async () => {
+  const fakeHandleJpg = {
+    getFileHandle: () =>
+      Promise.resolve({
+        getFile: () => Promise.resolve({ name: "v.jpg", type: "image/jpeg", size: 100 }),
+      }),
+  };
+  const r1 = await assetsLib.resolveAssetFile(fakeHandleJpg, {
+    label: "v",
+    type: "character",
+    file: "v.jpg",
+  });
+  assertEqual(r1.state, "resolved");
+
+  const fakeHandleWebp = {
+    getFileHandle: () =>
+      Promise.resolve({
+        getFile: () => Promise.resolve({ name: "w.webp", type: "image/webp", size: 200 }),
+      }),
+  };
+  const r2 = await assetsLib.resolveAssetFile(fakeHandleWebp, {
+    label: "w",
+    type: "style",
+    file: "w.webp",
+  });
+  assertEqual(r2.state, "resolved");
+});
+
+test("assets: resolveAssetFile returns unsupported for GIF even when found", async () => {
+  const fakeHandle = {
+    getFileHandle: () =>
+      Promise.resolve({
+        getFile: () =>
+          Promise.resolve({ name: "g.gif", type: "image/gif", size: 1 }),
+      }),
+  };
+  const r = await assetsLib.resolveAssetFile(fakeHandle, {
+    label: "g",
+    type: "other",
+    file: "g.gif",
+  });
+  assertEqual(r.state, "unsupported");
+  assertEqual(r.file, undefined);
+});
+
+test("assets: resolveReferences walks a nested path", async () => {
+  // Builds a fake handle that tracks path segments.
+  function makeFakeRoot(map) {
+    return {
+      async getDirectoryHandle(name) {
+        const sub = map[name];
+        if (!sub) throw new DOMException("missing dir " + name, "NotFoundError");
+        return sub;
+      },
+      async getFileHandle(name) {
+        if (!map[name]) throw new DOMException("missing file " + name, "NotFoundError");
+        return { async getFile() { return map[name]; } };
+      },
+    };
+  }
+  const root = makeFakeRoot({
+    refs: {
+      async getDirectoryHandle(name) {
+        if (name !== "chars") throw new DOMException("missing", "NotFoundError");
+        return {
+          async getFileHandle(name) {
+            if (name !== "yuki.png") throw new DOMException("missing", "NotFoundError");
+            return { async getFile() { return { name: "yuki.png", type: "image/png", size: 42 }; } };
+          },
+        };
+      },
+    },
+  });
+  const refs = [
+    { label: "Yuki", type: "character", file: "refs/chars/yuki.png" },
+  ];
+  const out = await assetsLib.resolveReferences(root, refs);
+  assertEqual(out.length, 1);
+  assertEqual(out[0].state, "resolved");
+  assertEqual(out[0].path, "refs/chars/yuki.png");
+});
+
+test("assets: resolveReferences isolates failures", async () => {
+  const root = {
+    async getDirectoryHandle() {
+      return {
+        async getFileHandle(name) {
+          if (name === "ok.png") {
+            return { async getFile() { return { name: "ok.png", type: "image/png", size: 1 }; } };
+          }
+          throw new DOMException("missing", "NotFoundError");
+        },
+      };
+    },
+  };
+  const refs = [
+    { label: "ok", type: "character", file: "refs/ok.png" },
+    { label: "bad", type: "character", file: "refs/missing.png" },
+  ];
+  const out = await assetsLib.resolveReferences(root, refs);
+  assertEqual(out.length, 2);
+  assertEqual(out[0].state, "resolved");
+  assertEqual(out[1].state, "missing");
+});
+
+test("assets: filesFromResolved extracts File objects in order", async () => {
+  const f1 = { name: "a.png", type: "image/png", size: 1 };
+  const f2 = { name: "b.png", type: "image/png", size: 2 };
+  const out = assetsLib.filesFromResolved([
+    { state: "resolved", file: f1 },
+    { state: "missing" },
+    { state: "resolved", file: f2 },
+    { state: "unsupported" },
+  ]);
+  assertEqual(out.length, 2);
+  assertEqual(out[0], f1);
+  assertEqual(out[1], f2);
 });
 
 // ----- end ----------------------------------------------------------------

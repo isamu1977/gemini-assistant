@@ -208,6 +208,29 @@ h3 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
   background: var(--bg);
 }
 
+.ref-state {
+  flex: 0 0 auto;
+  width: 14px;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.ref-state.state-resolved    { color: var(--ok); }
+.ref-state.state-missing     { color: var(--warn); }
+.ref-state.state-unsupported { color: var(--warn); }
+.ref-state.state-unbound     { color: var(--fg-muted); }
+
+.ref-state-note {
+  flex: 1 1 100%;
+  font-size: 10px;
+  color: var(--fg-muted);
+  margin-top: 2px;
+  padding-left: 20px;
+  font-style: italic;
+}
+
 .ref-badge {
   flex: 0 0 auto;
   display: inline-block;
@@ -254,11 +277,65 @@ h3 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
+.ref-attach {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  padding: 3px 8px;
+  min-width: 64px;
+}
+
 .references-empty {
   margin: 0;
   font-size: 11px;
   color: var(--fg-muted);
   font-style: italic;
+}
+
+/* ----- Folder binding ----- */
+
+.folder-binding {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 5px 8px;
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.folder-binding-status {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.folder-binding-label {
+  color: var(--fg-muted);
+}
+
+.folder-binding-name {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.folder-binding-name.unbound {
+  color: var(--fg-muted);
+  font-style: italic;
+  font-family: inherit;
+}
+
+.folder-binding button {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  font-size: 11px;
 }
 
 /* ----- Project stats line ----- */

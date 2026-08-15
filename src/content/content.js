@@ -10,6 +10,12 @@
  *     -> { ok: true, url, selfTest }
  *   { type: "GEMINI_ASSISTANT_INSERT_PROMPT", text: string }
  *     -> { ok: true, length } | { ok: false, error }
+ *   { type: "GEMINI_ASSISTANT_ATTACH", file: File, fileName?, fileType?, fileSize? }
+ *     -> { ok: true, method, fileName, fileType, fileSize } | { ok: false, error, diagnostics }
+ *
+ * The File in ATTACH is structured-cloneable (it is a Blob), so it
+ * crosses the chrome.tabs.sendMessage boundary without base64. The
+ * adapter does all the DOM work; this script does not touch the page.
  */
 
 (function () {
@@ -48,6 +54,31 @@
         // insertPromptIntoGemini is async; keep the message channel open.
         adapter
           .insertPromptIntoGemini(msg.text ?? "")
+          .then((result) => sendResponse(result))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) })
+          );
+        return true;
+      }
+
+      case "GEMINI_ASSISTANT_ATTACH": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter) {
+          sendResponse({ ok: false, error: "adapter not loaded" });
+          return false;
+        }
+        if (!adapter.attachFileToGemini) {
+          sendResponse({ ok: false, error: "adapter does not support attachment" });
+          return false;
+        }
+        const file = msg.file;
+        if (!file || typeof file !== "object" || typeof file.name !== "string") {
+          sendResponse({ ok: false, error: "Invalid file payload" });
+          return false;
+        }
+        // attachFileToGemini is async; keep the message channel open.
+        adapter
+          .attachFileToGemini(file)
           .then((result) => sendResponse(result))
           .catch((e) =>
             sendResponse({ ok: false, error: e?.message ?? String(e) })
