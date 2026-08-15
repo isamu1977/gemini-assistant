@@ -162,6 +162,148 @@ h3 { font-size: 13px; margin: 0 0 6px; font-weight: 600; }
   flex: 1;
 }
 
+/* ----- References ----- */
+
+.references-row {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.references-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.references-label {
+  font-size: 11px;
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+
+.references-count {
+  font-size: 11px;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.references-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.ref-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  padding: 3px 4px;
+  border-radius: 3px;
+  background: var(--bg);
+}
+
+.ref-badge {
+  flex: 0 0 auto;
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  color: var(--accent-fg);
+}
+
+.ref-badge.type-character   { background: #c0392b; }
+.ref-badge.type-environment { background: #2c7a4b; }
+.ref-badge.type-style       { background: #6c4ab8; }
+.ref-badge.type-object      { background: #b07a1f; }
+.ref-badge.type-other       { background: #5f6368; }
+
+.ref-meta {
+  flex: 1;
+  min-width: 0;
+}
+
+.ref-label {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ref-file {
+  font-size: 10.5px;
+  color: var(--fg-muted);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ref-id {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--fg-muted);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.references-empty {
+  margin: 0;
+  font-size: 11px;
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+/* ----- Project stats line ----- */
+
+.project-stats {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  color: var(--fg-muted);
+}
+
+/* ----- Asset catalog (collapsible) ----- */
+
+.assets-panel {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.assets-panel summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.assets-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  background: var(--bg-muted);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 160px;
+  overflow: auto;
+}
+
+.asset-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 2px 0;
+}
+
 /* ----- Prompt ----- */
 
 .prompt-label {

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "x", "name": "x" },
+  "assets": {
+    "a": { "label": "A", "type": "character", "file": "a.png" }
+  },
+  "tasks": [
+    { "id": "t1", "prompt": "p", "references": ["does-not-exist"] }
+  ]
+}

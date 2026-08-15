@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "v2", "name": "V2 valid" },
+  "assets": {
+    "a": { "label": "Asset A", "type": "character", "file": "refs/a.png" },
+    "b": { "label": "Asset B", "type": "style", "file": "refs/b.png" }
+  },
+  "tasks": [
+    { "id": "t1", "prompt": "P1", "references": ["a", "b"] },
+    { "id": "t2", "prompt": "P2" },
+    { "id": "t3", "prompt": "P3", "references": ["a"] }
+  ]
+}

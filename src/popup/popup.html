@@ -31,6 +31,7 @@
         <div class="project-meta">
           <h2 id="project-name">Project</h2>
           <p id="project-desc" class="project-desc" hidden></p>
+          <p id="project-stats" class="project-stats" hidden></p>
         </div>
         <button id="reimport-btn" type="button" class="ghost" title="Replace current project">
           Replace
@@ -50,6 +51,16 @@
         <div class="status-row">
           <label for="status-select">Status</label>
           <select id="status-select"></select>
+        </div>
+        <div class="references-row">
+          <div class="references-header">
+            <span class="references-label">References</span>
+            <span class="references-count" id="references-count">0</span>
+          </div>
+          <ul id="references-list" class="references-list"></ul>
+          <p id="references-empty" class="references-empty" hidden>
+            No references for this task.
+          </p>
         </div>
       </div>
 
@@ -75,6 +86,11 @@
       <details class="progress-panel">
         <summary>Progress</summary>
         <div id="progress-summary" class="progress-grid"></div>
+      </details>
+
+      <details class="assets-panel" id="assets-panel" hidden>
+        <summary id="assets-summary">Assets</summary>
+        <ul id="assets-list" class="assets-list"></ul>
       </details>
     </section>
 

@@ -46,32 +46,90 @@ file, isolated, language-independent (validated in EN and PT).
 
 ---
 
-## Project JSON (schema version 1)
+## Project JSON (schema version 1 and 2)
+
+Both versions are accepted. **v1** projects are valid forever — no
+migration is required to use the asset catalog. **v2** adds an
+optional asset catalog and optional per-task references.
+
+### v1 (legacy)
 
 ```jsonc
 {
   "schemaVersion": 1,
   "project": {
-    "id": "example-project",      // stable id
-    "name": "Example Project",     // required
+    "id": "example-project",
+    "name": "Example Project",
     "description": "optional"
   },
   "tasks": [
     {
-      "id": "task-001",           // unique within project, required
-      "title": "First task",      // optional
-      "prompt": "..."             // required, non-empty
+      "id": "task-001",
+      "title": "First task",        // optional
+      "prompt": "..."               // required, non-empty
+    }
+  ]
+}
+```
+
+### v2 (asset catalog + references)
+
+```jsonc
+{
+  "schemaVersion": 2,
+  "project": { "id": "...", "name": "...", "description": "..." },
+  "assets": {                       // optional; absent treated as {}
+    "asset-id": {
+      "label": "Human-readable name",   // required, non-empty
+      "type": "character",                // character | environment | style | object | other
+      "file": "refs/asset.png"           // required, non-empty
+    },
+    ...
+  },
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "First task",               // optional
+      "prompt": "...",                    // required
+      "references": ["asset-id", "..."]   // optional; absent treated as []
     }
   ]
 }
 ```
 
 Rules enforced by the validator:
-- `schemaVersion` must equal `1`.
+- `schemaVersion` must be 1 or 2.
 - `project.id` and `project.name` are required and non-empty.
-- `tasks` is a non-empty array.
-- Each task has a unique `id` and a non-empty `prompt`.
-- `title` is optional (defaults to empty string).
+- `tasks` is a non-empty array; each task has a unique `id` and a
+  non-empty `prompt`.
+- For v2:
+  - Each asset has a unique `id`, a non-empty `label`, a `type` from
+    the 5-value enum above, and a non-empty `file`.
+  - Each task's `references` (if present) is an array of strings,
+    unique within the task, and every referenced id must exist in
+    `assets`.
+
+The `file` field is **metadata only**. The extension does not read
+the filesystem in this milestone. Future milestones will resolve the
+file path against a project package and upload the bytes to Gemini.
+
+The order of `references` is preserved — that is the order the
+extension will eventually upload images to Gemini.
+
+### Examples in the repo
+
+- `examples/example-project-v1.json` — minimal v1 (regression / compat)
+- `examples/example-project-v2.json` — 5 tasks, 5 assets, shared asset,
+  one task without references
+
+## Asset types
+
+`character`, `environment`, `style`, `object`, `other`.
+
+These are metadata for organization only. The extension does not
+interpret them — Gemini's prompt semantics drive how they are used.
+Add new types later by extending the `ASSET_TYPES` array in
+`src/lib/project.js` and bumping schema version.
 
 ## Task status
 
@@ -166,6 +224,24 @@ popup and the content script is documented in
 `src/content/content.js`.
 
 ## Bug history
+
+### v0.3.0 — Asset catalog + per-task references
+
+The Project JSON schema evolved to **v2** to carry a central asset
+catalog and per-task references. v1 projects remain fully supported
+and are treated as having no assets and no references — no migration
+required.
+
+The popup shows, for the current task:
+- `References · N` header
+- One row per reference with a type badge (`character`,
+  `environment`, `style`, `object`, `other`), label, and file path
+- An `Assets · N` collapsible catalog of every asset in the project
+
+`Insert Prompt` continues to send only the prompt text — references
+are metadata at this milestone. The next milestone will resolve
+`asset.file` paths to actual bytes and upload them in declared order
+before sending.
 
 ### v0.2.3 — Insert Prompt appends instead of replacing
 

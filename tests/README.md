@@ -117,6 +117,27 @@ then asserts:
 This test catches the v0.2.2 regression where the button's click
 listener was missing (reverting the listener makes 8/9 scenarios fail).
 
+## End-to-end References / Assets tests
+
+The popup renders References per task and a collapsible Asset Catalog
+when the project declares v2 assets.
+
+```bash
+python3 tests/e2e_references.py
+```
+
+Scenarios:
+
+- v1 project: no references shown, assets panel hidden
+- v2 task with N references: badges + labels + file paths in declared order
+- v2 task without references: empty message + count=0
+- v2 task with a single reference: only that one is shown
+- v2 asset catalog: visible, count matches project assets
+- Prev / Next / dropdown selection: references list updates correctly
+- Edit prompt + Insert Prompt: payload is prompt only (references are
+  not yet sent — that's the next milestone)
+- Popup reload: references list restored from `chrome.storage.local`
+
 ## End-to-end Insert Replace tests
 
 The Insert Prompt must REPLACE the existing content, never append. This

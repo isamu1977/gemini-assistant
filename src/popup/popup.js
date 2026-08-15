@@ -40,6 +40,7 @@
 
   const projectNameEl = $("#project-name");
   const projectDescEl = $("#project-desc");
+  const projectStatsEl = $("#project-stats");
   const taskSelectEl = $("#task-select");
   const statusSelectEl = $("#status-select");
   const taskTitleEl = $("#task-title");
@@ -50,6 +51,14 @@
   const prevBtn = $("#prev-btn");
   const nextBtn = $("#next-btn");
   const progressSummaryEl = $("#progress-summary");
+
+  const referencesCountEl = $("#references-count");
+  const referencesListEl = $("#references-list");
+  const referencesEmptyEl = $("#references-empty");
+
+  const assetsPanelEl = $("#assets-panel");
+  const assetsListEl = $("#assets-list");
+  const assetsSummaryEl = $("#assets-summary");
 
   const statusEl = $("#status");
   const statusText = $("#status-text");
@@ -165,6 +174,15 @@
       projectDescEl.hidden = true;
     }
 
+    const assetCount = projectLib.countAssets(proj);
+    if (assetCount > 0) {
+      projectStatsEl.textContent =
+        `${assetCount} asset${assetCount === 1 ? "" : "s"} in catalog`;
+      projectStatsEl.hidden = false;
+    } else {
+      projectStatsEl.hidden = true;
+    }
+
     // Task selector
     taskSelectEl.innerHTML = "";
     for (const t of proj.tasks) {
@@ -193,6 +211,12 @@
     for (const el of taskCurrentEls) el.textContent = String(curNum);
     for (const el of taskTotalEls) el.textContent = String(total);
     taskTitleEl.textContent = currentTask()?.title ?? "";
+
+    // References (current task)
+    renderReferences();
+
+    // Asset catalog (collapsible)
+    renderAssetCatalog();
 
     // Prompt
     promptEl.value = cur?.prompt ?? currentTask()?.prompt ?? "";
@@ -223,6 +247,90 @@
           `<div class="progress-cell"><span class="label">${label}</span><span class="value">${value}</span></div>`,
       )
       .join("");
+  }
+
+  function renderReferences() {
+    const proj = state.source && state.source.project;
+    const cur = currentTask();
+    referencesListEl.innerHTML = "";
+    if (!proj || !cur) {
+      referencesCountEl.textContent = "0";
+      referencesEmptyEl.hidden = false;
+      return;
+    }
+    const refs = projectLib.resolveReferences(proj, cur.id);
+    if (refs.length === 0) {
+      referencesCountEl.textContent = "0";
+      referencesEmptyEl.hidden = false;
+      return;
+    }
+    referencesCountEl.textContent = String(refs.length);
+    referencesEmptyEl.hidden = true;
+    for (const r of refs) {
+      const li = document.createElement("li");
+      li.className = "ref-item";
+      const badge = document.createElement("span");
+      badge.className = `ref-badge type-${r.type}`;
+      badge.textContent = r.type;
+      const meta = document.createElement("div");
+      meta.className = "ref-meta";
+      const label = document.createElement("div");
+      label.className = "ref-label";
+      label.textContent = r.label;
+      const file = document.createElement("div");
+      file.className = "ref-file";
+      file.textContent = r.file;
+      file.title = r.file;
+      meta.appendChild(label);
+      meta.appendChild(file);
+      const idEl = document.createElement("span");
+      idEl.className = "ref-id";
+      idEl.textContent = r.id;
+      li.appendChild(badge);
+      li.appendChild(meta);
+      li.appendChild(idEl);
+      referencesListEl.appendChild(li);
+    }
+  }
+
+  function renderAssetCatalog() {
+    const proj = state.source && state.source.project;
+    const assetCount = projectLib.countAssets(proj);
+    if (assetCount === 0) {
+      assetsPanelEl.hidden = true;
+      assetsListEl.innerHTML = "";
+      return;
+    }
+    assetsPanelEl.hidden = false;
+    assetsSummaryEl.textContent = `Assets · ${assetCount}`;
+    assetsListEl.innerHTML = "";
+    const assets = proj.assets;
+    for (const id of Object.keys(assets)) {
+      const a = assets[id];
+      const li = document.createElement("li");
+      li.className = "asset-item";
+      const badge = document.createElement("span");
+      badge.className = `ref-badge type-${a.type}`;
+      badge.textContent = a.type;
+      const meta = document.createElement("div");
+      meta.className = "ref-meta";
+      const label = document.createElement("div");
+      label.className = "ref-label";
+      label.textContent = a.label;
+      const file = document.createElement("div");
+      file.className = "ref-file";
+      file.textContent = a.file;
+      file.title = a.file;
+      meta.appendChild(label);
+      meta.appendChild(file);
+      const idEl = document.createElement("span");
+      idEl.className = "ref-id";
+      idEl.textContent = id;
+      li.appendChild(badge);
+      li.appendChild(meta);
+      li.appendChild(idEl);
+      assetsListEl.appendChild(li);
+    }
   }
 
   // ----- persist ----------------------------------------------------------

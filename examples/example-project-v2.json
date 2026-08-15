@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 2,
+  "project": {
+    "id": "example-project-v2",
+    "name": "Example Project (v2 with assets)",
+    "description": "Five tasks and five assets. Shared assets are referenced by multiple tasks."
+  },
+  "assets": {
+    "character-main": {
+      "label": "Main character",
+      "type": "character",
+      "file": "references/character-main.png"
+    },
+    "character-secondary": {
+      "label": "Secondary character",
+      "type": "character",
+      "file": "references/character-secondary.png"
+    },
+    "environment-village": {
+      "label": "Snow village",
+      "type": "environment",
+      "file": "references/environment-village.png"
+    },
+    "style-master": {
+      "label": "Master visual style",
+      "type": "style",
+      "file": "references/style-master.png"
+    },
+    "object-lantern": {
+      "label": "Floating lantern",
+      "type": "object",
+      "file": "references/object-lantern.png"
+    }
+  },
+  "tasks": [
+    {
+      "id": "task-001",
+      "title": "Opening shot",
+      "prompt": "Wide shot of the snow village at night with the main character walking toward the camera.",
+      "references": ["character-main", "environment-village", "style-master"]
+    },
+    {
+      "id": "task-002",
+      "title": "Meeting the second character",
+      "prompt": "Close-up of the main character meeting the secondary character by the lantern.",
+      "references": ["character-main", "character-secondary", "object-lantern"]
+    },
+    {
+      "id": "task-003",
+      "title": "Shared environment with no character",
+      "prompt": "Empty snow village square, no characters, atmospheric shot.",
+      "references": ["environment-village", "style-master"]
+    },
+    {
+      "id": "task-004",
+      "title": "Stylistic frame",
+      "prompt": "Abstract frame demonstrating the master visual style only.",
+      "references": ["style-master"]
+    },
+    {
+      "id": "task-005",
+      "title": "Free composition (no references)",
+      "prompt": "Open prompt without any reference image.",
+      "references": []
+    }
+  ]
+}
