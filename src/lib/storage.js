@@ -101,6 +101,11 @@
       source: null,
       tasks: null,
       currentTaskId: null,
+      // v0.6.2: gate flag. When false, Prepare Task / Generate Task
+      // remain disabled until the user has manually confirmed the
+      // attachment trace succeeds end-to-end. Once flipped to true,
+      // it persists across side-panel reloads.
+      attachUnlocked: false,
     };
   }
 
@@ -118,6 +123,10 @@
       tasks: raw.tasks && typeof raw.tasks === "object" ? raw.tasks : null,
       currentTaskId:
         typeof raw.currentTaskId === "string" ? raw.currentTaskId : null,
+      // Backwards-compatible: legacy v0.6.1 stored objects have no
+      // attachUnlocked field. Default to false (gated) so the user is
+      // forced to validate the new attach flow manually.
+      attachUnlocked: raw.attachUnlocked === true,
     };
   }
 
@@ -136,6 +145,12 @@
       source: state?.source ?? null,
       tasks: state?.tasks ?? null,
       currentTaskId: state?.currentTaskId ?? null,
+      // attachUnlocked is optional. We store it only if true so
+      // legacy state written before v0.6.2 is not rewritten on every
+      // save (keeps the storage diff small).
+      ...(state && state.attachUnlocked === true
+        ? { attachUnlocked: true }
+        : {}),
     };
     if (isChromeStorageAvailable()) {
       await setInChrome(STATE_KEY, safe);

@@ -205,6 +205,21 @@
             <button id="probe-attachment-btn" type="button" class="secondary">
               Probe attachment
             </button>
+            <button id="trace-attachment-btn" type="button" class="secondary">
+              Trace attachment
+            </button>
+            <button id="strategy-a-btn" type="button" class="secondary" disabled>
+              Try Strategy A
+            </button>
+          </div>
+          <div id="trace-result" class="trace-result" hidden>
+            <div class="trace-header-row">
+              <span id="trace-failed-at" class="trace-failed-at">—</span>
+              <button id="trace-retry-btn" type="button" class="ghost">
+                Retry
+              </button>
+            </div>
+            <ol id="trace-steps" class="trace-steps"></ol>
           </div>
         </div>
       </details>

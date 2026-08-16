@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.6.1",
-  "description": "Generic project and task manager for gemini.google.com. v0.6.1: stabilizes Side Panel ↔ Gemini content script messaging (single sendToGemini helper, strict tabId validation, PT-BR menu fallback). v0.6: end-to-end single-task image generation — activate Create Image mode, attach references, insert prompt, send, detect result, and download to Downloads/Gemini Assistant/<project-id>/.",
+  "version": "0.6.2",
+  "description": "Generic project and task manager for gemini.google.com. v0.6.2: attachment instrumentation — structured step trace, layered 'Enviar arquivos' detector (Tier 1 icon-based / Tier 2 accessible-name / Tier 3 localized text), file-input lifecycle probe (0/50/150/300/750/1500/2500 ms checkpoints), Strategy A opt-in (native input + DataTransfer), and a manual gate so Prepare/Generate Task only run after the user verifies attach in real Gemini. v0.6.1: stabilizes Side Panel ↔ Gemini content script messaging. v0.6: end-to-end single-task image generation.",
   "minimum_chrome_version": "116",
 
   "permissions": ["storage", "sidePanel", "downloads"],

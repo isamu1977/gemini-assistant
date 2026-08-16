@@ -1943,6 +1943,683 @@ test("orchestrator: messaging failure at send does not run waiting-for-generatio
   assert(!visited.includes("waiting-for-generation"));
 });
 
+// ----- v0.6.2: storage attachUnlocked + adapter instrumentation ----------
+
+console.log(`\n${C.bold}storage.js (v0.6.2: attachUnlocked)${C.reset}`);
+
+test("storage: emptyState returns attachUnlocked=false (defaults to gated)", () => {
+  const s = storageLib.emptyState();
+  assertEqual(s.attachUnlocked, false);
+});
+
+test("storage: coerceState migrates legacy v0.6.1 state to attachUnlocked=false", () => {
+  const legacy = {
+    schemaVersion: 1,
+    source: { project: { id: "x", name: "X" }, importedAt: 1 },
+    tasks: {},
+    currentTaskId: null,
+  };
+  const s = storageLib.coerceState(legacy);
+  // Force a write roundtrip.
+  storageLib.saveState(s);
+  const loaded = storageLib.coerceState(
+    JSON.parse(
+      require("fs").existsSync("") ? "{}" : "{}",
+    ),
+  );
+  // For our purposes we just need coerceState semantics:
+  assertEqual(s.attachUnlocked, false);
+});
+
+test("storage: coerceState preserves attachUnlocked=true when stored explicitly", () => {
+  const s = storageLib.coerceState({
+    schemaVersion: 1,
+    source: null,
+    tasks: null,
+    currentTaskId: null,
+    attachUnlocked: true,
+  });
+  assertEqual(s.attachUnlocked, true);
+});
+
+test("storage: coerceState treats attachUnlocked=false explicitly as false", () => {
+  const s = storageLib.coerceState({
+    schemaVersion: 1,
+    source: null,
+    tasks: null,
+    currentTaskId: null,
+    attachUnlocked: false,
+  });
+  assertEqual(s.attachUnlocked, false);
+});
+
+console.log(`\n${C.bold}messaging.js (v0.6.2: ATTACH_TRACE / ATTACH_STRATEGY_A)${C.reset}`);
+
+test("messaging: MESSAGE_TYPES exposes ATTACH_TRACE and ATTACH_STRATEGY_A (v0.6.2)", () => {
+  assertEqual(
+    messagingLib.MESSAGE_TYPES.ATTACH_TRACE,
+    "GEMINI_ASSISTANT_ATTACH_TRACE",
+  );
+  assertEqual(
+    messagingLib.MESSAGE_TYPES.ATTACH_STRATEGY_A,
+    "GEMINI_ASSISTANT_ATTACH_STRATEGY_A",
+  );
+});
+
+console.log(`\n${C.bold}geminiDomAdapter (v0.6.2: trace structure)${C.reset}`);
+
+// Load the adapter inside a vm sandbox with minimal globals so we can
+// exercise the new instrumentation without a full DOM or browser.
+function loadAdapterInSandbox() {
+  const vm = require("vm");
+  const fs = require("fs");
+  const code = fs.readFileSync(
+    path.join(ROOT, "src/dom/geminiDomAdapter.js"),
+    "utf8",
+  );
+  const ctx = {
+    console,
+    setTimeout,
+    clearTimeout,
+    Date,
+    JSON,
+    MutationObserver: undefined,
+    DataTransfer: undefined,
+    Element: function Element() {},
+    document: minimalDocument(),
+  };
+  ctx.globalThis = ctx;
+  ctx.self = ctx;
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(code, ctx);
+  return ctx.globalThis.RedSunDomAdapter;
+}
+
+// Bare-minimum document mock with a tiny selector engine. Supports
+// tag / .class / [attr] / [attr=value] / descendant (space). Enough
+// for the adapter's selector vocabulary.
+function matchesEl(el, q) {
+  // q is one compound: tag[attr=v].class.class...
+  let s = q;
+  let expectedTag = null;
+  const tagMatch = s.match(/^([a-zA-Z][\w-]*)/);
+  if (tagMatch) {
+    expectedTag = tagMatch[1].toLowerCase();
+    s = s.slice(tagMatch[0].length);
+  }
+  if (expectedTag && (el.tagName || "").toLowerCase() !== expectedTag) {
+    return false;
+  }
+  while (s.length) {
+    if (s[0] === ".") {
+      const m = s.match(/^\.([\w-]+)/);
+      if (!m) return false;
+      const cls = m[1];
+      if (!(el._classes || []).includes(cls)) return false;
+      s = s.slice(m[0].length);
+    } else if (s[0] === "[") {
+      const m = s.match(/^\[([^\]=]+)(?:=([^\]]*))?\]/);
+      if (!m) return false;
+      const name = m[1].trim();
+      const value = m[2];
+      const got = el._getAttribute(name);
+      if (value === undefined) {
+        if (got === null) return false;
+      } else if (got !== value.replace(/^["']|["']$/g, "")) {
+        return false;
+      }
+      s = s.slice(m[0].length);
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+function queryInNode(node, sel, results) {
+  for (const c of node._children || []) {
+    if (matchesEl(c, sel)) results.push(c);
+    queryInNode(c, sel, results);
+  }
+}
+
+function queryCompoundInNode(node, parts, idx, results) {
+  if (idx >= parts.length) return;
+  const sel = parts[idx];
+  const childMatches = [];
+  for (const c of node._children || []) {
+    if (matchesEl(c, sel)) childMatches.push(c);
+    queryInNode(c, sel, childMatches);
+  }
+  if (idx === parts.length - 1) {
+    for (const c of childMatches) results.push(c);
+    return;
+  }
+  for (const c of childMatches)
+    queryCompoundInNode(c, parts, idx + 1, results);
+}
+
+function splitCompound(sel) {
+  return sel.split(/\s+/).filter(Boolean);
+}
+
+function queryAllInNode(root, sel) {
+  // Support comma-separated lists ("a, b, c") by recursing per branch
+  // and deduping.
+  const branches = sel.split(",").map((s) => s.trim()).filter(Boolean);
+  if (branches.length === 1) {
+    return queryAllInNodeSingle(root, sel);
+  }
+  const out = [];
+  const seen = new Set();
+  for (const b of branches) {
+    for (const el of queryAllInNodeSingle(root, b)) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      out.push(el);
+    }
+  }
+  return out;
+}
+
+function queryAllInNodeSingle(root, sel) {
+  const results = [];
+  queryCompoundInNode(root, splitCompound(sel), 0, results);
+  return results;
+}
+
+function defineNodeMethods(el) {
+  el._getAttribute = function (n) {
+    const a = (el.attributes || []).find((x) => x.name === n);
+    return a ? a.value : null;
+  };
+  el.getAttribute = el._getAttribute;
+  el.getBoundingClientRect = () => ({
+    width: 100, height: 30, x: 0, y: 0,
+    left: 0, top: 0, right: 100, bottom: 30,
+  });
+  el.querySelector = (sel) => {
+    const all = queryAllInNode(el, sel);
+    return all[0] || null;
+  };
+  el.querySelectorAll = (sel) => queryAllInNode(el, sel);
+  el.appendChild = (child) => {
+    el._children.push(child);
+    child.parentElement = el;
+    return child;
+  };
+  el.parentElement = null;
+  el.isConnected = true;
+  return el;
+}
+
+function minimalDocument() {
+  const docBody = defineNodeMethods({
+    tagName: "BODY",
+    _children: [],
+    attributes: [],
+    _classes: [],
+    style: { display: "", visibility: "" },
+    id: "",
+  });
+  return wrapDoc(docBody);
+}
+
+function wrapDoc(bodyEl) {
+  const docEl = defineNodeMethods({
+    tagName: "HTML",
+    _children: [bodyEl],
+    attributes: [],
+    _classes: [],
+    style: { display: "", visibility: "" },
+    id: "",
+  });
+  bodyEl.parentElement = docEl;
+  const doc = {
+    body: bodyEl,
+    documentElement: docEl,
+    querySelector(sel) {
+      const all = queryAllInNode(bodyEl, sel);
+      return all[0] || null;
+    },
+    querySelectorAll(sel) {
+      const all = queryAllInNode(bodyEl, sel);
+      if (matchesEl(bodyEl, sel)) all.unshift(bodyEl);
+      return all;
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    createElement(tag) {
+      return defineNodeMethods({
+        tagName: tag.toUpperCase(),
+        _children: [],
+        attributes: [],
+        _classes: [],
+        style: { display: "", visibility: "" },
+        id: "",
+        textContent: "",
+      });
+    },
+  };
+  return doc;
+}
+
+test("adapter: ATTACH_TRACE_STEPS contains the 12 ordered steps", () => {
+  const a = loadAdapterInSandbox();
+  assertEqual(a.ATTACH_TRACE_STEPS.length, 12);
+  assertEqual(a.ATTACH_TRACE_STEPS[0], "asset-loaded");
+  assertEqual(a.ATTACH_TRACE_STEPS[1], "messaging-ok");
+  assertEqual(a.ATTACH_TRACE_STEPS[2], "attachment-trigger-found");
+  assertEqual(a.ATTACH_TRACE_STEPS[3], "attachment-trigger-clicked");
+  assertEqual(a.ATTACH_TRACE_STEPS[4], "menu-detected");
+  assertEqual(a.ATTACH_TRACE_STEPS[5], "upload-action-detected");
+  assertEqual(a.ATTACH_TRACE_STEPS[6], "upload-action-clicked");
+  assertEqual(a.ATTACH_TRACE_STEPS[7], "file-input-detected");
+  assertEqual(a.ATTACH_TRACE_STEPS[8], "file-assigned");
+  assertEqual(a.ATTACH_TRACE_STEPS[9], "change-dispatched");
+  assertEqual(a.ATTACH_TRACE_STEPS[10], "attachment-ui-detected");
+  assertEqual(a.ATTACH_TRACE_STEPS[11], "attachment-ready");
+});
+
+test("adapter: UPLOAD_FILES_FALLBACK_LABELS is frozen and contains PT-BR + EN + JA", () => {
+  const a = loadAdapterInSandbox();
+  assert(Object.isFrozen(a.UPLOAD_FILES_FALLBACK_LABELS));
+  assertEqual(a.UPLOAD_FILES_FALLBACK_LABELS["pt-BR"], "Enviar arquivos");
+  assertEqual(a.UPLOAD_FILES_FALLBACK_LABELS["en-US"], "Upload files");
+  assertEqual(a.UPLOAD_FILES_FALLBACK_LABELS["ja-JP"], "ファイルをアップロード");
+});
+
+test("adapter: scoreUploadCandidate — Tier 1 wins on attach_file icon + menuitem", () => {
+  const a = loadAdapterInSandbox();
+  // Tier 1: role=menuitem + iconAlt=attach_file.
+  const tier1 = a.scoreUploadCandidate(
+    /* element not needed: descriptor-only signature */
+    null,
+    {
+      tag: "button",
+      role: "menuitem",
+      ariaLabel: null,
+      textSample: "ignored",
+      textLength: 0,
+      classHint: "",
+      iconAlt: "attach_file",
+      dataAttrs: {},
+    },
+  );
+  assertEqual(tier1, 100);
+});
+
+test("adapter: scoreUploadCandidate — Tier 2 catches PT aria-label fragment", () => {
+  const a = loadAdapterInSandbox();
+  const t = a.scoreUploadCandidate(null, {
+    tag: "button",
+    role: "menuitem",
+    ariaLabel: "Enviar arquivos",
+    textSample: "",
+    textLength: 0,
+    classHint: "",
+    iconAlt: null,
+    dataAttrs: {},
+  });
+  assert(t >= 70, `expected high tier, got ${t}`);
+});
+
+test("adapter: scoreUploadCandidate — Tier 3 catches exact localized text", () => {
+  const a = loadAdapterInSandbox();
+  const tPT = a.scoreUploadCandidate(null, {
+    tag: "button",
+    role: "menuitem",
+    ariaLabel: null,
+    textSample: "Enviar arquivos",
+    textLength: 14,
+    classHint: "",
+    iconAlt: null,
+    dataAttrs: {},
+  });
+  const tEN = a.scoreUploadCandidate(null, {
+    tag: "button",
+    role: "menuitem",
+    ariaLabel: null,
+    textSample: "Upload files",
+    textLength: 12,
+    classHint: "",
+    iconAlt: null,
+    dataAttrs: {},
+  });
+  const tJA = a.scoreUploadCandidate(null, {
+    tag: "button",
+    role: "menuitem",
+    ariaLabel: null,
+    textSample: "ファイルをアップロード",
+    textLength: 11,
+    classHint: "",
+    iconAlt: null,
+    dataAttrs: {},
+  });
+  assert(tPT >= 50, `tier=PT got ${tPT}`);
+  assert(tEN >= 50, `tier=EN got ${tEN}`);
+  assert(tJA >= 50, `tier=JA got ${tJA}`);
+});
+
+test("adapter: scoreUploadCandidate — image_create is rejected (not upload files)", () => {
+  const a = loadAdapterInSandbox();
+  // "Create image" should not match upload files, even if its icon is present.
+  const t = a.scoreUploadCandidate(null, {
+    tag: "button",
+    role: "menuitemcheckbox",
+    ariaLabel: "Create image",
+    textSample: "Create image",
+    textLength: 12,
+    classHint: "",
+    iconAlt: "image_create",
+    dataAttrs: {},
+  });
+  assertEqual(t, 0);
+});
+
+test("adapter: scoreUploadCandidate — non-upload items score 0", () => {
+  const a = loadAdapterInSandbox();
+  const t = a.scoreUploadCandidate(null, {
+    tag: "button",
+    role: "menuitemcheckbox",
+    ariaLabel: "Create video",
+    textSample: "Create video",
+    textLength: 12,
+    classHint: "",
+    iconAlt: "video_create",
+    dataAttrs: {},
+  });
+  assertEqual(t, 0);
+});
+
+test("adapter: describeMenuItem returns structured fields for a built element", () => {
+  const a = loadAdapterInSandbox();
+  // Build a tiny DOM mock sufficient for describeMenuItem.
+  function el(tag, attrs) {
+    const e = {
+      tagName: tag.toUpperCase(),
+      attributes: Object.entries(attrs || {}).map(([k, v]) => ({
+        name: k,
+        value: String(v),
+      })),
+      children: [],
+      classList: { _classes: [], contains() { return false; } },
+    };
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === "class") e.className = v;
+      else if (k === "text") {
+        e.textContent = v;
+      } else e[k] = v;
+    }
+    e.getAttribute = (n) => {
+      const a = e.attributes.find((x) => x.name === n);
+      return a ? a.value : null;
+    };
+    e.getBoundingClientRect = () => ({ width: 100, height: 30, x: 0, y: 0 });
+    e.querySelector = () => null;
+    return e;
+  }
+  const item = el("button", {
+    role: "menuitem",
+    "aria-label": "Enviar arquivos",
+    class: "upload-item",
+    text: "Enviar arquivos",
+  });
+  const desc = a.describeMenuItem(item);
+  assert(desc !== null);
+  assertEqual(desc.tag, "button");
+  assertEqual(desc.role, "menuitem");
+  assertEqual(desc.ariaLabel, "Enviar arquivos");
+  assertEqual(desc.textSample, "Enviar arquivos");
+});
+
+test("adapter: runAttachTrace — invalid file fails at asset-loaded", async () => {
+  const a = loadAdapterInSandbox();
+  const trace = await a.runAttachTrace(null);
+  assertEqual(trace.operation, "attach");
+  assertEqual(trace.failedAt, "asset-loaded");
+  assertEqual(trace.steps.length, 1);
+  assertEqual(trace.steps[0].step, "asset-loaded");
+  assertEqual(trace.steps[0].ok, false);
+  assert(typeof trace.steps[0].durationMs === "number");
+  assert(typeof trace.steps[0].ts === "string");
+});
+
+test("adapter: runAttachTrace — without any DOM the trigger step fails next", async () => {
+  const a = loadAdapterInSandbox();
+  const trace = await a.runAttachTrace({
+    name: "character-main.png",
+    size: 1024,
+    type: "image/png",
+  });
+  // Without document.querySelector etc., findPlusButton is null
+  // (the sandbox has no DOM).
+  assert(trace.failedAt != null);
+  // The trigger-found step must be present and must be ok=false.
+  const step = trace.steps.find(
+    (s) => s.step === "attachment-trigger-found",
+  );
+  assert(step);
+  assertEqual(step.ok, false);
+  // failedAt should stop at trigger-found (no DOM = no trigger).
+  assertEqual(trace.failedAt, "attachment-trigger-found");
+});
+
+test("adapter: snapshotFileInputs returns 0 with no DOM", () => {
+  const a = loadAdapterInSandbox();
+  const r = a.snapshotFileInputs();
+  assertEqual(r.count, 0);
+  assertEqual(r.inputs.length, 0);
+});
+
+// vm sandbox DOM tests: install a minimal document with the surface
+// the adapter uses (querySelector, querySelectorAll, getBoundingClientRect).
+function withMinimalDom(innerHtml, bodyAttrs, run) {
+  const vm = require("vm");
+  const fs = require("fs");
+  const code = fs.readFileSync(
+    path.join(ROOT, "src/dom/geminiDomAdapter.js"),
+    "utf8",
+  );
+  function makeEl(tag, attrs, parentEl) {
+    const el = defineNodeMethods({
+      tagName: tag.toUpperCase(),
+      attributes: Object.entries(attrs || {}).map(([k, v]) => ({
+        name: k,
+        value: String(v),
+      })),
+      _parent: parentEl || null,
+      _children: [],
+      _classes: ((attrs && attrs.class) || "")
+        .toString()
+        .split(/\s+/)
+        .filter(Boolean),
+      style: { display: "", visibility: "" },
+      multiple: !!(attrs && attrs.multiple === true),
+      className: ((attrs && attrs.class) || "").toString(),
+      innerHTML: (attrs && attrs.innerHTML) || "",
+      innerText: (attrs && attrs.text) || "",
+      textContent: (attrs && attrs.text) || "",
+      id: (attrs && attrs.id) || "",
+    });
+    for (const [k, v] of Object.entries(attrs || {})) {
+      if (k === "text" || k === "class" || k === "id") continue;
+      el[k] = v;
+    }
+    return el;
+  }
+  const docBody = makeEl("body", bodyAttrs || {});
+  const doc = wrapDoc(docBody);
+  const ctx = {
+    console,
+    setTimeout,
+    clearTimeout,
+    Date,
+    JSON,
+    MutationObserver: undefined,
+    DataTransfer: undefined,
+    Element: function Element() {},
+    document: doc,
+  };
+  ctx.globalThis = ctx;
+  ctx.self = ctx;
+  ctx.window = ctx;
+  vm.createContext(ctx);
+  if (innerHtml && typeof innerHtml === "function") {
+    innerHtml(makeEl, doc.body);
+  }
+  vm.runInContext(code, ctx);
+  const a = ctx.globalThis.RedSunDomAdapter;
+  run(a, ctx);
+  return ctx;
+}
+
+test("adapter: findUploadFilesInOverlay — Tier 1 detects attach_file + menuitem", () => {
+  withMinimalDom(
+    (mk, body) => {
+      const menu = mk("div", { class: "cdk-overlay-pane" });
+      body.appendChild(menu);
+      const item = mk("button", {
+        role: "menuitem",
+        "aria-label": null,
+        class: "menu-item",
+      });
+      menu.appendChild(item);
+      // Embed the icon with alt="attach_file".
+      const icon = mk("img", { alt: "attach_file" });
+      item.appendChild(icon);
+    },
+    {},
+    (a) => {
+      const r = a.findUploadFilesInOverlay();
+      if (!r.ok) {
+        throw new Error(
+          "expected ok=true. candidates=" + JSON.stringify(r.candidates, null, 2),
+        );
+      }
+      assertEqual(r.tier, 100);
+      assertEqual(r.item.iconAlt, "attach_file");
+    },
+  );
+});
+
+test("adapter: findUploadFilesInOverlay — Tier 2 fallback (PT aria-label)", () => {
+  withMinimalDom(
+    (mk, body) => {
+      const menu = mk("div", { class: "cdk-overlay-pane" });
+      body.appendChild(menu);
+      const item = mk("button", {
+        role: "menuitem",
+        "aria-label": "Enviar arquivos",
+        class: "menu-item",
+        text: "Enviar arquivos",
+      });
+      menu.appendChild(item);
+    },
+    {},
+    (a) => {
+      const r = a.findUploadFilesInOverlay();
+      assert(r.ok);
+      assert(r.tier >= 70);
+      assertEqual(r.item.ariaLabel, "Enviar arquivos");
+    },
+  );
+});
+
+test("adapter: findUploadFilesInOverlay — Tier 3 fallback matches localized text", () => {
+  withMinimalDom(
+    (mk, body) => {
+      const menu = mk("div", { class: "cdk-overlay-pane" });
+      body.appendChild(menu);
+      const item = mk("button", {
+        role: "menuitem",
+        class: "menu-item",
+        text: "ファイルをアップロード",
+      });
+      menu.appendChild(item);
+    },
+    {},
+    (a) => {
+      const r = a.findUploadFilesInOverlay();
+      assert(r.ok);
+      // Tier 3 should fire on exact localized text (score >= 50).
+      assert(r.tier >= 50);
+    },
+  );
+});
+
+test("adapter: findMenuCandidates discovers CDK overlay panels", () => {
+  withMinimalDom(
+    (mk, body) => {
+      const cdk = mk("div", { class: "cdk-overlay-container" });
+      body.appendChild(cdk);
+      const pane = mk("div", { class: "cdk-overlay-pane" });
+      cdk.appendChild(pane);
+      const menu = mk("div", { role: "menu" });
+      pane.appendChild(menu);
+      for (let i = 0; i < 5; i++) {
+        menu.appendChild(
+          mk("button", {
+            role: "menuitem",
+            class: "mi",
+            text: "item " + i,
+          }),
+        );
+      }
+    },
+    {},
+    (a) => {
+      const cands = a.findMenuCandidates();
+      assert(cands.length >= 1, "expected at least one menu candidate");
+      // CDK overlay pane should be picked up.
+      assert(
+        cands.some((c) => /cdk-overlay/.test(c.source)),
+        "expected cdk-overlay selector matched",
+      );
+    },
+  );
+});
+
+test("adapter: runAttachTrace stops at attachment-trigger-found (no DOM)", async () => {
+  const vm = require("vm");
+  const fs = require("fs");
+  const code = fs.readFileSync(
+    path.join(ROOT, "src/dom/geminiDomAdapter.js"),
+    "utf8",
+  );
+  const ctx = { console, setTimeout, clearTimeout, Date, JSON };
+  ctx.globalThis = ctx;
+  vm.createContext(ctx);
+  vm.runInContext(code, ctx);
+  const a = ctx.globalThis.RedSunDomAdapter;
+  const trace = await a.runAttachTrace({
+    name: "x.png",
+    size: 1,
+    type: "image/png",
+  });
+  // Without DOM, trigger isn't found.
+  assertEqual(trace.failedAt, "attachment-trigger-found");
+  // Steps are emitted in the spec order up to the failure.
+  const stepsBefore = trace.steps.map((s) => s.step);
+  assertEqual(stepsBefore[0], "asset-loaded");
+  assertEqual(stepsBefore[1], "messaging-ok");
+  assertEqual(stepsBefore[2], "attachment-trigger-found");
+});
+
+test("adapter: trace step durations are numeric and never negative", async () => {
+  const a = loadAdapterInSandbox();
+  const trace = await a.runAttachTrace({
+    name: "x.png",
+    size: 1,
+    type: "image/png",
+  });
+  for (const s of trace.steps) {
+    assert(typeof s.durationMs === "number", `step ${s.step} durationMs numeric`);
+    assert(s.durationMs >= 0, `step ${s.step} durationMs >= 0`);
+  }
+});
+
 // ----- end ----------------------------------------------------------------
 
 console.log(

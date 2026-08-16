@@ -1733,6 +1733,917 @@
     };
   }
 
+  // ---- v0.6.2: Attachment Step Trace + Layered Menu/Input Probes ------
+  //
+  // The v0.6.1 attach flow was failing in real Chrome with no observable
+  // failure: trigger found, click did nothing observable. We need to
+  // discover exactly where the flow dies without speculating.
+  //
+  // This block adds two non-destructive diagnostic tools the side panel
+  // can call:
+  //
+  //   runAttachTrace(file)
+  //     Runs ONE attach operation with structured tracing. Each step
+  //     records { ok, timestamp, durationMs, payload }. Returns the
+  //     full trace so the side panel can render "Failed at: <step>".
+  //     No bytes are ever written to the trace.
+  //
+  //   probeFileInputLifecycle(checkpointsMs)
+  //     Snapshots <input type=file> state at multiple times after a
+  //     click event. Identifies the four lifecycle classes:
+  //       A. appears and persists
+  //       B. appears briefly then disappears
+  //       C. always present (hidden)
+  //       D. never appears
+  //
+  //   findUploadFilesInOverlay()
+  //     Layered detector for the "Enviar arquivos" menu item. Tier 1
+  //     uses structural signals (role + icon + position). Tier 2
+  //     uses accessible-name fragments. Tier 3 falls back to localized
+  //     text. Searches globally because Angular/Material renders
+  //     menus outside the composer's DOM subtree via CDK overlay.
+  //
+  // Existing attachFileWithMenu() is preserved unchanged. This block
+  // is additive: callers that depend on it see no behavioral diff.
+
+  // Locale-aware labels for the upload-files menu item. Used in Tier 3
+  // only. Adding a language = appending one string here.
+  const UPLOAD_FILES_FALLBACK_LABELS = Object.freeze({
+    "en-US": "Upload files",
+    "en-GB": "Upload files",
+    "pt-BR": "Enviar arquivos",
+    "pt-PT": "Enviar ficheiros",
+    "es-ES": "Subir archivos",
+    "es-419": "Subir archivos",
+    "fr-FR": "Téléverser des fichiers",
+    "de-DE": "Dateien hochladen",
+    "ja-JP": "ファイルをアップロード",
+    "ko-KR": "파일 업로드",
+    "zh-CN": "上传文件",
+    "zh-TW": "上傳檔案",
+    "vi-VN": "Tải tệp lên",
+    "it-IT": "Carica file",
+  });
+
+  // Step list, in order. The trace function emits one entry per step.
+  const ATTACH_TRACE_STEPS = Object.freeze([
+    "asset-loaded",
+    "messaging-ok",
+    "attachment-trigger-found",
+    "attachment-trigger-clicked",
+    "menu-detected",
+    "upload-action-detected",
+    "upload-action-clicked",
+    "file-input-detected",
+    "file-assigned",
+    "change-dispatched",
+    "attachment-ui-detected",
+    "attachment-ready",
+  ]);
+
+  function makeTraceStep(step, ok, payload, startedAt) {
+    return {
+      step,
+      ok: !!ok,
+      ts: new Date().toISOString(),
+      durationMs: Date.now() - startedAt,
+      payload: payload || null,
+    };
+  }
+
+  function describeDomNode(el) {
+    if (!el || !(el instanceof Element)) return null;
+    let parent = el.parentElement;
+    let parentTag = null;
+    let parentClass = null;
+    if (parent) {
+      parentTag = parent.tagName?.toLowerCase() ?? null;
+      parentClass = (parent.className || "").toString().slice(0, 80);
+    }
+    return {
+      tag: el.tagName?.toLowerCase() ?? null,
+      id: el.id || null,
+      type: el.getAttribute("type") ?? null,
+      accept: el.getAttribute("accept") ?? null,
+      multiple: el.multiple ?? null,
+      display: el.style?.display ?? null,
+      visibility: el.style?.visibility ?? null,
+      width: el.getBoundingClientRect().width,
+      height: el.getBoundingClientRect().height,
+      parentTag,
+      parentClass,
+    };
+  }
+
+  /**
+   * Find every plausible menu/popover candidate in the document.
+   * The Gemini UI (Angular Material + CDK overlay) renders the + menu
+   * outside the composer's DOM subtree, frequently as a sibling of
+   * <body> or under a CDK overlay container.
+   *
+   * This is a structural probe; nothing is clicked.
+   */
+  function findMenuCandidates() {
+    const out = [];
+    const seen = new Set();
+
+    // 1. Explicit menu/popover roles + Angular Material components.
+    const sels = [
+      '[role="menu"]',
+      '[role="dialog"]',
+      '[role="listbox"]',
+      '[role="presentation"]',
+      'mat-menu-panel',
+      'mat-dialog-container',
+      '.cdk-overlay-pane',
+      '.cdk-overlay-container [role="menu"]',
+      '.cdk-overlay-container mat-menu-panel',
+      '.cdk-overlay-backdrop',
+      '[popover]',
+      'dialog[open]',
+    ];
+    for (const sel of sels) {
+      try {
+        for (const el of document.querySelectorAll(sel)) {
+          if (seen.has(el)) continue;
+          seen.add(el);
+          const r = el.getBoundingClientRect();
+          if (!(r.width > 0 && r.height > 0)) continue;
+          out.push({
+            source: sel,
+            tag: el.tagName?.toLowerCase() ?? null,
+            role: el.getAttribute("role") ?? null,
+            classHint: (el.className || "").toString().slice(0, 80),
+            rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+            itemCount: el.querySelectorAll(
+              '[role="menuitem"], [role="menuitemcheckbox"], button, a',
+            ).length,
+          });
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Describe a candidate menu item: tag, role, accessible name, visible
+   * text sample, classes, and useful data-attributes. No content beyond
+   * structural fields is returned.
+   */
+  function describeMenuItem(el) {
+    if (!el || typeof el.getAttribute !== "function") return null;
+    const text = (el.textContent || "").trim();
+    const aria = el.getAttribute("aria-label") ?? null;
+    const icon = el.querySelector("img, mat-icon, [class*='icon'], [class*='material']");
+    const iconAlt = icon
+      ? icon.getAttribute("alt") ?? icon.textContent ?? null
+      : null;
+    return {
+      tag: el.tagName?.toLowerCase() ?? null,
+      role: el.getAttribute("role") ?? null,
+      ariaLabel: aria,
+      textSample: text.slice(0, 80),
+      textLength: text.length,
+      classHint: (el.className || "").toString().slice(0, 120),
+      iconAlt,
+      dataAttrs: collectUsefulDataAttrs(el),
+    };
+  }
+
+  function collectUsefulDataAttrs(el) {
+    const out = {};
+    if (!el || !el.attributes) return out;
+    for (const a of Array.from(el.attributes)) {
+      if (!a || typeof a.name !== "string") continue;
+      if (!a.name.startsWith("data-")) continue;
+      if (a.name.length > 64) continue;
+      if (a.value && a.value.length > 200) continue;
+      out[a.name] = a.value;
+    }
+    return out;
+  }
+
+  /**
+   * Layered detector for the "Upload files" (PT: "Enviar arquivos") item.
+   * Searches globally across every menu candidate, not just descendants
+   * of the + button — Angular Material renders menus in CDK overlays.
+   *
+   *   Tier 1: structural / icon-based
+   *           role=menuitem + icon whose alt is "attach_file" (or
+   *           contains that fragment) + ancestor chain points to an
+   *           upload/attach region.
+   *   Tier 2: accessible-name match
+   *           aria-label contains "upload files" / "enviar arquivo".
+   *   Tier 3: localized text fallback
+   *           exact match (case-insensitive) against UPLOAD_FILES_FALLBACK_LABELS
+   *           values.
+   *
+   * Returns { ok, item, tier, candidates[] }. ok is true iff an item
+   * was selected. Each candidate in the array is a structured
+   * describeMenuItem() snapshot. Nothing about the file itself is
+   * recorded here.
+   */
+  function findUploadFilesInOverlay() {
+    const candidates = [];
+
+    // 1. Collect every menuitem-like element, even those outside the
+    //    composer's subtree. We bound the search by visible-bbox > 0.
+    const items = Array.from(
+      document.querySelectorAll(
+        '[role="menuitem"], [role="menuitemcheckbox"], button, a',
+      ),
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    });
+
+    for (const el of items) {
+      const desc = describeMenuItem(el);
+      if (!desc) continue;
+
+      const tier = scoreUploadCandidate(el, desc);
+      if (tier > 0) candidates.push({ desc, tier, el });
+    }
+
+    if (candidates.length === 0) {
+      return { ok: false, item: null, tier: 0, candidates: [] };
+    }
+    candidates.sort((a, b) => b.tier - a.tier);
+    const best = candidates[0];
+    return {
+      ok: true,
+      item: best.desc,
+      tier: best.tier,
+      candidates: candidates.slice(0, 8).map((c) => c.desc),
+    };
+  }
+
+  function scoreUploadCandidate(el, desc) {
+    const label = (desc.ariaLabel || "").toLowerCase();
+    const text = (desc.textSample || "").toLowerCase();
+    const icon = (desc.iconAlt || "").toLowerCase();
+
+    // Tier 1: structural — icon name is the canonical "attach_file"
+    //         Material symbol, and the surrounding role is menuitem.
+    if (
+      desc.role === "menuitem" &&
+      (icon === "attach_file" || icon.includes("attach_file"))
+    ) {
+      return 100;
+    }
+
+    // Tier 2: accessible-name fragments.
+    if (/upload\s*files?/i.test(label)) return 80;
+    if (/enviar\s*arquivos?/i.test(label)) return 78;
+    if (/t[eé]l[ée]verser\s+des\s+fichiers?/i.test(label)) return 76;
+    if (/ファイル.*アップロード|アップロード.*ファイル/.test(label)) return 76;
+    if (label && /upload|attach|fichier|datei|archivo/i.test(label) &&
+        /file|archivo|file|fichier|datei/i.test(label) &&
+        !/generador|imagen|image create|video|música|music|canvas|deep research/i.test(label)
+    ) {
+      return 60;
+    }
+
+    // Tier 3: localized visible text (case-insensitive exact match).
+    const FALLBACK_VALUES = Object.values(UPLOAD_FILES_FALLBACK_LABELS).map((v) =>
+      v.toLowerCase(),
+    );
+    if (text && FALLBACK_VALUES.includes(text)) return 50;
+
+    // Soft tier 3+: substring of a long-enough fallback.
+    for (const v of FALLBACK_VALUES) {
+      if (v.length >= 8 && text && text.includes(v)) return 30;
+    }
+    return 0;
+  }
+
+  /**
+   * Snapshot a single <input type="file"> for diagnostics.
+   * count + accept + multiple + display + parentDescriptor.
+   */
+  function snapshotFileInputs() {
+    const inputs = Array.from(
+      document.querySelectorAll('input[type="file"]'),
+    );
+    return {
+      count: inputs.length,
+      inputs: inputs.slice(0, 4).map(describeDomNode),
+    };
+  }
+
+  /**
+   * Probe the file input lifecycle at a fixed schedule of checkpoints
+   * (in ms). Each checkpoint records count + first-input structural
+   * descriptor if any. Classifies the lifecycle after the budget.
+   *
+   * Implementation: a single MutationObserver on document.body with
+   * the requested timeout. We explicitly do NOT poll at every
+   * millisecond; we wake on actual mutations and re-check at the
+   * scheduled checkpoints.
+   */
+  function probeFileInputLifecycle(checkpointsMs) {
+    if (!Array.isArray(checkpointsMs) || checkpointsMs.length === 0) {
+      checkpointsMs = [0, 50, 150, 300, 750, 1500, 2500];
+    }
+    const sortedCheckpoints = [...checkpointsMs].sort((a, b) => a - b);
+    const totalMs = sortedCheckpoints[sortedCheckpoints.length - 1];
+    const snapshots = [];
+    let observed = false;
+
+    const obs = new MutationObserver(() => {
+      observed = true;
+    });
+    try {
+      obs.observe(document.body, { childList: true, subtree: true });
+    } catch (_) {
+      /* ignore */
+    }
+
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      let idx = 0;
+      const takeSnapshot = () => {
+        const elapsed = Date.now() - startedAt;
+        const snap = snapshotFileInputs();
+        snapshots.push({
+          atMs: elapsed,
+          triggeredByCheckpoint: sortedCheckpoints[idx] ?? null,
+          count: snap.count,
+          accept: snap.inputs[0]?.accept ?? null,
+          multiple: snap.inputs[0]?.multiple ?? false,
+          display: snap.inputs[0]?.display ?? null,
+          width: snap.inputs[0]?.width ?? 0,
+          height: snap.inputs[0]?.height ?? 0,
+          parentDescriptor: snap.inputs[0]?.parentTag ?? null,
+          // Note: not used downstream; intentionally truncated.
+          inputCountDelta: snap.count - (snapshots.at(-1)?.count ?? 0),
+        });
+        idx++;
+      };
+
+      // First checkpoint is always at 0ms (immediate).
+      takeSnapshot();
+
+      const tick = () => {
+        const elapsed = Date.now() - startedAt;
+        while (
+          idx < sortedCheckpoints.length &&
+          elapsed >= sortedCheckpoints[idx]
+        ) {
+          takeSnapshot();
+        }
+        if (Date.now() - startedAt >= totalMs + 50) {
+          try {
+            obs.disconnect();
+          } catch (_) {
+            /* ignore */
+          }
+          const counts = snapshots.map((s) => s.count);
+          const minCount = counts.length > 0 ? Math.min(...counts) : 0;
+          const maxCount = counts.length > 0 ? Math.max(...counts) : 0;
+          let classification = "never-appeared";
+          if (maxCount > 0 && minCount > 0) classification = "always-present";
+          else if (maxCount > 0) classification = "appeared-briefly";
+          else if (maxCount > 0 && minCount === maxCount) {
+            classification = "always-present";
+          } else if (maxCount > 0) {
+            classification = "appeared-briefly";
+          }
+          resolve({
+            durationMs: Date.now() - startedAt,
+            snapshots,
+            classification,
+            mutationObserved: observed,
+            totalCheckpoints: sortedCheckpoints.length,
+          });
+          return;
+        }
+        setTimeout(tick, 50);
+      };
+      setTimeout(tick, 0);
+    });
+  }
+
+  /**
+   * Wait for a real DOM signal that the chat composer recognized the
+   * attachment. We do NOT trust file injection alone; we verify a
+   * concrete UI delta.
+   *
+   *   signals: attachment chip count delta, thumbnail under input-area-v2,
+   *            gem-media-attachment appearance, or preview img with
+   *            data: / blob: source.
+   *
+   * Returns { ok, evidence, signalsAfter }. Never throws.
+   */
+  async function waitForAttachmentEvidence(chipsBefore, timeoutMs) {
+    const start = Date.now();
+    const deadline = start + (timeoutMs || ATTACH_FILE_TIMEOUT_MS);
+    const area = document.querySelector("input-area-v2");
+
+    const computeState = () => {
+      const chips = area ? area.querySelectorAll("gem-media-attachment") : [];
+      const thumbs = area ? area.querySelectorAll('[class*="thumbnail" i], img[src^="data:"], img[src^="blob:"]') : [];
+      return {
+        chips: chips.length,
+        thumbnails: thumbs.length,
+      };
+    };
+
+    return new Promise((resolve) => {
+      let resolved = false;
+      const finalize = (r) => {
+        if (resolved) return;
+        resolved = true;
+        try {
+          obs.disconnect();
+        } catch (_) {
+          /* ignore */
+        }
+        resolve(r);
+      };
+
+      const obs = new MutationObserver(() => {
+        const state = computeState();
+        if (state.chips > chipsBefore || state.thumbnails > 0) {
+          finalize({
+            ok: true,
+            signalsAfter: { ...state, atMs: Date.now() - start },
+            evidence: {
+              chipsDelta: state.chips - chipsBefore,
+              thumbnails: state.thumbnails,
+              areaTag: area?.tagName?.toLowerCase() ?? null,
+            },
+          });
+        }
+      });
+      try {
+        obs.observe(document.body, { childList: true, subtree: true });
+      } catch (_) {
+        /* ignore */
+      }
+
+      const tick = () => {
+        if (resolved) return;
+        const state = computeState();
+        if (state.chips > chipsBefore || state.thumbnails > 0) {
+          finalize({
+            ok: true,
+            signalsAfter: { ...state, atMs: Date.now() - start },
+            evidence: {
+              chipsDelta: state.chips - chipsBefore,
+              thumbnails: state.thumbnails,
+              areaTag: area?.tagName?.toLowerCase() ?? null,
+            },
+          });
+          return;
+        }
+        if (Date.now() >= deadline) {
+          const state = computeState();
+          finalize({
+            ok: false,
+            signalsAfter: { ...state, atMs: Date.now() - start },
+            evidence: {
+              chipsDelta: state.chips - chipsBefore,
+              thumbnails: state.thumbnails,
+              areaTag: area?.tagName?.toLowerCase() ?? null,
+            },
+          });
+          return;
+        }
+        setTimeout(tick, 100);
+      };
+      tick();
+    });
+  }
+
+  /**
+   * Public: run a structured attach trace. This is intentionally
+   * additive to attachFileWithMenu(). Existing callers see no change.
+   *
+   * Each step records { ok, ts, durationMs, payload }. No bytes are
+   * recorded. The trace aborts on first failure and never throws.
+   */
+  async function runAttachTrace(file) {
+    const startedAt = Date.now();
+    const trace = {
+      operation: "attach",
+      assetId: file?.name ?? null,
+      startedAt: new Date().toISOString(),
+      steps: [],
+      failedAt: null,
+      summary: null,
+    };
+
+    function pushStep(stepName, ok, payload) {
+      const step = makeTraceStep(stepName, ok, payload, startedAt);
+      trace.steps.push(step);
+      return step;
+    }
+
+    // Step 1 — asset-loaded
+    if (!file || typeof file !== "object" || typeof file.name !== "string") {
+      pushStep("asset-loaded", false, { reason: "invalid file" });
+      trace.failedAt = "asset-loaded";
+      trace.summary = { totalDurationMs: Date.now() - startedAt, reason: "asset-loaded" };
+      return trace;
+    }
+    pushStep("asset-loaded", true, {
+      name: file.name,
+      size: file.size,
+      type: file.type,
+    });
+
+    // Step 2 — messaging-ok (pre-flight; content script must be alive)
+    pushStep("messaging-ok", true, {
+      reason: "this function runs inside the content script",
+    });
+
+    // Step 3 — attachment-trigger-found
+    const trigger0 = findPlusButton();
+    if (!trigger0) {
+      pushStep("attachment-trigger-found", false, {
+        reason: "findPlusButton returned null",
+      });
+      trace.failedAt = "attachment-trigger-found";
+      trace.summary = { totalDurationMs: Date.now() - startedAt };
+      return trace;
+    }
+    pushStep("attachment-trigger-found", true, {
+      tag: trigger0.tagName?.toLowerCase() ?? null,
+      ariaLabel: trigger0.getAttribute("aria-label") ?? null,
+    });
+
+    // Step 4 — attachment-trigger-clicked
+    const t0 = Date.now();
+    try {
+      trigger0.click();
+    } catch (e) {
+      pushStep("attachment-trigger-clicked", false, {
+        error: e?.message ?? "unknown",
+      });
+      trace.failedAt = "attachment-trigger-clicked";
+      trace.summary = { totalDurationMs: Date.now() - startedAt };
+      return trace;
+    }
+    pushStep("attachment-trigger-clicked", true, {
+      durationMs: Date.now() - t0,
+    });
+
+    // Step 5 — menu-detected (search globally, not just composer subtree)
+    const t1 = Date.now();
+    let menuEvidence = null;
+    let menuObservation = null;
+    const menuWaitStart = Date.now();
+    while (Date.now() - menuWaitStart < ATTACH_MENU_OPEN_TIMEOUT_MS) {
+      const candidates = findMenuCandidates();
+      if (candidates.length > 0) {
+        menuEvidence = candidates;
+        break;
+      }
+      await sleep(80);
+    }
+    if (!menuEvidence) {
+      pushStep("menu-detected", false, {
+        candidates: menuObservation,
+        timeoutMs: ATTACH_MENU_OPEN_TIMEOUT_MS,
+      });
+      trace.failedAt = "menu-detected";
+      trace.summary = { totalDurationMs: Date.now() - startedAt };
+      return trace;
+    }
+    pushStep("menu-detected", true, {
+      durationMs: Date.now() - t1,
+      menuItemCount: menuEvidence.reduce((acc, m) => acc + m.itemCount, 0),
+      menuCount: menuEvidence.length,
+      firstMenu: menuEvidence[0],
+    });
+
+    // Step 6 — upload-action-detected
+    const t2 = Date.now();
+    const probe = findUploadFilesInOverlay();
+    if (!probe.ok) {
+      pushStep("upload-action-detected", false, {
+        tier: probe.tier,
+        candidateCount: probe.candidates.length,
+        candidates: probe.candidates.slice(0, 3),
+      });
+      trace.failedAt = "upload-action-detected";
+      trace.summary = { totalDurationMs: Date.now() - startedAt };
+      return trace;
+    }
+    pushStep("upload-action-detected", true, {
+      durationMs: Date.now() - t2,
+      tier: probe.tier,
+      matchedAria: probe.item?.ariaLabel ?? null,
+      matchedText: probe.item?.textSample ?? null,
+      iconAlt: probe.item?.iconAlt ?? null,
+    });
+
+    // We do NOT click [Enviar arquivos] yet — the user wants to first
+    // observe the file input lifecycle without modifying it. The
+    // remaining steps run only after explicit OptIn for Strategy A.
+    //
+    // For the trace diagnostic we just record that upload-action is
+    // locatable, and mark "trace complete" without modifying any state.
+    pushStep("upload-action-clicked", true, {
+      skipped: true,
+      reason:
+        "trace completes at action-detection; further steps modify state and are gated behind opt-in",
+    });
+    pushStep("file-input-detected", false, {
+      skipped: true,
+      reason: "no input mutation attempted in trace-only mode",
+    });
+    pushStep("file-assigned", false, {
+      skipped: true,
+      reason: "trace-only",
+    });
+    pushStep("change-dispatched", false, {
+      skipped: true,
+      reason: "trace-only",
+    });
+    pushStep("attachment-ui-detected", false, {
+      skipped: true,
+      reason: "trace-only",
+    });
+    pushStep("attachment-ready", false, {
+      skipped: true,
+      reason: "trace-only",
+    });
+
+    trace.failedAt = null;
+    trace.summary = {
+      totalDurationMs: Date.now() - startedAt,
+      traceOnly: true,
+    };
+    return trace;
+  }
+
+  /**
+   * Public: trace-only file-input lifecycle probe. Takes an optional
+   * schedule (defaults to the standard checkpoints) and returns one
+   * snapshot per checkpoint plus a final classification.
+   */
+  function runFileInputLifecycleProbe(checkpointsMs) {
+    return probeFileInputLifecycle(checkpointsMs);
+  }
+
+  /**
+   * Public: layered upload-files item detector. Returns the full
+   * candidate list (or empty), so the side panel can show the user
+   * what each candidate looks like.
+   */
+  function probeUploadFilesCandidates() {
+    return findUploadFilesInOverlay();
+  }
+
+  // expose the internal name too, so tests + future tooling can call
+  // either name without confusion.
+  // eslint-disable-next-line no-unused-vars
+  var findUploadFilesInOverlay_alias = findUploadFilesInOverlay;
+
+  /**
+   * Strategy A: attempt the native-input injection flow. Returns a
+   * structured trace (same shape as runAttachTrace). The side panel
+   * surfaces it.
+   */
+  async function runAttachStrategyA(file) {
+    const startedAt = Date.now();
+    const trace = {
+      operation: "attach-strategy-a",
+      assetId: file?.name ?? null,
+      startedAt: new Date().toISOString(),
+      steps: [],
+      failedAt: null,
+      summary: null,
+      strategy: "native-input+datatransfer",
+    };
+
+    function pushStep(stepName, ok, payload) {
+      const step = makeTraceStep(stepName, ok, payload, startedAt);
+      trace.steps.push(step);
+      return step;
+    }
+
+    if (!file || typeof file !== "object" || typeof file.name !== "string") {
+      pushStep("asset-loaded", false, { reason: "invalid file" });
+      trace.failedAt = "asset-loaded";
+      return trace;
+    }
+
+    pushStep("asset-loaded", true, {
+      name: file.name,
+      size: file.size,
+      type: file.type,
+    });
+    pushStep("messaging-ok", true, {
+      reason: "content-script context",
+    });
+
+    const trigger = findPlusButton();
+    if (!trigger) {
+      pushStep("attachment-trigger-found", false, {
+        reason: "findPlusButton returned null",
+      });
+      trace.failedAt = "attachment-trigger-found";
+      return trace;
+    }
+    pushStep("attachment-trigger-found", true, {
+      ariaLabel: trigger.getAttribute("aria-label") ?? null,
+    });
+
+    try {
+      trigger.click();
+    } catch (e) {
+      pushStep("attachment-trigger-clicked", false, { error: e?.message });
+      trace.failedAt = "attachment-trigger-clicked";
+      return trace;
+    }
+    pushStep("attachment-trigger-clicked", true);
+
+    // Wait for menu.
+    const menuWaitStart = Date.now();
+    while (Date.now() - menuWaitStart < ATTACH_MENU_OPEN_TIMEOUT_MS) {
+      if (findMenuCandidates().length > 0) break;
+      await sleep(80);
+    }
+    const menuCandidates = findMenuCandidates();
+    if (menuCandidates.length === 0) {
+      pushStep("menu-detected", false, { timeoutMs: ATTACH_MENU_OPEN_TIMEOUT_MS });
+      trace.failedAt = "menu-detected";
+      return trace;
+    }
+    pushStep("menu-detected", true, { menuCount: menuCandidates.length });
+
+    const probe = findUploadFilesInOverlay();
+    if (!probe.ok) {
+      pushStep("upload-action-detected", false, {
+        candidateCount: probe.candidates.length,
+      });
+      trace.failedAt = "upload-action-detected";
+      return trace;
+    }
+    pushStep("upload-action-detected", true, {
+      tier: probe.tier,
+      matchedAria: probe.item?.ariaLabel ?? null,
+      matchedText: probe.item?.textSample ?? null,
+    });
+
+    // Strategy A attempts a CLICK on the upload menuitem; this is the
+    // known race: Gemini may mount <input type=file> immediately (good)
+    // OR open the OS picker immediately (bad). We click, then
+    // immediately attempt DataTransfer injection on whichever file
+    // input appears, watching lifecycle.
+    let clickedEl = null;
+    if (probe.candidates && probe.candidates.length > 0) {
+      // Re-locate the live element by descriptor (the previous result
+      // may have been collected from a now-detached node).
+      const items = Array.from(
+        document.querySelectorAll(
+          '[role="menuitem"], [role="menuitemcheckbox"], button, a',
+        ),
+      );
+      clickedEl = items.find((el) => {
+        if (!(el.getBoundingClientRect().width > 0)) return false;
+        const label = (el.getAttribute("aria-label") || "").toLowerCase();
+        const text = ((el.textContent || "").trim() || "").toLowerCase();
+        if (label && probe.item?.ariaLabel &&
+            label === probe.item.ariaLabel.toLowerCase()) return true;
+        if (text && probe.item?.textSample &&
+            text === probe.item.textSample.toLowerCase()) return true;
+        return false;
+      });
+    }
+    if (!clickedEl) {
+      pushStep("upload-action-clicked", false, {
+        reason: "clickable element could not be re-located after detection",
+      });
+      trace.failedAt = "upload-action-clicked";
+      return trace;
+    }
+    try {
+      clickedEl.click();
+    } catch (e) {
+      pushStep("upload-action-clicked", false, { error: e?.message });
+      trace.failedAt = "upload-action-clicked";
+      return trace;
+    }
+    pushStep("upload-action-clicked", true, {
+      tag: clickedEl.tagName?.toLowerCase() ?? null,
+    });
+
+    // Lifecycle probe — confirms the input's behavior under our action.
+    const lifecycle = await probeFileInputLifecycle([
+      0, 50, 150, 300, 750, 1500, 2500,
+    ]);
+    const snapshotAtFinal = lifecycle.snapshots[lifecycle.snapshots.length - 1];
+    if (snapshotAtFinal.count === 0) {
+      pushStep("file-input-detected", false, {
+        classification: lifecycle.classification,
+        snapshots: lifecycle.snapshots,
+        durationMs: lifecycle.durationMs,
+      });
+      trace.failedAt = "file-input-detected";
+      return trace;
+    }
+    pushStep("file-input-detected", true, {
+      classification: lifecycle.classification,
+      count: snapshotAtFinal.count,
+      accept: snapshotAtFinal.accept,
+      multiple: snapshotAtFinal.multiple,
+      display: snapshotAtFinal.display,
+      parentDescriptor: snapshotAtFinal.parentDescriptor,
+      durationMs: lifecycle.durationMs,
+    });
+
+    // Inject File via DataTransfer.
+    let inputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    if (inputs.length === 0) {
+      pushStep("file-assigned", false, { reason: "no input at injection time" });
+      trace.failedAt = "file-assigned";
+      return trace;
+    }
+    const input = inputs[0];
+    let dataTransfer;
+    try {
+      dataTransfer = new DataTransfer();
+      dataTransfer.items.add(file);
+    } catch (e) {
+      pushStep("file-assigned", false, { error: e?.message ?? "DataTransfer failed" });
+      trace.failedAt = "file-assigned";
+      return trace;
+    }
+    try {
+      Object.defineProperty(input, "files", {
+        value: dataTransfer.files,
+        configurable: true,
+      });
+    } catch (e) {
+      pushStep("file-assigned", false, { error: e?.message ?? "defineProperty failed" });
+      trace.failedAt = "file-assigned";
+      return trace;
+    }
+    pushStep("file-assigned", true, {
+      fileName: file.name,
+      mime: file.type,
+      size: file.size,
+    });
+
+    // Dispatch the events Gemini listens for. The user spec is explicit:
+    // only input + change. No shotgun of synthetic events.
+    const area = document.querySelector("input-area-v2");
+    const chipsBefore = area ? area.querySelectorAll("gem-media-attachment").length : 0;
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    pushStep("change-dispatched", true, { chipsBefore });
+
+    // Wait for ACTUAL UI evidence: chip count increment OR thumbnail.
+    const evidenceResult = await waitForAttachmentEvidence(chipsBefore, ATTACH_FILE_TIMEOUT_MS);
+    if (!evidenceResult.ok) {
+      pushStep("attachment-ui-detected", false, {
+        signalsAfter: evidenceResult.signalsAfter,
+        evidence: evidenceResult.evidence,
+      });
+      trace.failedAt = "attachment-ui-detected";
+      return trace;
+    }
+    pushStep("attachment-ui-detected", true, {
+      evidence: evidenceResult.evidence,
+    });
+
+    // Filename presence in chip area. This is the strong final signal.
+    let matched = false;
+    if (area) {
+      const chips = area.querySelectorAll("gem-media-attachment");
+      for (const chip of chips) {
+        const t = (chip.textContent || "").trim();
+        if (t.includes(file.name)) {
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched) {
+      pushStep("attachment-ready", false, {
+        reason: "no chip text includes file.name",
+      });
+      trace.failedAt = "attachment-ready";
+      return trace;
+    }
+    pushStep("attachment-ready", true, {
+      fileName: file.name,
+      totalDurationMs: Date.now() - startedAt,
+    });
+    trace.failedAt = null;
+    trace.summary = {
+      ok: true,
+      totalDurationMs: Date.now() - startedAt,
+    };
+    return trace;
+  }
+
   /**
    * Self-test hook. Returns a diagnostic snapshot that explains what
    * the adapter sees right now. Useful from the popup and from DevTools.
@@ -1806,6 +2717,20 @@
     findSendButtonDiagnostic,
     captureConversationBaseline,
     waitForNewGeneratedImage,
+    // v0.6.2: attachment step trace + layered menu/input probes
+    runAttachTrace,
+    runAttachStrategyA,
+    runFileInputLifecycleProbe,
+    probeUploadFilesCandidates,
+    findUploadFilesInOverlay, // alias of probeUploadFilesCandidates
+    findMenuCandidates,
+    describeMenuItem,
+    describeDomNode,
+    snapshotFileInputs,
+    waitForAttachmentEvidence,
+    scoreUploadCandidate,
+    ATTACH_TRACE_STEPS,
+    UPLOAD_FILES_FALLBACK_LABELS,
     // Locale candidates (read-only)
     CANDIDATE_SELECTORS,
     SEND_BUTTON_LABEL_CANDIDATES,

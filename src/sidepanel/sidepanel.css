@@ -760,6 +760,94 @@ button:disabled {
   flex: 1;
 }
 
+/* v0.6.2: trace-result rendering inside the Attachment card. */
+.trace-result {
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elev);
+}
+
+.trace-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.trace-failed-at {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--warn);
+  word-break: break-word;
+  flex: 1;
+}
+.trace-failed-at[data-state="ok"] {
+  color: var(--ok);
+}
+.trace-failed-at[data-state="none"] {
+  color: var(--fg-muted);
+}
+
+.trace-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.trace-steps li {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 2px 0;
+  border-bottom: 1px dotted var(--border);
+}
+.trace-steps li:last-child {
+  border-bottom: none;
+}
+.trace-step-icon {
+  flex: 0 0 14px;
+  text-align: center;
+}
+.trace-step-icon.ok {
+  color: var(--ok);
+}
+.trace-step-icon.fail {
+  color: var(--warn);
+}
+.trace-step-icon.skipped {
+  color: var(--fg-muted);
+}
+.trace-step-name {
+  flex: 0 0 auto;
+  min-width: 180px;
+}
+.trace-step-meta {
+  color: var(--fg-muted);
+  font-size: 9.5px;
+}
+
+/* v0.6.2: prepare/generate gate notice when attachment is not yet
+   confirmed working. Shown above the workflow actions. */
+.workflow-gate-notice {
+  background: var(--bg-banner);
+  border: 1px solid var(--bg-banner-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--fg);
+  margin-bottom: 8px;
+}
+.workflow-gate-notice strong {
+  display: block;
+  margin-bottom: 2px;
+}
+
 /* ----- Self-test pre ----- */
 
 .selftest-pre {

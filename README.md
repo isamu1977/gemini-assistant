@@ -263,6 +263,35 @@ card in `chrome://extensions/`, then hard-reload any Gemini tab
 The workflow locks navigation while running. Use **Cancel** to abort
 local polling (an in-flight Gemini generation cannot be cancelled).
 
+### v0.6.2 — Attachment tracing + manual gate
+
+Attachment in real Chrome was failing silently. v0.6.2 ships an
+**instrumentation-only** patch — no behavioral change to the existing
+`attachFileWithMenu` flow — so we can identify the exact step at which
+the flow dies before attempting any fix.
+
+What is new:
+
+- **Trace attachment** button inside the *Attachment* card. Runs a
+  structured 12-step trace and renders the result inline. Each step
+  reports `ok` / `ts` / `durationMs` and a small structural payload
+  (no file bytes).
+- **Try Strategy A** button (disabled until the trace reaches
+  `upload-action-detected`). Triggers the native-input + DataTransfer
+  flow end-to-end and waits for a chip delta.
+- **Mark attach verified** button. Until toggled, *Prepare Task* and
+  *Generate Task* stay disabled — the user must manually confirm the
+  trace succeeded end-to-end in real Gemini before the workflow can
+  run. This gate resets on project import.
+- The *Debug* card now appends the last trace JSON under
+  `--- last attach trace ---` so the full structured report is
+  preserved.
+
+Until the trace step `attachment-ready` turns true in real Gemini, do
+not assume attach works. The trace is the only contract test we have
+left; automated Playwright tests cannot substitute for the real
+Angular/Material DOM.
+
 ### v0.5.1 — Manual attach + insert
 
 Still supported. You can use the old flow:

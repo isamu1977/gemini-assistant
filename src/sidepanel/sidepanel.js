@@ -87,6 +87,13 @@
   const attachmentSummaryEl = $("#attachment-summary");
   const attachmentDiagnosticsEl = $("#attachment-diagnostics");
   const probeAttachmentBtn = $("#probe-attachment-btn");
+  // v0.6.2
+  const traceAttachmentBtn = $("#trace-attachment-btn");
+  const strategyABtn = $("#strategy-a-btn");
+  const traceResultEl = $("#trace-result");
+  const traceFailedAtEl = $("#trace-failed-at");
+  const traceRetryBtn = $("#trace-retry-btn");
+  const traceStepsEl = $("#trace-steps");
 
   const selfTestEl = $("#selftest");
 
@@ -107,6 +114,16 @@
   const workflowMessagingEl = $("#workflow-messaging");
   const workflowPhaseEl = $("#workflow-phase");
   const workflowLogEl = $("#workflow-log");
+  // v0.6.2: attach-gate notice rendered above the workflow actions.
+  const workflowGateNoticeEl = document.createElement("div");
+  if (workflowPhaseEl && workflowPhaseEl.parentNode) {
+    workflowGateNoticeEl.className = "workflow-gate-notice";
+    workflowGateNoticeEl.hidden = true;
+    workflowPhaseEl.parentNode.insertBefore(
+      workflowGateNoticeEl,
+      workflowPhaseEl.nextSibling,
+    );
+  }
   const ensureImageModeBtn = $("#ensure-image-mode-btn");
   const prepareTaskBtn = $("#prepare-task-btn");
   const generateTaskBtn = $("#generate-task-btn");
@@ -114,6 +131,23 @@
   const markApprovedBtn = $("#mark-approved-btn");
   const markRedoBtn = $("#mark-redo-btn");
   const pingGeminiBtn = $("#ping-gemini-btn");
+  // v0.6.2: manual gate flip.
+  let markAttachVerifiedBtn = $("#mark-attach-verified-btn");
+  if (!markAttachVerifiedBtn) {
+    markAttachVerifiedBtn = document.createElement("button");
+    markAttachVerifiedBtn.id = "mark-attach-verified-btn";
+    markAttachVerifiedBtn.type = "button";
+    markAttachVerifiedBtn.className = "ghost";
+    markAttachVerifiedBtn.hidden = true;
+    markAttachVerifiedBtn.textContent = "Mark attach verified";
+    const workflowActions =
+      (ensureImageModeBtn && ensureImageModeBtn.parentNode) || null;
+    if (workflowActions) {
+      workflowActions.appendChild(markAttachVerifiedBtn);
+    } else if (workflowLogEl && workflowLogEl.parentNode) {
+      workflowLogEl.parentNode.appendChild(markAttachVerifiedBtn);
+    }
+  }
 
   // ----- state (in-memory) ------------------------------------------------
 
@@ -738,6 +772,10 @@
       source: { project, importedAt: Date.now() },
       tasks: projectLib.buildInitialTaskState(project),
       currentTaskId: projectLib.firstTaskId(project),
+      // v0.6.2: importing a new project resets the attach-unlocked
+      // flag. The user must re-verify attach before Prepare Task is
+      // allowed to run.
+      attachUnlocked: false,
     };
     state = newState;
     folderHandle = null;
@@ -971,7 +1009,16 @@
       if (res && res.ok) {
         messagingHealth = { ok: true };
         if (res.selfTest) {
-          selfTestEl.textContent = JSON.stringify(res.selfTest, null, 2);
+          // v0.6.2: append the last attach trace so the Debug card
+          // doubles as "View attachment trace". The selfTest JSON is
+          // prefixed; the trace JSON is appended under a marker.
+          const blocks = [JSON.stringify(res.selfTest, null, 2)];
+          if (lastTrace) {
+            blocks.push(""); // separator
+            blocks.push("--- last attach trace ---");
+            blocks.push(JSON.stringify(lastTrace, null, 2));
+          }
+          selfTestEl.textContent = blocks.join("\n");
           renderAttachmentDiagnostics(res.selfTest.attachment);
         }
       }
@@ -1013,6 +1060,235 @@
     }
   }
 
+  // ----- v0.6.2: attachment step trace + Strategy A opt-in --------------
+
+  // Holds the last File object we ran the trace against, so Retry does
+  // not require the user to re-click the original Attach button.
+  let tracePendingFile = null;
+
+  // Holds the last trace result so we can show it in the Debug card.
+  let lastTrace = null;
+
+  function describeTraceStep(step) {
+    if (!step || typeof step !== "object") return null;
+    const meta = [];
+    if (typeof step.durationMs === "number") meta.push(`${step.durationMs}ms`);
+    if (step.payload && typeof step.payload === "object") {
+      // Show only the few most useful fields, never bytes.
+      const p = step.payload;
+      if (typeof p.reason === "string") meta.push(p.reason);
+      else if (typeof p.error === "string") meta.push(p.error);
+      else if (typeof p.tier === "number") meta.push(`tier=${p.tier}`);
+      else if (typeof p.classification === "string")
+        meta.push(p.classification);
+    }
+    return {
+      name: step.step,
+      ok: !!step.ok,
+      meta: meta.join(" · "),
+      skipped: !!(step.payload && step.payload.skipped),
+    };
+  }
+
+  function renderTraceSteps(steps) {
+    if (!traceStepsEl) return;
+    traceStepsEl.innerHTML = "";
+    if (!Array.isArray(steps)) return;
+    for (const s of steps) {
+      const info = describeTraceStep(s);
+      if (!info) continue;
+      const li = document.createElement("li");
+      const icon = document.createElement("span");
+      icon.className =
+        "trace-step-icon " +
+        (info.skipped ? "skipped" : info.ok ? "ok" : "fail");
+      icon.textContent = info.skipped ? "·" : info.ok ? "✓" : "✕";
+      const name = document.createElement("span");
+      name.className = "trace-step-name";
+      name.textContent = info.name;
+      const meta = document.createElement("span");
+      meta.className = "trace-step-meta";
+      meta.textContent = info.meta;
+      li.appendChild(icon);
+      li.appendChild(name);
+      li.appendChild(meta);
+      traceStepsEl.appendChild(li);
+    }
+  }
+
+  function renderTraceResult(trace) {
+    lastTrace = trace;
+    if (!traceResultEl || !traceFailedAtEl) return;
+    traceResultEl.hidden = false;
+    if (!trace) {
+      traceFailedAtEl.textContent = "—";
+      traceFailedAtEl.dataset.state = "none";
+      traceStepsEl && (traceStepsEl.innerHTML = "");
+      return;
+    }
+    if (trace.failedAt) {
+      traceFailedAtEl.textContent = `✕ Failed at: ${trace.failedAt}`;
+      traceFailedAtEl.dataset.state = "fail";
+    } else if (trace.summary && trace.summary.ok) {
+      traceFailedAtEl.textContent = "✓ Trace complete";
+      traceFailedAtEl.dataset.state = "ok";
+    } else {
+      traceFailedAtEl.textContent = "Trace complete (no steps beyond detection)";
+      traceFailedAtEl.dataset.state = "none";
+    }
+    renderTraceSteps(trace.steps || []);
+    if (strategyABtn) {
+      // Strategy A is enabled iff the trace reached upload-action-detection.
+      strategyABtn.disabled = !(
+        trace.failedAt == null ||
+        (trace.failedAt === "upload-action-detected") ||
+        // We allow retry even after detection failures (tier=0 results).
+        (trace.steps &&
+          trace.steps.some(
+            (s) => s.step === "upload-action-detected" && s.ok,
+          ))
+      );
+    }
+  }
+
+  function resolveTraceFile() {
+    // Prefer the file that was attached earlier. Fall back to the
+    // first resolved reference from the current task.
+    if (tracePendingFile && typeof tracePendingFile === "object") {
+      return tracePendingFile;
+    }
+    const refs = resolvedRefsCache || [];
+    for (const r of refs) {
+      if (r && r.state === "resolved" && r.fileObj) {
+        return r.fileObj;
+      }
+    }
+    return null;
+  }
+
+  async function runAttachTrace() {
+    let tab;
+    try {
+      tab = await getActiveTab();
+    } catch (e) {
+      setStatusLine("error", `Trace failed: ${e.message}`);
+      return;
+    }
+    if (!isGeminiUrl(tab.url)) {
+      setStatusLine("error", `Open ${GEMINI_HOST} first.`);
+      return;
+    }
+    const file = resolveTraceFile();
+    if (!file) {
+      setStatusLine(
+        "error",
+        "Trace needs a resolved reference. Bind the folder and ensure a task has a resolved asset.",
+      );
+      return;
+    }
+    tracePendingFile = file;
+    setStatusLine("info", "Tracing attach flow…");
+    try {
+      const resp = await sendToGemini(
+        messagingLib.MESSAGE_TYPES.ATTACH_TRACE,
+        { file },
+      );
+      if (!resp || !resp.ok) {
+        setStatusLine("error", `Trace failed: ${resp?.error ?? "unknown"}`);
+        renderTraceResult(null);
+        return;
+      }
+      renderTraceResult(resp.trace);
+      const summary = resp.trace?.summary || {};
+      setStatusLine(
+        summary && summary.traceOnly ? "info" : "ok",
+        summary && summary.traceOnly
+          ? "Trace captured (no state changed). Click 'Try Strategy A' to test the injection."
+          : `Trace finished${summary?.totalDurationMs ? ` in ${summary.totalDurationMs}ms` : ""}.`,
+      );
+      refreshSelfTest();
+    } catch (e) {
+      setStatusLine("error", `Trace failed: ${e?.message ?? "unknown"}`);
+    }
+  }
+
+  async function onTraceAttachment() {
+    traceAttachmentBtn.disabled = true;
+    try {
+      await runAttachTrace();
+    } finally {
+      traceAttachmentBtn.disabled = false;
+    }
+  }
+
+  async function onTryStrategyA() {
+    let tab;
+    try {
+      tab = await getActiveTab();
+    } catch (e) {
+      setStatusLine("error", `Strategy A failed: ${e.message}`);
+      return;
+    }
+    if (!isGeminiUrl(tab.url)) {
+      setStatusLine("error", `Open ${GEMINI_HOST} first.`);
+      return;
+    }
+    const file = resolveTraceFile();
+    if (!file) {
+      setStatusLine("error", "Strategy A needs a resolved reference.");
+      return;
+    }
+    setStatusLine("info", "Running Strategy A…");
+    strategyABtn.disabled = true;
+    try {
+      const resp = await sendToGemini(
+        messagingLib.MESSAGE_TYPES.ATTACH_STRATEGY_A,
+        { file },
+      );
+      if (!resp || !resp.ok) {
+        setStatusLine(
+          "error",
+          `Strategy A failed at message layer: ${resp?.error ?? "unknown"}`,
+        );
+        return;
+      }
+      const trace = resp.trace;
+      renderTraceResult(trace);
+      const failedAt = trace?.failedAt;
+      if (trace?.summary?.ok || trace?.steps?.some((s) => s.step === "attachment-ready" && s.ok)) {
+        setStatusLine("ok", "Strategy A succeeded — attachment is in place.");
+      } else {
+        setStatusLine(
+          "error",
+          `Strategy A failed at: ${failedAt ?? "unknown step"}`,
+        );
+      }
+      refreshSelfTest();
+    } catch (e) {
+      setStatusLine("error", `Strategy A failed: ${e?.message ?? "unknown"}`);
+    } finally {
+      strategyABtn.disabled = false;
+    }
+  }
+
+  // ----- v0.6.2: prepare/generate gate (attach-unlocked) --------------------
+
+  async function setAttachUnlocked(unlocked) {
+    state.attachUnlocked = unlocked === true;
+    await persistState();
+    renderWorkflowState();
+    setStatusLine(
+      state.attachUnlocked ? "ok" : "info",
+      state.attachUnlocked
+        ? "Attach verified. Prepare Task / Generate Task are now enabled."
+        : "Attach gate re-armed. Prepare Task is disabled until attach is verified again.",
+    );
+  }
+
+  async function onMarkAttachWorking() {
+    await setAttachUnlocked(true);
+  }
+
   // ----- wiring -----------------------------------------------------------
 
   importBtn.addEventListener("click", triggerImport);
@@ -1047,6 +1323,10 @@
   if (markApprovedBtn) markApprovedBtn.addEventListener("click", onMarkApproved);
   if (markRedoBtn) markRedoBtn.addEventListener("click", onMarkRedo);
   if (pingGeminiBtn) pingGeminiBtn.addEventListener("click", onPingGemini);
+  if (traceAttachmentBtn) traceAttachmentBtn.addEventListener("click", onTraceAttachment);
+  if (traceRetryBtn) traceRetryBtn.addEventListener("click", () => onTraceAttachment());
+  if (strategyABtn) strategyABtn.addEventListener("click", onTryStrategyA);
+  if (markAttachVerifiedBtn) markAttachVerifiedBtn.addEventListener("click", onMarkAttachWorking);
 
   promptEl.addEventListener("input", schedulePromptSave);
   promptEl.addEventListener("keydown", (e) => {
@@ -1185,9 +1465,17 @@
     if (ensureImageModeBtn) {
       ensureImageModeBtn.disabled = busy || !state.source;
     }
+    // v0.6.2: attach-unlocked gate. Prepare/Generate stay disabled
+    // until the user has manually confirmed the trace+attach flow.
+    const attachGateOpen = !!state.attachUnlocked;
     if (prepareTaskBtn) {
       prepareTaskBtn.disabled =
-        busy || !state.source || !folderHandle || total === 0 || resolved !== total;
+        busy ||
+        !state.source ||
+        !folderHandle ||
+        total === 0 ||
+        resolved !== total ||
+        !attachGateOpen;
     }
     if (generateTaskBtn) {
       // Enable only after a successful prepare.
@@ -1206,6 +1494,27 @@
     }
     if (markRedoBtn) {
       markRedoBtn.hidden = s.phase !== "complete";
+    }
+    // v0.6.2: gate notice rendered inside the workflow card.
+    if (workflowGateNoticeEl) {
+      if (!attachGateOpen) {
+        workflowGateNoticeEl.hidden = false;
+        workflowGateNoticeEl.innerHTML =
+          "<strong>Attach gate armed.</strong> " +
+          "Use the Trace attachment / Try Strategy A buttons in the " +
+          "Attachment card. Once the chip with the expected filename " +
+          "appears in Gemini, click <em>Mark attach verified</em> below " +
+          "to enable Prepare Task / Generate Task.";
+      } else {
+        workflowGateNoticeEl.hidden = true;
+      }
+    }
+    if (markAttachVerifiedBtn) {
+      // Always shown when we have a project; flips state.attachUnlocked.
+      markAttachVerifiedBtn.hidden = !state.source;
+      markAttachVerifiedBtn.textContent = state.attachUnlocked
+        ? "Re-arm attach gate"
+        : "Mark attach verified";
     }
     // Lock navigation while busy.
     if (prevBtn) prevBtn.disabled = busy || (projectLib.prevTaskId(state.source.project, state.currentTaskId) === null);
@@ -1389,6 +1698,17 @@
   }
 
   async function onPrepareTask() {
+    // v0.6.2: defense-in-depth. Even if the Prepare Task button is
+    // somehow re-enabled, refuse to run until the user has manually
+    // confirmed attach works (see renderWorkflowState gate).
+    if (!state.attachUnlocked) {
+      setStatusLine(
+        "error",
+        "Attachment is not verified. Run Trace attachment in the Attachment card, then click Mark attach verified before Prepare Task.",
+      );
+      renderWorkflowState();
+      return;
+    }
     let tab;
     try {
       tab = await getActiveTab();
