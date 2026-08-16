@@ -29,3 +29,8 @@ __pycache__/
 
 # Local extension validation profiles
 /tmp/gemini-assistant-ext-profile/
+
+# Local manual-test fixtures (NOT canonical; the canonical fixture lives
+# in examples/). Drop your own reference images here for manual Chrome
+# testing; the example-project-v2.json paths assume these filenames.
+tests/references/

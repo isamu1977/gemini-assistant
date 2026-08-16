@@ -19,17 +19,17 @@
     "environment-village": {
       "label": "Snow village",
       "type": "environment",
-      "file": "references/environment-village.png"
+      "file": "references/environment-village.jpg"
     },
     "style-master": {
       "label": "Master visual style",
       "type": "style",
-      "file": "references/style-master.png"
+      "file": "references/style-master.jpg"
     },
     "object-lantern": {
       "label": "Floating lantern",
       "type": "object",
-      "file": "references/object-lantern.png"
+      "file": "references/object-lantern.jpg"
     }
   },
   "tasks": [
