@@ -128,6 +128,45 @@
         </div>
       </section>
 
+      <!-- GENERATION WORKFLOW (v0.6) -->
+      <section class="card workflow-card">
+        <div class="card-header">
+          <span class="card-title">Generation</span>
+        </div>
+        <div class="card-body">
+          <dl class="diag-list">
+            <dt>Image Mode</dt>
+            <dd id="workflow-image-mode" class="muted">…probing…</dd>
+            <dt>References</dt>
+            <dd id="workflow-references" class="muted">— / — resolved</dd>
+            <dt>Attached</dt>
+            <dd id="workflow-attached" class="muted">— / —</dd>
+          </dl>
+          <div id="workflow-phase" class="workflow-phase" data-phase="idle">idle</div>
+          <ul id="workflow-log" class="workflow-log" hidden></ul>
+          <div class="workflow-actions">
+            <button id="ensure-image-mode-btn" type="button" class="secondary">
+              Ensure Image Mode
+            </button>
+            <button id="prepare-task-btn" type="button" class="primary" disabled>
+              Prepare Task
+            </button>
+            <button id="generate-task-btn" type="button" class="primary" disabled>
+              Generate Task
+            </button>
+            <button id="cancel-op-btn" type="button" class="ghost" hidden>
+              Cancel
+            </button>
+            <button id="mark-approved-btn" type="button" class="secondary" hidden>
+              Mark Approved
+            </button>
+            <button id="mark-redo-btn" type="button" class="secondary" hidden>
+              Mark Redo
+            </button>
+          </div>
+        </div>
+      </section>
+
       <!-- PROGRESS (collapsible) -->
       <details class="card collapsible">
         <summary class="card-header">
@@ -201,6 +240,7 @@
     <script src="../lib/storage.js"></script>
     <script src="../lib/assets.js"></script>
     <script src="../lib/output.js"></script>
+    <script src="../workflow/orchestrator.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

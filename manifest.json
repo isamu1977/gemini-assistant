@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.5.1",
-  "description": "Generic project and task manager for gemini.google.com. Loads a Project JSON, binds a project folder, and attaches individual reference images to Gemini's composer. Project + Task UI lives in the Chrome Side Panel. Insert Prompt and Attach are both manual — never auto-sends.",
+  "version": "0.6.0",
+  "description": "Generic project and task manager for gemini.google.com. v0.6: end-to-end single-task image generation — activate Create Image mode, attach references, insert prompt, send, detect result, and download to Downloads/Gemini Assistant/<project-id>/.",
   "minimum_chrome_version": "116",
 
-  "permissions": ["storage", "sidePanel"],
+  "permissions": ["storage", "sidePanel", "downloads"],
 
   "host_permissions": [
     "https://gemini.google.com/*"

@@ -5,16 +5,29 @@ scriptable target for any workflow driven by a **Project JSON**, a
 **bound project folder**, and a **list of tasks**. The first use case is
 image generation, but the core is generic.
 
-It does not call the Gemini API. It does not click Send. It only:
+It does **not** call the Gemini API. It does **not** require a backend.
+All interaction happens through the Gemini DOM, structured by a single
+adapter file. The Side Panel owns a small state machine that drives
+Prepare → Generate → Send → Wait → Download for **one task at a time**.
 
-1. Loads a Project JSON from disk.
-2. Binds a local folder so reference paths resolve to real files.
-3. Shows the tasks, status, and editable prompts.
-4. Lets you navigate, edit, mark status, insert the current task's
-   prompt into Gemini's textbox for manual review and sending.
-5. **v0.5.1:** attach one resolved reference image at a time to
-   Gemini's composer — manually, one per click, no batch.
-6. **v0.5.1:** the entire UI is now in the Chrome Side Panel.
+What v0.6 does for one selected task:
+
+1. Activates **Create Image** mode on Gemini (no auto-send yet).
+2. Attaches all references in the declared order.
+3. Inserts the prompt into the composer.
+4. (Stops here for review — Prepare Task.)
+5. On Generate Task: runs a preflight, clicks Send exactly once, waits
+   for the new image to appear in the response, fetches it, and downloads
+   it to `Downloads/Gemini Assistant/<project-id>/<basename>.<ext>`.
+6. Marks the task as `generated`.
+
+**v0.6 deliberately does not** (deferred to future milestones):
+
+- Auto-advance to the next task.
+- Batch generation.
+- Automatic approval.
+- Image editing / watermark handling.
+- Direct write into the project folder.
 
 The Gemini DOM is touched only by `src/dom/geminiDomAdapter.js` — one
 file, isolated, language-independent (validated in EN and PT).
@@ -30,22 +43,27 @@ file, isolated, language-independent (validated in EN and PT).
 ├── src/
 │   ├── sidepanel/                sidepanel.html, sidepanel.css, sidepanel.js
 │   ├── background/
-│   │   └── service-worker.js     registers sidePanel on toolbar click
+│   │   └── service-worker.js     sidePanel registration + chrome.downloads bridge
 │   ├── content/
-│   │   └── content.js            bridges side panel <-> adapter (Insert + Attach + Probe)
+│   │   └── content.js            bridges side panel <-> adapter (Insert, Attach, Probe, Image Mode, Send, Fetch, Baseline)
 │   ├── dom/
 │   │   └── geminiDomAdapter.js   ⭐ only file that touches Gemini's DOM
-│   └── lib/
-│       ├── project.js            Project JSON schema + validation
-│       ├── storage.js            chrome.storage.local wrapper
-│       └── assets.js             asset resolver + wrong-root detection
+│   ├── lib/
+│   │   ├── project.js            Project JSON schema + validation (v1, v2)
+│   │   ├── storage.js            chrome.storage.local wrapper
+│   │   ├── assets.js             asset resolver + wrong-root detection
+│   │   └── output.js             v0.6: sanitize output.basename, build download filenames
+│   └── workflow/
+│       └── orchestrator.js       v0.6: Prepare/Generate state machine (in-memory)
 ├── examples/
-│   └── example-project.json      5 tasks for manual testing
+│   ├── example-project.json
+│   ├── example-project-v1.json
+│   └── example-project-v2.json   (now with `output.basename` per task)
 └── tests/
-    ├── run.js                    pure-Node test runner
+    ├── run.js                    pure-Node test runner (115 tests)
     ├── fixtures/                 validation fixtures
     ├── e2e_*.py                  Playwright DOM tests (mocked)
-    └── README.md                 test docs
+    └── MANUAL_TESTS_V0_6.md      manual test plan A/B/C/D
 ```
 
 > **No build step.** Plain JavaScript, no bundler, no npm install
@@ -53,7 +71,7 @@ file, isolated, language-independent (validated in EN and PT).
 
 ---
 
-## Chrome Side Panel (v0.5.1)
+## Chrome Side Panel
 
 The UI is now a **Chrome Side Panel** (Manifest V3, Chrome 116+). The
 toolbar icon opens the side panel directly. There is no popup.
@@ -71,6 +89,40 @@ loaded from `src/sidepanel/sidepanel.html` and the service worker
 (`src/background/service-worker.js`) registers the behavior. See
 `manifest.json` for the `side_panel.default_path` and the `sidePanel`
 permission.
+
+---
+
+## Generation workflow (v0.6)
+
+```
+┌─ Side Panel ──────────────────────────────────────────────────┐
+│                                                                │
+│   [ Ensure Image Mode ]   ← idempotent                         │
+│   [ Prepare Task ]        ← image mode + 3 refs + prompt        │
+│   [ Generate Task ]       ← preflight + send + wait + download  │
+│   [ Cancel ]              ← mid-flight                          │
+│                                                                │
+│   After complete:                                            │
+│     [ Mark Approved ]                                         │
+│     [ Mark Redo ]   ← re-run generates (1).png via uniquify   │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+State machine: see `src/workflow/orchestrator.js`. Phases:
+
+```
+idle → preparing-image-mode → preparing-attachments
+    → preparing-prompt → ready → preflight → sending
+    → waiting-for-generation → downloading → complete
+                                       │
+                                       └─ any failure ─→ error
+                                       └─ user cancel  ─→ cancelled
+```
+
+`Downloads/Gemini Assistant/<project-id>/<basename>.<ext>` is where
+files land. The basename comes from `task.output.basename` (sanitized)
+or, when absent, from `task.id`.
 
 ---
 
@@ -163,7 +215,11 @@ Add new types later by extending the `ASSET_TYPES` array in
 
 Four values, fixed for v1: `pending` (default), `generated`, `approved`, `redo`.
 
-Statuses are **manually set** — the extension does not detect them from Gemini.
+In v0.6 the extension transitions `pending → generated` automatically
+when a Generate Task run completes successfully (download started).
+
+Statuses `approved` and `redo` are **still manually set** — review the
+downloaded image yourself before approving.
 
 ---
 
@@ -184,32 +240,37 @@ card in `chrome://extensions/`, then hard-reload any Gemini tab
 
 ## Usage
 
+### v0.6 — End-to-end single task
+
 1. Open `https://gemini.google.com` and sign in.
 2. Click the **Gemini Assistant** toolbar icon. The Side Panel opens.
-3. Click **Import Project** and pick a JSON file (try
-   `examples/example-project-v2.json` for the attachment flow).
-4. Click **Bind folder…** under *Project Files* and pick the folder
-   that contains your reference images. The side panel shows the
-   folder name and resolves each reference against it.
-   **Binding is session-only** — closing and reopening the side panel
-   requires re-binding.
-5. If you accidentally picked a subfolder (e.g. `references/` instead
-   of the project root), the **Wrong folder selected** banner appears
-   at the top. Click **Rebind** to pick the correct root.
-6. Use the dropdown or **Previous / Next** to navigate.
-7. For each reference card you see a state badge:
-   - `✓` resolved (PNG/JPEG/WEBP found) → **Attach** enabled
-   - `✕` missing (file not found) → disabled
-   - `✕` unsupported (file found but wrong type, e.g. GIF/PDF) → disabled
-   - `·` unbound (no folder bound) → disabled
-8. Click **Attach** on a resolved card — the image is attached to the
-   current Gemini composer. **Review and send manually.**
-9. Edit the prompt if needed — saves locally with a 350 ms debounce.
-10. Click **Insert Prompt** — the text lands in Gemini's prompt field.
-    Send manually.
-11. Change the task's status via the dropdown.
-12. Open the **Attachment** panel for structured diagnostics. Click
-    **Probe attachment** to inspect the Gemini UI without sending a file.
+3. Click **Import Project** and pick a JSON file (use
+   `examples/example-project-v2.json`).
+4. Click **Bind folder…** under *Project Files* and pick the folder that
+   contains your reference images. Binding is session-only.
+5. Navigate to **scene-001**.
+6. In the **Generation** card, click **Ensure Image Mode**. The Gemini
+   page now shows the "Create image" toggle active.
+7. Click **Prepare Task**. The orchestrator attaches each reference in
+   order, inserts the prompt, and stops at `ready`. **Nothing is sent
+   yet.** Review the composer on the Gemini page.
+8. Click **Generate Task**. The orchestrator runs the preflight, clicks
+   Send, waits for the image, and starts downloading to
+   `Downloads/Gemini Assistant/yuki-video-001/scene-001.png`.
+9. After success, the task status moves to `generated`. **Mark
+   Approved** or **Mark Redo**.
+
+The workflow locks navigation while running. Use **Cancel** to abort
+local polling (an in-flight Gemini generation cannot be cancelled).
+
+### v0.5.1 — Manual attach + insert
+
+Still supported. You can use the old flow:
+
+1. Bind folder, navigate to a task with references.
+2. Click **Attach** per reference.
+3. Click **Insert Prompt**.
+4. **Send manually** on the Gemini page.
 
 The **Debug** panel shows the raw JSON self-test (collapsed by default).
 
@@ -298,6 +359,19 @@ side panel and the content script is documented in
 `src/content/content.js`.
 
 ## Bug history
+
+### v0.6.0 — End-to-End Single Task Image Generation
+
+- New `task.output.basename` optional field for download filenames. Sanitized at parse time; path traversal rejected.
+- New Image Generation mode adapter (`ensureImageGenerationMode`) detects the "Deselect Images" toggle that appears only when active.
+- New `attachFileWithMenu` opens the + menu, clicks Upload files, injects via DataTransfer, waits for the chip with the expected filename.
+- New orchestrator (`src/workflow/orchestrator.js`) drives Prepare → Generate → Send → Wait → Download.
+- New service-worker download bridge (`chrome.downloads` with `conflictAction: "uniquify"`).
+- New task auto-transition `pending → generated` after successful download start.
+- Operation lock disables navigation during a run.
+- Composer non-clean safety check before Prepare.
+- Side Panel: new **Generation** card with workflow buttons + phase log.
+- New diagnostics: imageMode, baseline, attachment menu state.
 
 ### v0.5.1 — Wrong-root selection + Attachment diagnostics + Side Panel
 

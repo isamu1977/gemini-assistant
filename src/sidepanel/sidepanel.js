@@ -95,6 +95,22 @@
   const confirmCancelBtn = $("#confirm-cancel");
   const confirmOkBtn = $("#confirm-ok");
 
+  // v0.6: workflow
+  const outputLib = globalThis.GeminiAssistantOutput;
+  const orchestratorLib = globalThis.GeminiAssistantOrchestrator;
+
+  const workflowImageModeEl = $("#workflow-image-mode");
+  const workflowReferencesEl = $("#workflow-references");
+  const workflowAttachedEl = $("#workflow-attached");
+  const workflowPhaseEl = $("#workflow-phase");
+  const workflowLogEl = $("#workflow-log");
+  const ensureImageModeBtn = $("#ensure-image-mode-btn");
+  const prepareTaskBtn = $("#prepare-task-btn");
+  const generateTaskBtn = $("#generate-task-btn");
+  const cancelOpBtn = $("#cancel-op-btn");
+  const markApprovedBtn = $("#mark-approved-btn");
+  const markRedoBtn = $("#mark-redo-btn");
+
   // ----- state (in-memory) ------------------------------------------------
 
   let state = storageLib.emptyState();
@@ -220,6 +236,8 @@
       await resolveCurrentRefs();
       renderReferences();
     }
+    // Refresh workflow buttons (Prepare/Generate enable state).
+    if (typeof renderWorkflowState === "function") renderWorkflowState();
   }
 
   function renderFolderBinding() {
@@ -413,6 +431,9 @@
     // Prev/Next enable state
     prevBtn.disabled = projectLib.prevTaskId(proj, state.currentTaskId) === null;
     nextBtn.disabled = projectLib.nextTaskId(proj, state.currentTaskId) === null;
+
+    // Workflow buttons need fresh state too.
+    if (typeof renderWorkflowState === "function") renderWorkflowState();
   }
 
   function renderProgress() {
@@ -1010,6 +1031,13 @@
   insertBtn.addEventListener("click", onInsert);
   probeAttachmentBtn.addEventListener("click", probeAttachment);
 
+  if (ensureImageModeBtn) ensureImageModeBtn.addEventListener("click", onEnsureImageMode);
+  if (prepareTaskBtn) prepareTaskBtn.addEventListener("click", onPrepareTask);
+  if (generateTaskBtn) generateTaskBtn.addEventListener("click", onGenerateTask);
+  if (cancelOpBtn) cancelOpBtn.addEventListener("click", onCancel);
+  if (markApprovedBtn) markApprovedBtn.addEventListener("click", onMarkApproved);
+  if (markRedoBtn) markRedoBtn.addEventListener("click", onMarkRedo);
+
   promptEl.addEventListener("input", schedulePromptSave);
   promptEl.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -1049,6 +1077,401 @@
     } catch {
       // non-fatal
     }
+  }
+
+  // ----- v0.6: workflow ---------------------------------------------------
+
+  let orchestrator = null;
+  let workflowCancelled = false;
+
+  function logWorkflow(level, message, info) {
+    if (!workflowLogEl) return;
+    workflowLogEl.hidden = false;
+    const li = document.createElement("li");
+    li.dataset.level = level;
+    li.textContent = `[${level}] ${message}`;
+    workflowLogEl.appendChild(li);
+    // Cap log size.
+    while (workflowLogEl.children.length > 50) {
+      workflowLogEl.removeChild(workflowLogEl.firstChild);
+    }
+    workflowLogEl.scrollTop = workflowLogEl.scrollHeight;
+  }
+
+  function renderWorkflowState() {
+    // Always refresh the workflow UI, even when the orchestrator hasn't
+    // been created yet (e.g. user just bound a folder and we need to
+    // re-evaluate the Prepare button).
+    const s = orchestrator ? orchestrator.state : { phase: "idle", attachments: [], imageMode: null };
+    if (workflowPhaseEl) {
+      workflowPhaseEl.textContent = s.phase;
+      workflowPhaseEl.dataset.phase = s.phase;
+    }
+    // Image mode indicator
+    if (s.imageMode) {
+      const cls = s.imageMode.ok ? "ok" : "warn";
+      const txt = s.imageMode.ok
+        ? s.imageMode.mode === "already-active"
+          ? "✓ Ready"
+          : "✓ Enabled"
+        : "✕ " + (s.imageMode.error || "failed");
+      if (workflowImageModeEl) {
+        workflowImageModeEl.classList.remove("ok", "warn", "muted");
+        workflowImageModeEl.classList.add(cls);
+        workflowImageModeEl.textContent = `IMAGE MODE — ${txt}`;
+      }
+    } else {
+      if (workflowImageModeEl) {
+        workflowImageModeEl.classList.add("muted");
+        workflowImageModeEl.textContent = "IMAGE MODE — …";
+      }
+    }
+    // References count
+    const total = currentTask()
+      ? projectLib.resolveReferences(state.source.project, currentTask().id).length
+      : 0;
+    const resolved = (resolvedRefsCache || []).filter(
+      (r) => r && r.state === "resolved",
+    ).length;
+    if (workflowReferencesEl) {
+      workflowReferencesEl.classList.remove("ok", "warn", "muted");
+      workflowReferencesEl.classList.add(resolved === total && total > 0 ? "ok" : "muted");
+      workflowReferencesEl.textContent = `${resolved} / ${total} resolved`;
+    }
+    // Attached count
+    const attached = s.attachments.filter((a) => a && a.ok).length;
+    const attempted = s.attachments.length;
+    if (workflowAttachedEl) {
+      workflowAttachedEl.classList.remove("ok", "warn", "muted");
+      const cls =
+        attached === total && attempted === total && total > 0
+          ? "ok"
+          : attempted > attached
+            ? "warn"
+            : "muted";
+      workflowAttachedEl.classList.add(cls);
+      workflowAttachedEl.textContent = `${attached} / ${total}`;
+    }
+    // Buttons
+    const busy = orchestrator ? orchestrator.isActive() : false;
+    if (ensureImageModeBtn) {
+      ensureImageModeBtn.disabled = busy || !state.source;
+    }
+    if (prepareTaskBtn) {
+      prepareTaskBtn.disabled =
+        busy || !state.source || !folderHandle || total === 0 || resolved !== total;
+    }
+    if (generateTaskBtn) {
+      // Enable only after a successful prepare.
+      generateTaskBtn.disabled =
+        busy ||
+        !state.source ||
+        !folderHandle ||
+        s.phase !== "ready" ||
+        (total > 0 && attached !== total);
+    }
+    if (cancelOpBtn) {
+      cancelOpBtn.hidden = !busy;
+    }
+    if (markApprovedBtn) {
+      markApprovedBtn.hidden = s.phase !== "complete";
+    }
+    if (markRedoBtn) {
+      markRedoBtn.hidden = s.phase !== "complete";
+    }
+    // Lock navigation while busy.
+    if (prevBtn) prevBtn.disabled = busy || (projectLib.prevTaskId(state.source.project, state.currentTaskId) === null);
+    if (nextBtn) nextBtn.disabled = busy || (projectLib.nextTaskId(state.source.project, state.currentTaskId) === null);
+    if (reimportBtn) reimportBtn.disabled = busy;
+    if (folderBindBtn) folderBindBtn.disabled = busy;
+    if (taskSelectEl) taskSelectEl.disabled = busy;
+    if (insertBtn) insertBtn.disabled = busy;
+  }
+
+  function ensureOrchestrator(tabId) {
+    if (orchestrator && orchestrator._tabId === tabId) return orchestrator;
+    orchestrator = orchestratorLib.createOrchestrator({
+      sendToTab: (id, msg) => sendMessage(id, msg),
+      downloadImage: downloadImageViaServiceWorker,
+      onPhaseChange: (phase, info) => {
+        logWorkflow("phase", `${info?.prev ?? "?"} → ${phase}`);
+        renderWorkflowState();
+        // Persist status if we transitioned to complete and the task
+        // was not yet marked.
+        if (phase === "complete") {
+          const cur = currentMutable();
+          if (cur && cur.status !== "generated") {
+            cur.status = "generated";
+            persistState();
+            renderProgress();
+          }
+        }
+      },
+      onAttachmentProgress: (info) => {
+        const label = info.label || info.assetId || `#${info.index}`;
+        if (info.phase === "start") {
+          logWorkflow("attach", `Attaching ${label} (${info.fileName})…`);
+        } else if (info.phase === "ok") {
+          logWorkflow("attach", `✓ ${label} attached${info.elapsedMs ? ` in ${info.elapsedMs}ms` : ""}`);
+        } else {
+          logWorkflow("attach", `✕ ${label} failed: ${info.error}`);
+        }
+        renderWorkflowState();
+      },
+      onLog: (level, message, info) => {
+        logWorkflow(level, message, info);
+      },
+    });
+    orchestrator._tabId = tabId;
+    return orchestrator;
+  }
+
+  /**
+   * Fetch the generated image (via the content script, where session
+   * cookies are available) and forward the bytes to the service worker
+   * for chrome.downloads.
+   */
+  async function downloadImageViaServiceWorker({ imageSrc, basename, projectId, mimeOrExt }) {
+    if (!orchestrator || !orchestrator._tabId) {
+      return { ok: false, error: "no active tab" };
+    }
+    // 1. Ask the content script to fetch the image as ArrayBuffer.
+    let fetched;
+    try {
+      fetched = await sendMessage(orchestrator._tabId, {
+        type: "GEMINI_ASSISTANT_FETCH_IMAGE",
+        url: imageSrc,
+      });
+    } catch (e) {
+      return { ok: false, error: `fetch via content script failed: ${e?.message ?? String(e)}` };
+    }
+    if (!fetched || !fetched.ok) {
+      return { ok: false, error: fetched?.error || "fetch failed" };
+    }
+
+    // 2. Compute filename via outputLib.
+    const finalFilename =
+      outputLib.buildDownloadFilename(basename, fetched.mime || mimeOrExt);
+    if (!finalFilename) {
+      return { ok: false, error: "Could not derive filename (basename or mime invalid)" };
+    }
+
+    // 3. Forward to service worker for chrome.downloads.
+    let dl;
+    try {
+      dl = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
+          {
+            type: "GEMINI_ASSISTANT_DOWNLOAD_BLOB",
+            arrayBuffer: fetched.arrayBuffer, // structured-cloned across contexts
+            filename: finalFilename,
+            mime: fetched.mime || mimeOrExt || "application/octet-stream",
+          },
+          (resp) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            resolve(resp);
+          },
+        );
+      });
+    } catch (e) {
+      return { ok: false, error: `download bridge failed: ${e?.message ?? String(e)}` };
+    }
+    if (!dl || !dl.ok) {
+      return { ok: false, error: dl?.error || "download failed" };
+    }
+    return {
+      ok: true,
+      downloadId: dl.downloadId,
+      finalFilename: dl.finalFilename,
+    };
+  }
+
+  async function onEnsureImageMode() {
+    let tab;
+    try {
+      tab = await getActiveTab();
+    } catch (e) {
+      setStatusLine("error", `Ensure Image Mode failed: ${e.message}`);
+      return;
+    }
+    if (!isGeminiUrl(tab.url)) {
+      setStatusLine("error", `Open ${GEMINI_HOST} first.`);
+      return;
+    }
+    const orch = ensureOrchestrator(tab.id);
+    orch.reset({ id: currentTask()?.id ?? null });
+    setStatusLine("info", "Ensuring Image Generation mode…");
+    const ok = await orch.ensureImageMode();
+    setStatusLine(
+      ok ? "ok" : "error",
+      ok
+        ? "Image Generation mode ready."
+        : `Could not enable Image Generation mode: ${orch.state.imageMode?.error ?? "unknown"}`,
+    );
+    renderWorkflowState();
+    refreshSelfTest();
+  }
+
+  async function onPrepareTask() {
+    let tab;
+    try {
+      tab = await getActiveTab();
+    } catch (e) {
+      setStatusLine("error", `Prepare failed: ${e.message}`);
+      return;
+    }
+    if (!isGeminiUrl(tab.url)) {
+      setStatusLine("error", `Open ${GEMINI_HOST} first.`);
+      return;
+    }
+    const cur = currentTask();
+    if (!cur) {
+      setStatusLine("error", "No task selected.");
+      return;
+    }
+    const refs = (resolvedRefsCache || []).filter(
+      (r) => r && r.state === "resolved",
+    );
+    if (refs.length === 0) {
+      setStatusLine("error", "No references resolved for this task.");
+      return;
+    }
+    // Save current prompt edits.
+    const prompt = promptEl.value;
+    const cur_mut = currentMutable();
+    if (cur_mut && cur_mut.prompt !== prompt) {
+      cur_mut.prompt = prompt;
+      await persistState();
+    }
+    // Safety: refuse if composer is not clean.
+    try {
+      const cs = await sendMessage(tab.id, {
+        type: "GEMINI_ASSISTANT_COMPOSER_STATE",
+      });
+      if (cs && cs.ok && (cs.attachmentCount > 0 || cs.promptLength > 0)) {
+        const proceed = window.confirm(
+          "The composer is not clean (attachments or text remain). " +
+            "Continuing will APPEND to the existing content and may fail. " +
+            "Press OK to proceed anyway, or Cancel to clear the composer manually first.",
+        );
+        if (!proceed) return;
+      }
+    } catch (_) {
+      /* non-fatal */
+    }
+
+    const orch = ensureOrchestrator(tab.id);
+    setStatusLine("info", "Preparing task…");
+    const ok = await orch.prepareTask({
+      taskId: cur.id,
+      prompt,
+      resolvedRefs: refs.map((r) => ({
+        id: r.id,
+        label: r.label,
+        fileName: r.fileName,
+        fileType: r.fileType,
+        fileSize: r.fileSize,
+        state: r.state,
+        fileObj: r.fileObj,
+        error: r.error,
+      })),
+    });
+    if (ok) {
+      setStatusLine(
+        "ok",
+        `Prepared task "${cur.title || cur.id}". Review and click Generate Task when ready.`,
+      );
+    } else {
+      const err = orch.state.error?.error || "unknown";
+      const phase = orch.state.error?.phase;
+      const detail =
+        phase === "preparing-attachments" && orch.state.error?.attachedCount !== undefined
+          ? ` (${orch.state.error.attachedCount} / ${orch.state.error.totalCount} attached)`
+          : "";
+      setStatusLine("error", `Preparation failed: ${err}${detail}`);
+    }
+    renderWorkflowState();
+    refreshSelfTest();
+  }
+
+  async function onGenerateTask() {
+    let tab;
+    try {
+      tab = await getActiveTab();
+    } catch (e) {
+      setStatusLine("error", `Generate failed: ${e.message}`);
+      return;
+    }
+    if (!isGeminiUrl(tab.url)) {
+      setStatusLine("error", `Open ${GEMINI_HOST} first.`);
+      return;
+    }
+    const cur = currentTask();
+    if (!cur) {
+      setStatusLine("error", "No task selected.");
+      return;
+    }
+    if (!orchestrator || orchestrator.state.phase !== "ready") {
+      setStatusLine("error", "Task is not prepared. Click Prepare Task first.");
+      return;
+    }
+    const basename =
+      (outputLib &&
+        projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
+      cur.id;
+    const orch = ensureOrchestrator(tab.id);
+    setStatusLine("info", "Generating…");
+    const ok = await orch.generateTask({
+      taskId: cur.id,
+      prompt: promptEl.value,
+      resolvedRefs: (orchestrator.state.attachments || []).map((a) => a),
+      basename,
+      projectId: state.source.project.project.id,
+      mimeOrExt: "image/png", // refined later from fetch mime
+      generationTimeoutMs: 90000,
+    });
+    if (ok) {
+      const dl = orchestrator.state.download;
+      setStatusLine(
+        "ok",
+        `Generated ${cur.title || cur.id}. ` +
+          `Downloaded ${dl?.finalFilename || basename + ".png"}.`,
+      );
+    } else {
+      const phase = orchestrator.state.error?.phase;
+      const err = orchestrator.state.error?.error || "unknown";
+      setStatusLine("error", `Generation failed at ${phase}: ${err}`);
+    }
+    renderWorkflowState();
+    refreshSelfTest();
+  }
+
+  async function onCancel() {
+    if (!orchestrator) return;
+    orchestrator.cancel();
+    setStatusLine("warn", "Operation cancelled. Local polling stopped.");
+    renderWorkflowState();
+  }
+
+  async function onMarkApproved() {
+    const cur = currentMutable();
+    if (!cur) return;
+    cur.status = "approved";
+    await persistState();
+    renderProgress();
+    setStatusLine("ok", "Marked as approved.");
+  }
+
+  async function onMarkRedo() {
+    const cur = currentMutable();
+    if (!cur) return;
+    cur.status = "redo";
+    await persistState();
+    renderProgress();
+    setStatusLine("info", "Marked as redo. You can re-run Generate Task.");
   }
 
   init();

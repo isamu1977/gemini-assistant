@@ -25,6 +25,7 @@ const projectLib = require(path.join(ROOT, "src/lib/project.js"));
 const storageLib = require(path.join(ROOT, "src/lib/storage.js"));
 const assetsLib = require(path.join(ROOT, "src/lib/assets.js"));
 const outputLib = globalThis.GeminiAssistantOutput;
+const orchestratorLib = require(path.join(ROOT, "src/workflow/orchestrator.js"));
 
 const FIXTURES = path.join(__dirname, "fixtures");
 
@@ -1122,6 +1123,294 @@ test("v0.6: resolveTaskOutputBasename falls back to task.id when output absent",
 test("v0.6: resolveTaskOutputBasename returns null for unknown task", () => {
   const r = projectLib.parseProjectJson(readFixture("output-valid.json"));
   assertEqual(projectLib.resolveTaskOutputBasename(r.project, "does-not-exist"), null);
+});
+
+// ----- orchestrator.js (v0.6) ---------------------------------------
+
+console.log(`\n${C.bold}orchestrator.js (v0.6)${C.reset}`);
+
+function makeFakeFile(name) {
+  return { name, type: "image/png", size: 1024 };
+}
+
+function makeFakeResolvedRef(id, label) {
+  return {
+    id,
+    label,
+    file: `refs/${id}.png`,
+    state: "resolved",
+    fileObj: makeFakeFile(`${id}.png`),
+    fileName: `${id}.png`,
+    fileType: "image/png",
+    fileSize: 1024,
+    error: null,
+  };
+}
+
+function makeOrchestrator() {
+  const log = [];
+  const phases = [];
+  const progresses = [];
+  let tabId = null;
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async (id, msg) => {
+      tabId = id;
+      // The fake "tab" responds based on the message type.
+      if (msg.type === "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE") {
+        return { ok: true, mode: "activated" };
+      }
+      if (msg.type === "GEMINI_ASSISTANT_ATTACH_WITH_MENU") {
+        return { ok: true, fileName: msg.fileName, fileType: msg.fileType, fileSize: msg.fileSize, elapsedMs: 5 };
+      }
+      if (msg.type === "GEMINI_ASSISTANT_INSERT_PROMPT") {
+        return { ok: true, length: msg.text.length, method: "quill" };
+      }
+      if (msg.type === "GEMINI_ASSISTANT_COMPOSER_STATE") {
+        return {
+          ok: true,
+          attachmentCount: 0,
+          pendingUploadCount: 0,
+          promptLength: msg.text?.length ?? 0,
+          imageModeActive: true,
+          composerClean: true,
+        };
+      }
+      if (msg.type === "GEMINI_ASSISTANT_FIND_SEND_BUTTON") {
+        return { ok: true, found: true, disabled: false, label: "Send message" };
+      }
+      if (msg.type === "GEMINI_ASSISTANT_CAPTURE_BASELINE") {
+        return { ok: true, baseline: { capturedAt: 0, userQueryCount: 1, modelResponseCount: 1, generatedImageCount: 0, generatedImageSrcs: [] } };
+      }
+      if (msg.type === "GEMINI_ASSISTANT_SEND_COMPOSER") {
+        return { ok: true, method: "click" };
+      }
+      if (msg.type === "GEMINI_ASSISTANT_WAIT_FOR_GENERATED_IMAGE") {
+        return { ok: true, imageSrc: "https://lh3.googleusercontent.com/gg/abc", alt: "AI generated", naturalWidth: 1024, naturalHeight: 1024 };
+      }
+      return { ok: false, error: "unknown message" };
+    },
+    downloadImage: async (req) => ({
+      ok: true,
+      downloadId: 1,
+      finalFilename: `${req.basename}.png`,
+    }),
+    onPhaseChange: (phase, info) => {
+      phases.push({ phase, prev: info?.prev });
+      log.push(`phase:${info?.prev}->${phase}`);
+    },
+    onAttachmentProgress: (info) => {
+      progresses.push(info);
+    },
+    onLog: (level, message) => {
+      log.push(`${level}:${message}`);
+    },
+  });
+  orch._tabId = 7;
+  return { orch, phases, progresses, log };
+}
+
+test("orchestrator: createOrchestrator requires sendToTab", () => {
+  let thrown = null;
+  try {
+    orchestratorLib.createOrchestrator({});
+  } catch (e) {
+    thrown = e;
+  }
+  assert(thrown !== null, "expected throw");
+  assert(
+    /requires deps\.sendToTab/.test(thrown.message),
+    `unexpected error: ${thrown.message}`,
+  );
+});
+
+test("orchestrator: PHASES exposes the canonical phase list", () => {
+  const phases = orchestratorLib.PHASES;
+  for (const required of [
+    "idle",
+    "preparing-image-mode",
+    "preparing-attachments",
+    "preparing-prompt",
+    "ready",
+    "preflight",
+    "sending",
+    "waiting-for-generation",
+    "downloading",
+    "complete",
+    "error",
+    "cancelled",
+  ]) {
+    assert(phases.includes(required), `PHASES must contain ${required}`);
+  }
+});
+
+test("orchestrator: reset transitions to idle and records taskId", () => {
+  const { orch } = makeOrchestrator();
+  orch.reset({ id: "scene-001" });
+  assertEqual(orch.state.phase, "idle");
+  assertEqual(orch.state.taskId, "scene-001");
+});
+
+test("orchestrator: prepareTask happy path goes idle -> preparing-image-mode -> preparing-attachments -> preparing-prompt -> ready", async () => {
+  const { orch, phases } = makeOrchestrator();
+  const refs = [makeFakeResolvedRef("a", "A"), makeFakeResolvedRef("b", "B"), makeFakeResolvedRef("c", "C")];
+  const ok = await orch.prepareTask({
+    taskId: "scene-001",
+    prompt: "Wide shot of the snow village.",
+    resolvedRefs: refs,
+  });
+  assert(ok, "prepareTask should succeed");
+  assertEqual(orch.state.phase, "ready");
+  // Check the phase trajectory.
+  const visited = phases.map((p) => p.phase);
+  assert(visited.includes("preparing-image-mode"));
+  assert(visited.includes("preparing-attachments"));
+  assert(visited.includes("preparing-prompt"));
+  assert(visited[visited.length - 1], "ready");
+});
+
+test("orchestrator: prepareTask stops on missing ref and reports partial counts", async () => {
+  const { orch, phases } = makeOrchestrator();
+  const refs = [
+    makeFakeResolvedRef("a", "A"),
+    { id: "b", label: "B", state: "missing", error: "not found", file: "refs/b.png" },
+    makeFakeResolvedRef("c", "C"),
+  ];
+  const ok = await orch.prepareTask({
+    taskId: "scene-002",
+    prompt: "p",
+    resolvedRefs: refs,
+  });
+  assert(!ok);
+  assertEqual(orch.state.phase, "error");
+  assertEqual(orch.state.error.phase, "preparing-attachments");
+  assertEqual(orch.state.error.attachedCount, 0);
+  assertEqual(orch.state.error.totalCount, 3);
+  // prepareTask does NOT send, so we should NOT have entered sending.
+  const visited = phases.map((p) => p.phase);
+  assert(!visited.includes("sending"));
+});
+
+test("orchestrator: attachAll preserves order in onAttachmentProgress events", async () => {
+  const { orch, progresses } = makeOrchestrator();
+  const refs = [
+    makeFakeResolvedRef("a", "A"),
+    makeFakeResolvedRef("b", "B"),
+    makeFakeResolvedRef("c", "C"),
+  ];
+  await orch.ensureImageMode();
+  const ok = await orch.attachAll(refs);
+  assert(ok);
+  // Filter to "ok" events; expect 3, in order.
+  const oks = progresses.filter((p) => p.phase === "ok");
+  assertEqual(oks.length, 3);
+  assertEqual(oks[0].assetId, "a");
+  assertEqual(oks[1].assetId, "b");
+  assertEqual(oks[2].assetId, "c");
+});
+
+test("orchestrator: attachAll halts on first failure and reports count", async () => {
+  const { orch, progresses } = makeOrchestrator();
+  const refs = [
+    makeFakeResolvedRef("a", "A"),
+    makeFakeResolvedRef("b", "B"),
+    makeFakeResolvedRef("c", "C"),
+  ];
+  await orch.ensureImageMode();
+  // Override sendToTab to fail on the SECOND call.
+  let call = 0;
+  const real = orch;
+  // We can't easily monkeypatch the orchestrator's internal deps from here.
+  // Instead, simulate by passing a ref whose attach would fail. We do this
+  // by having a ref whose fileObj is null (treated as missing in attachAll).
+  const failing = [
+    makeFakeResolvedRef("a", "A"),
+    { ...refs[1], fileObj: null }, // will be rejected by attachAll
+    makeFakeResolvedRef("c", "C"),
+  ];
+  const ok = await orch.attachAll(failing);
+  assert(!ok);
+  assertEqual(orch.state.phase, "error");
+  // Only "start" for A is fired (because B fails the resolver check at the
+  // entry of attachAll, before any "start" is emitted).
+  const aStarts = progresses.filter(
+    (p) => p.phase === "start" && p.assetId === "a",
+  );
+  assertEqual(aStarts.length, 1);
+});
+
+test("orchestrator: preflight fails if composer attachments don't match expected", async () => {
+  const { orch } = makeOrchestrator();
+  await orch.ensureImageMode();
+  await orch.attachAll([makeFakeResolvedRef("a", "A")]);
+  await orch.insertPrompt("p");
+  // Now monkeypatch sendToTab to lie about attachments.
+  orch.deps.sendToTab = async () => ({
+    ok: true,
+    attachmentCount: 0,
+    pendingUploadCount: 0,
+    promptLength: 1,
+    imageModeActive: true,
+  });
+  const ok = await orch.preflight({ taskId: "x", promptLength: 1, resolvedRefs: [{}] });
+  assert(!ok);
+  assertEqual(orch.state.phase, "error");
+});
+
+test("orchestrator: generateTask happy path ends in complete", async () => {
+  const { orch, phases } = makeOrchestrator();
+  await orch.prepareTask({
+    taskId: "scene-001",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+  });
+  const ok = await orch.generateTask({
+    taskId: "scene-001",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+    basename: "scene-001",
+    projectId: "proj",
+    mimeOrExt: "image/png",
+    generationTimeoutMs: 1000,
+  });
+  assert(ok);
+  assertEqual(orch.state.phase, "complete");
+  const visited = phases.map((p) => p.phase);
+  assert(visited.includes("preflight"));
+  assert(visited.includes("sending"));
+  assert(visited.includes("waiting-for-generation"));
+  assert(visited.includes("downloading"));
+});
+
+test("orchestrator: cancel() transitions to cancelled and short-circuits pending phases", async () => {
+  const { orch } = makeOrchestrator();
+  orch.cancel();
+  // After cancel, ensureImageMode should NOT fire (it should observe the
+  // cancelled flag and return false without calling sendToTab).
+  let called = false;
+  orch.deps.sendToTab = async () => {
+    called = true;
+    return { ok: true };
+  };
+  const ok = await orch.ensureImageMode();
+  assert(!ok);
+  assert(!called, "sendToTab must not be called after cancel()");
+  assertEqual(orch.state.phase, "cancelled");
+});
+
+test("orchestrator: isActive reflects the current phase", () => {
+  const { orch } = makeOrchestrator();
+  assert(!orch.isActive());
+  orch._transition("sending");
+  assert(orch.isActive());
+  orch._transition("complete");
+  assert(!orch.isActive());
+});
+
+test("orchestrator: download fails when no generated image", async () => {
+  const { orch } = makeOrchestrator();
+  const ok = await orch.download("x", "y", "image/png");
+  assert(!ok);
+  assertEqual(orch.state.phase, "error");
 });
 
 // ----- end ----------------------------------------------------------------

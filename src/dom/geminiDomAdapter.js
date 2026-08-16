@@ -589,6 +589,10 @@
   const ATTACH_TIMEOUT_MS = 4000;
   const ATTACH_OBSERVER_QUIESCE_MS = 120;
 
+  // v0.6: extended timeouts for full file uploads (a few MB).
+  const ATTACH_FILE_TIMEOUT_MS = 12000;
+  const ATTACH_MENU_OPEN_TIMEOUT_MS = 2500;
+
   // CSS / attribute hints that indicate an attachment thumbnail in the
   // upload chip area. Locale-independent.
   const ATTACHMENT_HINT_SELECTORS = [
@@ -889,6 +893,308 @@
       probeBefore,
       probeAfter,
     };
+  }
+
+  /**
+   * Find the "Upload files" item inside the + menu. Localized via text
+   * OR aria-label (the menuitem's aria-label is the most stable; the
+   * visible text is the fallback).
+   */
+  function findUploadFilesMenuitem() {
+    const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
+    // Prefer the one closest to the composer.
+    const area = document.querySelector("input-area-v2");
+    const candidates = items.filter((i) => {
+      const r = i.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      if (area) {
+        const ar = area.getBoundingClientRect();
+        const dx = Math.abs(r.left + r.width / 2 - (ar.left + ar.width / 2));
+        const dy = Math.abs(r.top + r.height / 2 - (ar.top + ar.height / 2));
+        if (dx > 600 || dy > 600) return false;
+      }
+      return true;
+    });
+    // Score: aria-label is most stable.
+    let best = null;
+    let bestScore = 0;
+    for (const el of candidates) {
+      const label = (el.getAttribute("aria-label") || "").toLowerCase();
+      const text = (el.textContent || "").trim().toLowerCase();
+      const img = el.querySelector("img");
+      const alt = img ? (img.getAttribute("alt") || "").toLowerCase() : "";
+      let score = 0;
+      if (/^upload files?\.?$/i.test(label)) score += 60;
+      if (/^upload files?\.?$/i.test(text)) score += 50;
+      if (/upload/i.test(label) && /file|document/i.test(label)) score += 30;
+      if (alt === "attach_file" || alt.includes("attach_file")) score += 40;
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Open the + menu by clicking the + button. Idempotent: if the menu is
+   * already open, returns ok with reason="already-open". Never throws.
+   */
+  async function openAttachmentMenu() {
+    const before = isAttachmentMenuOpen();
+    if (before) {
+      return { ok: true, reason: "already-open" };
+    }
+    const plus = findPlusButton();
+    if (!plus) {
+      return { ok: false, reason: "no-plus-button", error: "Could not find + button." };
+    }
+    try {
+      plus.click();
+    } catch (e) {
+      return {
+        ok: false,
+        reason: "click-plus-failed",
+        error: `Click on + button failed: ${e?.message ?? "unknown"}`,
+      };
+    }
+    const start = Date.now();
+    while (Date.now() - start < ATTACH_MENU_OPEN_TIMEOUT_MS) {
+      if (isAttachmentMenuOpen()) {
+        return { ok: true, reason: "opened" };
+      }
+      // Fallback signal: file input appeared.
+      if (findFileInputs().length > 0) {
+        return { ok: true, reason: "input-mounted" };
+      }
+      await sleep(80);
+    }
+    return {
+      ok: false,
+      reason: "menu-not-opened",
+      error: "Clicked + but no menu or file input appeared within the timeout.",
+    };
+  }
+
+  /**
+   * Public API (v0.6): attach a File to the Gemini composer by:
+   *   1. Opening the + menu (if not already open).
+   *   2. Clicking "Upload files" to ensure a <input type="file"> is
+   *      mounted by Gemini's component.
+   *   3. Injecting the File via DataTransfer + change/input events.
+   *   4. Waiting for the chip to appear in the composer with the
+   *      expected filename.
+   *
+   * The function is idempotent in the sense that it reuses the menu /
+   * input that is already there. It does NOT remove pre-existing
+   * attachments.
+   *
+   * @param {File} file
+   * @param {{ onProgress?: (phase: string, info?: object) => void, timeoutMs?: number }} [opts]
+   * @returns {Promise<{ ok, error?, method?, fileName?, fileType?, fileSize?, elapsedMs?, diagnostics? }>}
+   */
+  async function attachFileWithMenu(file, opts) {
+    const startedAt = Date.now();
+    const emit = (phase, info) => {
+      try {
+        if (opts && typeof opts.onProgress === "function") opts.onProgress(phase, info);
+      } catch (_) {
+        /* ignore */
+      }
+    };
+
+    if (!file || typeof file !== "object" || typeof file.name !== "string") {
+      return { ok: false, error: "No file provided" };
+    }
+    emit("start", { fileName: file.name, size: file.size, type: file.type });
+
+    // 1. Ensure the menu is open.
+    const openRes = await openAttachmentMenu();
+    if (!openRes.ok) {
+      return { ok: false, error: openRes.error, phase: "open-menu" };
+    }
+    emit("menu-open", { reason: openRes.reason });
+
+    // 2. Make sure a file input is mounted. Some Gemini builds keep the
+    //    input mounted after first open; others re-mount per click.
+    let inputs = findFileInputs();
+    if (inputs.length === 0) {
+      const uploadItem = findUploadFilesMenuitem();
+      if (!uploadItem) {
+        return {
+          ok: false,
+          error: "Could not find 'Upload files' in the + menu.",
+          phase: "find-upload-item",
+        };
+      }
+      try {
+        uploadItem.click();
+      } catch (e) {
+        return {
+          ok: false,
+          error: `Click on Upload files failed: ${e?.message ?? "unknown"}`,
+          phase: "click-upload",
+        };
+      }
+      const startInput = Date.now();
+      while (Date.now() - startInput < ATTACH_MENU_OPEN_TIMEOUT_MS) {
+        inputs = findFileInputs();
+        if (inputs.length > 0) break;
+        await sleep(80);
+      }
+      if (inputs.length === 0) {
+        return {
+          ok: false,
+          error: "Click on Upload files did not mount a <input type='file'> within the timeout.",
+          phase: "mount-input",
+        };
+      }
+    }
+    emit("input-mounted", { count: inputs.length });
+
+    const input = inputs[0];
+
+    // 3. Inject File via DataTransfer.
+    let dataTransfer;
+    try {
+      dataTransfer = new DataTransfer();
+      dataTransfer.items.add(file);
+    } catch (e) {
+      return {
+        ok: false,
+        error: `DataTransfer construction failed: ${e?.message ?? "unknown"}`,
+        phase: "datatransfer",
+      };
+    }
+    try {
+      Object.defineProperty(input, "files", {
+        value: dataTransfer.files,
+        configurable: true,
+      });
+    } catch (e) {
+      return {
+        ok: false,
+        error: `Could not assign file list to input: ${e?.message ?? "unknown"}`,
+        phase: "assign-files",
+      };
+    }
+
+    // 4. Snapshot the chip count in input-area-v2 BEFORE dispatching events.
+    const area = document.querySelector("input-area-v2");
+    const chipsBefore = countComposerAttachments(area);
+    emit("pre-dispatch", { chipsBefore });
+
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+
+    // 5. Wait for the chip with our filename to appear.
+    const timeoutMs = (opts && typeof opts.timeoutMs === "number") ? opts.timeoutMs : ATTACH_FILE_TIMEOUT_MS;
+    const result = await waitForAttachmentOf(file.name, chipsBefore, timeoutMs);
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.error,
+        phase: result.phase,
+        fileName: file.name,
+        fileType: file.type,
+        fileSize: file.size,
+        elapsedMs: Date.now() - startedAt,
+        diagnostics: { chipsBefore, chipsAfter: result.chipsAfter ?? null },
+      };
+    }
+    emit("attached", { chipsAfter: result.chipsAfter });
+
+    return {
+      ok: true,
+      method: "datatransfer+menu",
+      fileName: file.name,
+      fileType: file.type,
+      fileSize: file.size,
+      elapsedMs: Date.now() - startedAt,
+      chipIndex: result.chipIndex,
+      diagnostics: { chipsBefore, chipsAfter: result.chipsAfter },
+    };
+  }
+
+  /**
+   * Count attachments currently in the composer (gem-media-attachment
+   * inside input-area-v2).
+   */
+  function countComposerAttachments(area) {
+    if (!area) return 0;
+    return area.querySelectorAll("gem-media-attachment").length;
+  }
+
+  /**
+   * Wait until the chip count in input-area-v2 grows AND a chip
+   * containing the given filename appears.
+   */
+  function waitForAttachmentOf(fileName, chipsBefore, timeoutMs) {
+    const start = Date.now();
+    return new Promise((resolve) => {
+      const area = document.querySelector("input-area-v2");
+      if (!area) {
+        resolve({ ok: false, error: "Composer not found.", phase: "no-area" });
+        return;
+      }
+      let resolved = false;
+      const finalize = (r) => {
+        if (resolved) return;
+        resolved = true;
+        try {
+          obs.disconnect();
+        } catch (_) {
+          /* ignore */
+        }
+        resolve(r);
+      };
+      const tick = () => {
+        const chips = area.querySelectorAll("gem-media-attachment");
+        const chipsAfter = chips.length;
+        if (chipsAfter > chipsBefore) {
+          // Look for our filename in any chip's text.
+          for (let i = 0; i < chips.length; i++) {
+            const text = (chips[i].textContent || "").trim();
+            if (text.includes(fileName)) {
+              finalize({
+                ok: true,
+                chipsAfter,
+                chipIndex: i,
+              });
+              return;
+            }
+          }
+        }
+        if (Date.now() - start >= timeoutMs) {
+          finalize({
+            ok: false,
+            error:
+              "Gemini did not acknowledge the attachment within the timeout. " +
+              "The chip with our filename did not appear.",
+            phase: "wait-for-chip",
+            chipsAfter: chips.length,
+          });
+          return;
+        }
+        // Schedule next tick.
+        setTimeout(tick, 100);
+      };
+      const obs = new MutationObserver(() => {
+        // Don't wait for the periodic tick if the DOM has changed.
+        const chips = area.querySelectorAll("gem-media-attachment");
+        if (chips.length > chipsBefore) {
+          for (let i = 0; i < chips.length; i++) {
+            const text = (chips[i].textContent || "").trim();
+            if (text.includes(fileName)) {
+              finalize({ ok: true, chipsAfter: chips.length, chipIndex: i });
+              return;
+            }
+          }
+        }
+      });
+      obs.observe(area, { childList: true, subtree: true });
+      tick();
+    });
   }
 
   /**
@@ -1239,6 +1545,167 @@
     };
   }
 
+  // ---- Send + Preflight + Generation Detection (v0.6) -------------------
+
+  /**
+   * Find the Send button. Locale-aware: we accept any label from
+   * SEND_BUTTON_LABEL_CANDIDATES that matches exactly (case-sensitive).
+   */
+  function findSendButtonLocalized() {
+    const buttons = Array.from(document.querySelectorAll("button[aria-label]"));
+    for (const b of buttons) {
+      const label = (b.getAttribute("aria-label") || "").trim();
+      if (SEND_BUTTON_LABEL_CANDIDATES.includes(label)) return b;
+    }
+    return null;
+  }
+
+  /**
+   * Send the current composer. Idempotent: refuse if button disabled.
+   */
+  async function sendCurrentComposer() {
+    const btn = findSendButtonLocalized();
+    if (!btn) {
+      return { ok: false, error: "Send button not found.", disabled: null };
+    }
+    if (btn.disabled || btn.getAttribute("aria-disabled") === "true") {
+      return { ok: false, error: "Send button is disabled.", disabled: true };
+    }
+    const tb = document.querySelector('[role="textbox"]') || findPromptInput();
+    if (tb) {
+      const txt = ((tb.innerText || "") + (tb.textContent || "")).trim();
+      if (txt.length === 0) {
+        return { ok: false, error: "Composer is empty.", disabled: true };
+      }
+    }
+    const baselineUserQueries = Array.from(
+      document.querySelectorAll("user-query"),
+    ).length;
+    try {
+      btn.click();
+    } catch (e) {
+      return { ok: false, error: `Send click failed: ${e?.message ?? "unknown"}` };
+    }
+    const start = Date.now();
+    const SEND_DETECT_TIMEOUT_MS = 5000;
+    while (Date.now() - start < SEND_DETECT_TIMEOUT_MS) {
+      const now = Array.from(document.querySelectorAll("user-query")).length;
+      if (now > baselineUserQueries) {
+        return {
+          ok: true,
+          method: "click",
+          baselineUserQueries,
+          currentUserQueries: now,
+          elapsedMs: Date.now() - start,
+        };
+      }
+      await sleep(80);
+    }
+    return {
+      ok: true,
+      method: "click",
+      baselineUserQueries,
+      currentUserQueries: baselineUserQueries,
+      elapsedMs: Date.now() - start,
+      note: "send-detect-timeout",
+    };
+  }
+
+  function findSendButtonDiagnostic() {
+    const btn = findSendButtonLocalized();
+    if (!btn) return { ok: false, found: false };
+    return {
+      ok: true,
+      found: true,
+      disabled: btn.disabled || btn.getAttribute("aria-disabled") === "true",
+      label: btn.getAttribute("aria-label") || null,
+    };
+  }
+
+  function captureConversationBaseline() {
+    const allImgs = Array.from(document.querySelectorAll("img"));
+    const generated = allImgs.filter((i) =>
+      /ai generated|generated by ai|gerada por ia|générée par ia/i.test(
+        i.getAttribute("alt") || "",
+      ),
+    );
+    return {
+      capturedAt: Date.now(),
+      userQueryCount: document.querySelectorAll("user-query").length,
+      modelResponseCount: document.querySelectorAll("model-response").length,
+      generatedImageCount: generated.length,
+      generatedImageSrcs: generated
+        .map((i) => i.getAttribute("src"))
+        .filter(Boolean),
+    };
+  }
+
+  async function waitForNewGeneratedImage(baseline, timeoutMs) {
+    const start = Date.now();
+    const POLL_MS = 600;
+    const initialUserQueries = baseline?.userQueryCount ?? 0;
+    const initialGenerated = new Set(baseline?.generatedImageSrcs ?? []);
+    while (Date.now() - start < timeoutMs) {
+      const currentUserQueries = document.querySelectorAll("user-query").length;
+      if (currentUserQueries <= initialUserQueries) {
+        await sleep(POLL_MS);
+        continue;
+      }
+      const responses = Array.from(
+        document.querySelectorAll("model-response"),
+      );
+      if (responses.length === 0) {
+        await sleep(POLL_MS);
+        continue;
+      }
+      const newestResponse = responses[responses.length - 1];
+      const imgs = Array.from(newestResponse.querySelectorAll("img"));
+      const candidates = imgs.filter((i) => {
+        const cls = (i.className || "").toString();
+        if (!/(\s|^)image(\s|$|animate|loaded)/.test(cls)) return false;
+        const alt = i.getAttribute("alt") || "";
+        if (!/ai generated|generated by ai|gerada por ia|générée par ia/i.test(alt)) {
+          return false;
+        }
+        if (!(i.naturalWidth > 0)) return false;
+        const src = i.getAttribute("src") || "";
+        if (!src) return false;
+        if (initialGenerated.has(src)) return false;
+        return true;
+      });
+      if (candidates.length === 1) {
+        const img = candidates[0];
+        const dlBtn = Array.from(
+          newestResponse.querySelectorAll('button[aria-label*="Download" i]'),
+        )[0];
+        return {
+          ok: true,
+          imageSrc: img.getAttribute("src"),
+          alt: img.getAttribute("alt"),
+          naturalWidth: img.naturalWidth,
+          naturalHeight: img.naturalHeight,
+          downloadControl: dlBtn
+            ? { ariaLabel: dlBtn.getAttribute("aria-label") }
+            : null,
+        };
+      }
+      if (candidates.length > 1) {
+        return {
+          ok: false,
+          error:
+            "Multiple generated images detected. Manual selection required.",
+          multipleCount: candidates.length,
+        };
+      }
+      await sleep(POLL_MS);
+    }
+    return {
+      ok: false,
+      error: "No new generated image detected within the timeout.",
+      timeoutMs,
+    };
+  }
+
   /**
    * Self-test hook. Returns a diagnostic snapshot that explains what
    * the adapter sees right now. Useful from the popup and from DevTools.
@@ -1257,6 +1724,9 @@
     const selectedQuill = selected ? locateQuill(selected) : null;
     const contentLength = selected ? textboxTextLength(selected) : null;
     const attachment = attachmentProbe();
+    const imageMode = imageModeProbe();
+    const baseline = captureConversationBaseline();
+    const sendBtn = findSendButtonDiagnostic();
 
     return {
       url: location.href,
@@ -1269,10 +1739,13 @@
         document.querySelectorAll("input-area-v2").length +
         document.querySelectorAll("input-container").length,
       sendButtonFound: !!findSendButton(),
+      sendButtonLocalized: sendBtn,
       selected: selected ? describeEl(selected) : null,
       selectedQuillAttached: !!selectedQuill,
       contentLength,
       attachment,
+      imageMode,
+      baseline,
       candidates: scored,
     };
   }
@@ -1294,6 +1767,18 @@
     findPlusButton,
     findDeselectImagesToggle,
     findCreateImageMenuitem,
+    // v0.6: attachment via menu
+    attachFileWithMenu,
+    openAttachmentMenu,
+    findUploadFilesMenuitem,
+    countComposerAttachments,
+    ATTACH_FILE_TIMEOUT_MS,
+    // v0.6: send + preflight + generation detection
+    sendCurrentComposer,
+    findSendButtonLocalized,
+    findSendButtonDiagnostic,
+    captureConversationBaseline,
+    waitForNewGeneratedImage,
     // Locale candidates (read-only)
     CANDIDATE_SELECTORS,
     SEND_BUTTON_LABEL_CANDIDATES,

@@ -91,6 +91,79 @@
         return true;
       }
 
+      case "GEMINI_ASSISTANT_ATTACH_WITH_MENU": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter || typeof adapter.attachFileWithMenu !== "function") {
+          sendResponse({
+            ok: false,
+            error: "adapter does not support attachFileWithMenu",
+          });
+          return false;
+        }
+        const file = msg.file;
+        if (!file || typeof file !== "object" || typeof file.name !== "string") {
+          sendResponse({ ok: false, error: "Invalid file payload" });
+          return false;
+        }
+        const opts =
+          msg.options && typeof msg.options === "object"
+            ? msg.options
+            : undefined;
+        adapter
+          .attachFileWithMenu(file, opts)
+          .then((result) => sendResponse(result))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) })
+          );
+        return true;
+      }
+
+      case "GEMINI_ASSISTANT_COMPOSER_STATE": {
+        // Returns the current state of the composer: attachment count,
+        // upload-pending flag, prompt length, etc. Used by preflight.
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter) {
+          sendResponse({ ok: false, error: "adapter not loaded" });
+          return false;
+        }
+        try {
+          const area = document.querySelector("input-area-v2");
+          const attachments = area
+            ? area.querySelectorAll("gem-media-attachment").length
+            : 0;
+          // Pending uploads: any progressbar inside the attachments.
+          const pendingUploads = area
+            ? area.querySelectorAll(
+                'gem-media-attachment [role="progressbar"], gem-media-attachment mat-progress-spinner',
+              ).length
+            : 0;
+          // Textbox + prompt length
+          const tb =
+            document.querySelector('[role="textbox"]') || adapter.findPromptInput?.();
+          let promptLength = 0;
+          if (tb) {
+            const txt = (tb.innerText || "").replace(/\u00a0/g, " ");
+            promptLength = txt.length;
+          }
+          // Image mode (lazy)
+          const imageProbe =
+            typeof adapter.imageModeProbe === "function"
+              ? adapter.imageModeProbe()
+              : null;
+          sendResponse({
+            ok: true,
+            attachmentCount: attachments,
+            pendingUploadCount: pendingUploads,
+            promptLength,
+            imageModeActive: !!(imageProbe && imageProbe.imageModeActive),
+            composerClean: attachments === 0 && pendingUploads === 0 && promptLength === 0,
+          });
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        }
+        return false;
+      }
+
       case "GEMINI_ASSISTANT_ATTACH_PROBE": {
         const adapter = globalThis.RedSunDomAdapter;
         if (!adapter) {
@@ -154,6 +227,105 @@
           .then((result) => sendResponse({ ok: true, ...result }))
           .catch((e) =>
             sendResponse({ ok: false, error: e?.message ?? String(e) })
+          );
+        return true;
+      }
+
+      case "GEMINI_ASSISTANT_SEND_COMPOSER": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter || typeof adapter.sendCurrentComposer !== "function") {
+          sendResponse({ ok: false, error: "adapter does not support sendCurrentComposer" });
+          return false;
+        }
+        adapter
+          .sendCurrentComposer()
+          .then((result) => sendResponse(result))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) })
+          );
+        return true;
+      }
+
+      case "GEMINI_ASSISTANT_FIND_SEND_BUTTON": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter || typeof adapter.findSendButtonDiagnostic !== "function") {
+          sendResponse({ ok: false, found: false });
+          return false;
+        }
+        try {
+          sendResponse({ ok: true, ...adapter.findSendButtonDiagnostic() });
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        }
+        return false;
+      }
+
+      case "GEMINI_ASSISTANT_CAPTURE_BASELINE": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter || typeof adapter.captureConversationBaseline !== "function") {
+          sendResponse({ ok: false, error: "adapter missing" });
+          return false;
+        }
+        try {
+          sendResponse({
+            ok: true,
+            baseline: adapter.captureConversationBaseline(),
+          });
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        }
+        return false;
+      }
+
+      case "GEMINI_ASSISTANT_WAIT_FOR_GENERATED_IMAGE": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter || typeof adapter.waitForNewGeneratedImage !== "function") {
+          sendResponse({ ok: false, error: "adapter missing" });
+          return false;
+        }
+        const baseline = msg.baseline || null;
+        const timeoutMs =
+          typeof msg.timeoutMs === "number" && msg.timeoutMs > 0
+            ? msg.timeoutMs
+            : 90000;
+        adapter
+          .waitForNewGeneratedImage(baseline, timeoutMs)
+          .then((result) => sendResponse(result))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) })
+          );
+        return true;
+      }
+
+      case "GEMINI_ASSISTANT_FETCH_IMAGE": {
+        // Fetch the image URL from the page context (where session
+        // cookies live) and return the bytes as ArrayBuffer.
+        const url = msg.url;
+        if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+          sendResponse({ ok: false, error: "invalid url" });
+          return false;
+        }
+        fetch(url, { credentials: "include" })
+          .then(async (resp) => {
+            if (!resp.ok) {
+              sendResponse({
+                ok: false,
+                error: `HTTP ${resp.status} ${resp.statusText}`,
+              });
+              return;
+            }
+            const mime = resp.headers.get("content-type") || "";
+            const ab = await resp.arrayBuffer();
+            sendResponse({
+              ok: true,
+              arrayBuffer: ab, // structured-cloned across contexts
+              mime,
+              contentLength: ab.byteLength,
+              finalUrl: resp.url || url,
+            });
+          })
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) }),
           );
         return true;
       }

@@ -1,20 +1,20 @@
 /*
  * service-worker.js
  *
- * Manifest V3 service worker. Currently does only one thing: registers
- * the side panel so that clicking the extension icon opens the panel
- * directly, instead of opening a popup. This is the v0.5.1 UX migration.
+ * Manifest V3 service worker.
+ *
+ * Responsibilities:
+ *   - Register the side panel so clicking the toolbar icon opens it.
+ *   - Bridge downloads via chrome.downloads (v0.6). The side panel cannot
+ *     download from a content-script-origin URL directly because some
+ *     Google CDN URLs require the user's session cookies, which are
+ *     only sent from the page context. We use a two-stage strategy:
+ *       stage 1: side panel -> content script (fetch + return Blob).
+ *       stage 2: side panel -> service worker (chrome.downloads).
+ *     The service worker only sees the Blob (encoded as ArrayBuffer).
  *
  * Activation timing: we set the panel behavior on every install/update.
  * Chrome caches the value, but re-registering is safe and idempotent.
- *
- * The side panel is configured to open on gemini.google.com only by
- * default. On other pages, clicking the icon is a no-op (Chrome will
- * show a hint that the side panel is not available for that tab).
- *
- * Restricting to gemini.google.com is intentional: the side panel is
- * the Gemini Assistant UI. Opening it on a blank tab or a non-Gemini
- * page would just confuse the user.
  */
 
 "use strict";
@@ -23,11 +23,8 @@ const GEMINI_HOST_PATTERN = "https://gemini.google.com/*";
 
 function registerSidePanelBehavior() {
   if (!chrome?.sidePanel?.setPanelBehavior) {
-    // Chrome < 114 or the sidePanel API is gated by permissions. The
-    // manifest declares "sidePanel", so this branch should be unreachable
-    // in supported browsers, but log loudly if it ever happens.
     console.warn(
-      "[Gemini Assistant:sw] chrome.sidePanel.setPanelBehavior is unavailable. Toolbar icon click will be a no-op.",
+      "[Gemini Assistant:sw] chrome.sidePanel.setPanelBehavior is unavailable.",
     );
     return;
   }
@@ -35,7 +32,6 @@ function registerSidePanelBehavior() {
     chrome.sidePanel.setPanelBehavior({
       openPanelOnActionClick: true,
     });
-    console.log("[Gemini Assistant:sw] side panel registered (openPanelOnActionClick=true)");
   } catch (e) {
     console.warn(
       "[Gemini Assistant:sw] setPanelBehavior failed:",
@@ -44,7 +40,6 @@ function registerSidePanelBehavior() {
   }
 }
 
-// Default options: only enable the panel on gemini.google.com.
 function setDefaultSidePanelOptions() {
   if (!chrome?.sidePanel?.setOptions) return;
   try {
@@ -59,6 +54,95 @@ function setDefaultSidePanelOptions() {
     );
   }
 }
+
+// ---- v0.6: download bridge -----------------------------------------
+
+// We expect the side panel to call:
+//   chrome.runtime.sendMessage({ type: "GEMINI_ASSISTANT_DOWNLOAD_BLOB",
+//     arrayBuffer, filename, mime })
+// and we respond with { ok, downloadId, finalFilename } or { ok:false, error }.
+//
+// We refuse any path traversal: filename must be a basename only, and
+// we always route it under the user's Downloads directory. The
+// chrome.downloads API automatically handles "(1)", "(2)" collisions
+// when conflictAction is "uniquify".
+
+const FILENAME_PATTERN = /^[a-zA-Z0-9 ._\-()\[\]']{1,200}\.[a-z0-9]{2,5}$/;
+
+function isAcceptableFilename(filename) {
+  if (typeof filename !== "string") return false;
+  if (filename.length === 0 || filename.length > 220) return false;
+  if (filename.includes("/") || filename.includes("\\")) return false;
+  if (filename.includes("..")) return false;
+  return true;
+}
+
+async function handleDownloadBlob(msg, sender) {
+  const arrayBuffer = msg.arrayBuffer;
+  const filename = msg.filename;
+  if (!arrayBuffer || typeof filename !== "string") {
+    return { ok: false, error: "missing arrayBuffer or filename" };
+  }
+  if (!isAcceptableFilename(filename)) {
+    return { ok: false, error: "filename rejected by sanitizer" };
+  }
+  if (!chrome?.downloads?.download) {
+    return { ok: false, error: "chrome.downloads API unavailable" };
+  }
+
+  // Build a Blob URL inside the service worker. Some Chrome versions
+  // also accept URL.createObjectURL(blob); both work.
+  let blob;
+  try {
+    blob = new Blob([arrayBuffer], {
+      type: typeof msg.mime === "string" ? msg.mime : "application/octet-stream",
+    });
+  } catch (e) {
+    return { ok: false, error: `Blob construction failed: ${e?.message ?? "unknown"}` };
+  }
+  const url = URL.createObjectURL(blob);
+  try {
+    const downloadId = await chrome.downloads.download({
+      url,
+      filename, // relative; chrome saves under Downloads by default.
+      conflictAction: "uniquify",
+      saveAs: false,
+    });
+    // We deliberately do NOT await completion: we want the side panel
+    // to update immediately when the download STARTS. Monitoring of
+    // completion happens via chrome.downloads.onChanged (out of scope).
+    return {
+      ok: true,
+      downloadId,
+      finalFilename: filename,
+      bytes: arrayBuffer.byteLength ?? null,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      error: `chrome.downloads.download failed: ${e?.message ?? "unknown"}`,
+    };
+  } finally {
+    // We do NOT revoke the URL immediately: chrome.downloads needs it.
+    // We revoke after a short grace period to free memory.
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (_) {
+        /* ignore */
+      }
+    }, 60_000);
+  }
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || typeof msg !== "object") return false;
+  if (msg.type === "GEMINI_ASSISTANT_DOWNLOAD_BLOB") {
+    handleDownloadBlob(msg, sender).then(sendResponse);
+    return true;
+  }
+  return false;
+});
 
 registerSidePanelBehavior();
 setDefaultSidePanelOptions();
