@@ -35,9 +35,11 @@
   const projectLib = globalThis.GeminiAssistantProject;
   const storageLib = globalThis.GeminiAssistantStorage;
   const assetsLib = globalThis.GeminiAssistantAssets;
+  const messagingLib = globalThis.GeminiAssistantMessaging;
 
-  if (!projectLib || !storageLib || !assetsLib) {
-    document.body.textContent = "Internal error: GeminiAssistant libs not loaded.";
+  if (!projectLib || !storageLib || !assetsLib || !messagingLib) {
+    document.body.textContent =
+      "Internal error: GeminiAssistant libs not loaded (messaging missing?).";
     return;
   }
 
@@ -102,6 +104,7 @@
   const workflowImageModeEl = $("#workflow-image-mode");
   const workflowReferencesEl = $("#workflow-references");
   const workflowAttachedEl = $("#workflow-attached");
+  const workflowMessagingEl = $("#workflow-messaging");
   const workflowPhaseEl = $("#workflow-phase");
   const workflowLogEl = $("#workflow-log");
   const ensureImageModeBtn = $("#ensure-image-mode-btn");
@@ -110,6 +113,7 @@
   const cancelOpBtn = $("#cancel-op-btn");
   const markApprovedBtn = $("#mark-approved-btn");
   const markRedoBtn = $("#mark-redo-btn");
+  const pingGeminiBtn = $("#ping-gemini-btn");
 
   // ----- state (in-memory) ------------------------------------------------
 
@@ -145,44 +149,44 @@
     insertBtn.textContent = busy ? "Inserting…" : "Insert Prompt";
   }
 
-  function getActiveTab() {
-    return new Promise((resolve, reject) => {
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        if (!tabs || tabs.length === 0) {
-          reject(new Error("No active tab"));
-          return;
-        }
-        resolve(tabs[0]);
-      });
-    });
-  }
+  // ----- messaging helpers (v0.6.1) ---------------------------------------
 
-  const GEMINI_HOST = "gemini.google.com";
-
-  function isGeminiUrl(url) {
+  // The Side Panel is now the only place that resolves which tab Gemini
+  // is running in. Every call to chrome.tabs.sendMessage flows through
+  // src/lib/messaging.js so we get:
+  //   * a single, well-tested queryTabs path;
+  //   * strict validation that tabId is a positive integer;
+  //   * a Promise-based API (no callbacks / no undefined options);
+  //   * structured-cloneable payload validation up front.
+  //
+  // getActiveTab is kept as a thin convenience for callers that only
+  // want the tab (not a message). It still funnels through messagingLib.
+  async function getActiveTab() {
     try {
-      const u = new URL(url);
-      return u.protocol === "https:" && u.host === GEMINI_HOST;
-    } catch {
-      return false;
+      return await messagingLib.getTargetGeminiTab(chrome);
+    } catch (e) {
+      throw new Error(e?.message ?? String(e));
     }
   }
 
-  function sendMessage(tabId, message) {
-    return new Promise((resolve, reject) => {
-      chrome.tabs.sendMessage(tabId, message, (response) => {
-        if (chrome.runtime.lastError) {
-          reject(new Error(chrome.runtime.lastError.message));
-          return;
-        }
-        resolve(response);
-      });
-    });
+  // Bridge for the legacy code path (Insert Prompt, single Attach, etc.).
+  // Validates Gemini URL up front for a friendlier error message, then
+  // delegates to messagingLib.sendTabMessage so all calls share the same
+  // argument discipline.
+  async function sendMessage(tabId, message) {
+    return await messagingLib.sendTabMessage(chrome, tabId, message);
   }
+
+  // High-level: resolve tab + send typed message. The orchestrator uses
+  // this; the legacy single-attach / probe paths still use sendMessage
+  // directly because they already validated the tab.
+  async function sendToGemini(type, payload) {
+    return await messagingLib.sendToGemini(chrome, type, payload || {});
+  }
+
+  // Cached Gemini host, kept for friendlier status-line messages.
+  const GEMINI_HOST = messagingLib.GEMINI_HOST;
+  const isGeminiUrl = messagingLib.isGeminiUrl;
 
   function currentTaskIndex() {
     if (!state.source) return -1;
@@ -964,12 +968,17 @@
       const tab = await getActiveTab();
       if (!isGeminiUrl(tab.url)) return;
       const res = await sendMessage(tab.id, { type: "GEMINI_ASSISTANT_PING" });
-      if (res && res.ok && res.selfTest) {
-        selfTestEl.textContent = JSON.stringify(res.selfTest, null, 2);
-        renderAttachmentDiagnostics(res.selfTest.attachment);
+      if (res && res.ok) {
+        messagingHealth = { ok: true };
+        if (res.selfTest) {
+          selfTestEl.textContent = JSON.stringify(res.selfTest, null, 2);
+          renderAttachmentDiagnostics(res.selfTest.attachment);
+        }
       }
-    } catch {
-      // non-fatal
+    } catch (e) {
+      messagingHealth = { ok: false, error: e?.message ?? String(e) };
+    } finally {
+      renderWorkflowState();
     }
   }
 
@@ -1037,6 +1046,7 @@
   if (cancelOpBtn) cancelOpBtn.addEventListener("click", onCancel);
   if (markApprovedBtn) markApprovedBtn.addEventListener("click", onMarkApproved);
   if (markRedoBtn) markRedoBtn.addEventListener("click", onMarkRedo);
+  if (pingGeminiBtn) pingGeminiBtn.addEventListener("click", onPingGemini);
 
   promptEl.addEventListener("input", schedulePromptSave);
   promptEl.addEventListener("keydown", (e) => {
@@ -1107,18 +1117,36 @@
       workflowPhaseEl.textContent = s.phase;
       workflowPhaseEl.dataset.phase = s.phase;
     }
+    // Messaging row (driven by last-known messagingHealth).
+    if (workflowMessagingEl) {
+      workflowMessagingEl.classList.remove("ok", "warn", "muted");
+      if (messagingHealth && messagingHealth.ok) {
+        workflowMessagingEl.classList.add("ok");
+        workflowMessagingEl.textContent = "✓ Connected";
+      } else if (messagingHealth && messagingHealth.error) {
+        workflowMessagingEl.classList.add("warn");
+        workflowMessagingEl.textContent = "✕ Error";
+        workflowMessagingEl.title = messagingHealth.error;
+      } else {
+        workflowMessagingEl.classList.add("muted");
+        workflowMessagingEl.textContent = "— (click Ping Gemini)";
+      }
+    }
     // Image mode indicator
     if (s.imageMode) {
       const cls = s.imageMode.ok ? "ok" : "warn";
-      const txt = s.imageMode.ok
-        ? s.imageMode.mode === "already-active"
-          ? "✓ Ready"
-          : "✓ Enabled"
-        : "✕ " + (s.imageMode.error || "failed");
+      let txt;
+      if (s.imageMode.ok) {
+        txt = s.imageMode.mode === "already-active" ? "✓ Ready" : "✓ Enabled";
+      } else {
+        // v0.6.1: short, friendly error in the main UI; details in Debug.
+        txt = "✕ Error";
+      }
       if (workflowImageModeEl) {
         workflowImageModeEl.classList.remove("ok", "warn", "muted");
         workflowImageModeEl.classList.add(cls);
         workflowImageModeEl.textContent = `IMAGE MODE — ${txt}`;
+        workflowImageModeEl.title = s.imageMode.error || "";
       }
     } else {
       if (workflowImageModeEl) {
@@ -1188,10 +1216,42 @@
     if (insertBtn) insertBtn.disabled = busy;
   }
 
-  function ensureOrchestrator(tabId) {
-    if (orchestrator && orchestrator._tabId === tabId) return orchestrator;
+  // Last-known messaging health for the UI row. The diagnostic Ping
+  // Gemini button updates this; the workflow also updates it implicitly
+  // whenever a sendToGemini call rejects.
+  let messagingHealth = null; // { ok: true } | { ok: false, error: string }
+
+  async function onPingGemini() {
+    setStatusLine("info", "Pinging Gemini content script…");
+    try {
+      const res = await messagingLib.pingGemini(chrome);
+      if (res.ok) {
+        messagingHealth = { ok: true };
+        setStatusLine(
+          "ok",
+          `Messaging ✓ connected (tab ${res.targetTabId}, ${res.targetTabUrl}).`,
+        );
+      } else {
+        messagingHealth = { ok: false, error: res.error };
+        setStatusLine(
+          "error",
+          `Could not communicate with Gemini content script. ${res.error}`,
+        );
+      }
+    } catch (e) {
+      messagingHealth = { ok: false, error: e?.message ?? String(e) };
+      setStatusLine("error", `Ping failed: ${messagingHealth.error}`);
+    }
+    renderWorkflowState();
+  }
+
+  function ensureOrchestrator() {
+    // The orchestrator no longer owns the tabId — the messaging helper
+    // does. We keep the orchestrator singleton across workflow runs so
+    // its state machine survives Prepare → Generate.
+    if (orchestrator) return orchestrator;
     orchestrator = orchestratorLib.createOrchestrator({
-      sendToTab: (id, msg) => sendMessage(id, msg),
+      sendToTab: (msg) => sendToGemini(msg.type, msg),
       downloadImage: downloadImageViaServiceWorker,
       onPhaseChange: (phase, info) => {
         logWorkflow("phase", `${info?.prev ?? "?"} → ${phase}`);
@@ -1222,7 +1282,6 @@
         logWorkflow(level, message, info);
       },
     });
-    orchestrator._tabId = tabId;
     return orchestrator;
   }
 
@@ -1232,14 +1291,13 @@
    * for chrome.downloads.
    */
   async function downloadImageViaServiceWorker({ imageSrc, basename, projectId, mimeOrExt }) {
-    if (!orchestrator || !orchestrator._tabId) {
-      return { ok: false, error: "no active tab" };
+    if (!orchestrator) {
+      return { ok: false, error: "no orchestrator" };
     }
     // 1. Ask the content script to fetch the image as ArrayBuffer.
     let fetched;
     try {
-      fetched = await sendMessage(orchestrator._tabId, {
-        type: "GEMINI_ASSISTANT_FETCH_IMAGE",
+      fetched = await sendToGemini("GEMINI_ASSISTANT_FETCH_IMAGE", {
         url: imageSrc,
       });
     } catch (e) {
@@ -1294,23 +1352,38 @@
     try {
       tab = await getActiveTab();
     } catch (e) {
-      setStatusLine("error", `Ensure Image Mode failed: ${e.message}`);
+      messagingHealth = { ok: false, error: e?.message ?? String(e) };
+      setStatusLine(
+        "error",
+        `Could not communicate with Gemini content script. ${messagingHealth.error}`,
+      );
+      renderWorkflowState();
       return;
     }
     if (!isGeminiUrl(tab.url)) {
       setStatusLine("error", `Open ${GEMINI_HOST} first.`);
       return;
     }
-    const orch = ensureOrchestrator(tab.id);
+    messagingHealth = { ok: true };
+    const orch = ensureOrchestrator();
     orch.reset({ id: currentTask()?.id ?? null });
     setStatusLine("info", "Ensuring Image Generation mode…");
     const ok = await orch.ensureImageMode();
-    setStatusLine(
-      ok ? "ok" : "error",
-      ok
-        ? "Image Generation mode ready."
-        : `Could not enable Image Generation mode: ${orch.state.imageMode?.error ?? "unknown"}`,
-    );
+    if (ok) {
+      setStatusLine("ok", "Image Generation mode ready.");
+    } else {
+      const err = orch.state.imageMode?.error || "unknown";
+      if (orch.state.imageMode?.error?.startsWith("Could not communicate")) {
+        messagingHealth = { ok: false, error: err };
+        setStatusLine(
+          "error",
+          "Could not communicate with Gemini content script. See Debug card.",
+        );
+      } else {
+        setStatusLine("error", `Image Mode ✕ Error. See Debug card.`);
+      }
+      logWorkflow("error", "Image Mode failed", { error: err });
+    }
     renderWorkflowState();
     refreshSelfTest();
   }
@@ -1320,13 +1393,19 @@
     try {
       tab = await getActiveTab();
     } catch (e) {
-      setStatusLine("error", `Prepare failed: ${e.message}`);
+      messagingHealth = { ok: false, error: e?.message ?? String(e) };
+      setStatusLine(
+        "error",
+        `Could not communicate with Gemini content script. ${messagingHealth.error}`,
+      );
+      renderWorkflowState();
       return;
     }
     if (!isGeminiUrl(tab.url)) {
       setStatusLine("error", `Open ${GEMINI_HOST} first.`);
       return;
     }
+    messagingHealth = { ok: true };
     const cur = currentTask();
     if (!cur) {
       setStatusLine("error", "No task selected.");
@@ -1363,7 +1442,7 @@
       /* non-fatal */
     }
 
-    const orch = ensureOrchestrator(tab.id);
+    const orch = ensureOrchestrator();
     setStatusLine("info", "Preparing task…");
     const ok = await orch.prepareTask({
       taskId: cur.id,
@@ -1391,7 +1470,15 @@
         phase === "preparing-attachments" && orch.state.error?.attachedCount !== undefined
           ? ` (${orch.state.error.attachedCount} / ${orch.state.error.totalCount} attached)`
           : "";
-      setStatusLine("error", `Preparation failed: ${err}${detail}`);
+      if (err.startsWith("Could not communicate")) {
+        messagingHealth = { ok: false, error: err };
+        setStatusLine(
+          "error",
+          "Could not communicate with Gemini content script. See Debug card.",
+        );
+      } else {
+        setStatusLine("error", `Preparation failed: ${err}${detail}`);
+      }
     }
     renderWorkflowState();
     refreshSelfTest();
@@ -1422,7 +1509,7 @@
       (outputLib &&
         projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
       cur.id;
-    const orch = ensureOrchestrator(tab.id);
+    const orch = ensureOrchestrator();
     setStatusLine("info", "Generating…");
     const ok = await orch.generateTask({
       taskId: cur.id,

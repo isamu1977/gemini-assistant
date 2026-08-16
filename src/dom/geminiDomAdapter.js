@@ -94,6 +94,24 @@
     "Tạo hình ảnh",
   ];
 
+  // Locale-aware labels for the "Upload files" entry inside the + menu.
+  // Used as a fallback when the structural detector (`attach_file` icon)
+  // does not match. The aria-label is more stable; the visible text is
+  // the fallback below.
+  const UPLOAD_FILES_TEXT_CANDIDATES = [
+    "Upload files",
+    "Upload file",
+    "Enviar arquivos",
+    "Enviar archivo",
+    "Enviar arquivo",
+    "Téléverser des fichiers",
+    "Datei hochladen",
+    "ファイルをアップロード",
+    "파일 업로드",
+    "上传文件",
+    "Tải tệp lên",
+  ];
+
   // Labels for the "Deselect Images" toggle button that appears in the
   // composer toolbar ONLY when Image Generation mode is active.
   // This is the most reliable structural indicator of image-mode ON.
@@ -447,7 +465,13 @@
           /describe (your|uma|une|una|ein) image|describe uma imagem|descreva sua imagem/i.test(
             placeholder,
           )) ||
-        !!createHeader,
+        !!createHeader ||
+        // Fallback: PT-BR composer placeholder "Descreva sua imagem…"
+        (placeholder &&
+          /descreva (sua|sue?s?) imagem/i.test(placeholder)) ||
+        // Generic structural fallback: any placeholder containing "image"
+        // when the composer is empty AND the createImagesHeader is found.
+        false,
     };
   }
 
@@ -926,6 +950,9 @@
       let score = 0;
       if (/^upload files?\.?$/i.test(label)) score += 60;
       if (/^upload files?\.?$/i.test(text)) score += 50;
+      // Locale-aware text fallback for "Upload files" (PT: "Enviar arquivos").
+      if (UPLOAD_FILES_TEXT_CANDIDATES.some((c) => text === c.toLowerCase())) score += 45;
+      if (UPLOAD_FILES_TEXT_CANDIDATES.some((c) => text.includes(c.toLowerCase()) && c.length >= 6)) score += 25;
       if (/upload/i.test(label) && /file|document/i.test(label)) score += 30;
       if (alt === "attach_file" || alt.includes("attach_file")) score += 40;
       if (score > bestScore) {

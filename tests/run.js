@@ -25,6 +25,7 @@ const projectLib = require(path.join(ROOT, "src/lib/project.js"));
 const storageLib = require(path.join(ROOT, "src/lib/storage.js"));
 const assetsLib = require(path.join(ROOT, "src/lib/assets.js"));
 const outputLib = globalThis.GeminiAssistantOutput;
+const messagingLib = require(path.join(ROOT, "src/lib/messaging.js"));
 const orchestratorLib = require(path.join(ROOT, "src/workflow/orchestrator.js"));
 
 const FIXTURES = path.join(__dirname, "fixtures");
@@ -1125,9 +1126,384 @@ test("v0.6: resolveTaskOutputBasename returns null for unknown task", () => {
   assertEqual(projectLib.resolveTaskOutputBasename(r.project, "does-not-exist"), null);
 });
 
-// ----- orchestrator.js (v0.6) ---------------------------------------
+// ----- messaging.js (v0.6.1) ----------------------------------------
+
+console.log(`\n${C.bold}messaging.js (v0.6.1)${C.reset}`);
+
+test("messaging: isGeminiUrl accepts https://gemini.google.com/...", () => {
+  assert(messagingLib.isGeminiUrl("https://gemini.google.com/app"));
+  assert(messagingLib.isGeminiUrl("https://gemini.google.com/"));
+  assert(!messagingLib.isGeminiUrl("http://gemini.google.com/"));
+  assert(!messagingLib.isGeminiUrl("https://example.com/"));
+  assert(!messagingLib.isGeminiUrl("https://gemini.google.com.evil.com/"));
+  assert(!messagingLib.isGeminiUrl(""));
+  assert(!messagingLib.isGeminiUrl(null));
+  assert(!messagingLib.isGeminiUrl(undefined));
+});
+
+test("messaging: isPositiveInteger strict check", () => {
+  assert(messagingLib.isPositiveInteger(1));
+  assert(messagingLib.isPositiveInteger(12345));
+  assert(!messagingLib.isPositiveInteger(0));
+  assert(!messagingLib.isPositiveInteger(-1));
+  assert(!messagingLib.isPositiveInteger(1.5));
+  assert(!messagingLib.isPositiveInteger("1"));
+  assert(!messagingLib.isPositiveInteger(null));
+  assert(!messagingLib.isPositiveInteger(undefined));
+  assert(!messagingLib.isPositiveInteger(NaN));
+});
+
+test("messaging: isMessageSerializable rejects functions and symbols", () => {
+  const r1 = messagingLib.isMessageSerializable({ type: "X", fn: () => 1 });
+  assert(!r1.ok, "function in payload must be rejected");
+  assert(/unsupported/i.test(r1.reason));
+  const r2 = messagingLib.isMessageSerializable({ type: "X", s: Symbol("s") });
+  assert(!r2.ok);
+});
+
+test("messaging: isMessageSerializable accepts plain objects, arrays, null, numbers, strings", () => {
+  assertEqual(messagingLib.isMessageSerializable(null), { ok: true });
+  assertEqual(messagingLib.isMessageSerializable(undefined), { ok: true });
+  assertEqual(messagingLib.isMessageSerializable({ type: "X" }), { ok: true });
+  assertEqual(
+    messagingLib.isMessageSerializable({ type: "X", list: [1, 2, 3] }),
+    { ok: true },
+  );
+  assertEqual(
+    messagingLib.isMessageSerializable({ type: "X", nested: { a: 1, b: "two" } }),
+    { ok: true },
+  );
+});
+
+test("messaging: MESSAGE_TYPES is frozen and contains the canonical names", () => {
+  assert(Object.isFrozen(messagingLib.MESSAGE_TYPES));
+  const required = [
+    "PING",
+    "INSERT_PROMPT",
+    "ATTACH",
+    "ATTACH_WITH_MENU",
+    "ATTACH_PROBE",
+    "ATTACH_ACTIVATE",
+    "COMPOSER_STATE",
+    "IMAGE_MODE_PROBE",
+    "ENSURE_IMAGE_MODE",
+    "SEND_COMPOSER",
+    "FIND_SEND_BUTTON",
+    "CAPTURE_BASELINE",
+    "WAIT_FOR_GENERATED_IMAGE",
+    "FETCH_IMAGE",
+  ];
+  for (const k of required) {
+    assert(
+      typeof messagingLib.MESSAGE_TYPES[k] === "string" &&
+        messagingLib.MESSAGE_TYPES[k].startsWith("GEMINI_ASSISTANT_"),
+      `MESSAGE_TYPES.${k} must be a GEMINI_ASSISTANT_* string`,
+    );
+  }
+  // Side panel + content script must agree on these strings.
+  // The content.js switch is the source of truth for runtime; we just
+  // sanity-check the most critical ones here.
+  assertEqual(
+    messagingLib.MESSAGE_TYPES.PING,
+    "GEMINI_ASSISTANT_PING",
+  );
+  assertEqual(
+    messagingLib.MESSAGE_TYPES.ENSURE_IMAGE_MODE,
+    "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE",
+  );
+  assertEqual(
+    messagingLib.MESSAGE_TYPES.ATTACH_WITH_MENU,
+    "GEMINI_ASSISTANT_ATTACH_WITH_MENU",
+  );
+});
+
+test("messaging: sendTabMessage rejects null/undefined tabId", async () => {
+  const fakeChrome = {};
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, null, { type: "X" }),
+    /invalid tabId/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, undefined, { type: "X" }),
+    /invalid tabId/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, "7", { type: "X" }),
+    /invalid tabId/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, 1.5, { type: "X" }),
+    /invalid tabId/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, 0, { type: "X" }),
+    /invalid tabId/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, -7, { type: "X" }),
+    /invalid tabId/,
+  );
+});
+
+test("messaging: sendTabMessage rejects invalid message shape", async () => {
+  const fakeChrome = makeMockChrome();
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, 7, null),
+    /message must be an object/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, 7, { /* no type */ }),
+    /message\.type/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendTabMessage(fakeChrome, 7, { type: "" }),
+    /message\.type/,
+  );
+  await assertThrowsAsync(
+    () =>
+      messagingLib.sendTabMessage(fakeChrome, 7, {
+        type: "X",
+        fn: () => 1,
+      }),
+    /not structured-cloneable/,
+  );
+});
+
+test("messaging: sendTabMessage happy path returns the response", async () => {
+  const chromeRef = makeMockChrome({
+    tabs: [
+      {
+        id: 7,
+        url: "https://gemini.google.com/app",
+        active: true,
+        windowId: 1,
+      },
+    ],
+    responses: { GEMINI_ASSISTANT_PING: { ok: true, url: "https://gemini.google.com/app" } },
+  });
+  const res = await messagingLib.sendTabMessage(chromeRef, 7, {
+    type: "GEMINI_ASSISTANT_PING",
+  });
+  assertEqual(res, { ok: true, url: "https://gemini.google.com/app" });
+  // Verify the message reached the mock exactly once with the expected shape.
+  assertEqual(chromeRef.tabs.calls.length, 1);
+  assertEqual(chromeRef.tabs.calls[0].tabId, 7);
+  assertEqual(chromeRef.tabs.calls[0].message.type, "GEMINI_ASSISTANT_PING");
+  // 3-arg form (tabId, message, callback) — never 4-arg with undefined options.
+  assertEqual(chromeRef.tabs.calls[0].args.length, 3);
+});
+
+test("messaging: sendTabMessage propagates chrome.runtime.lastError", async () => {
+  const chromeRef = makeMockChrome({
+    tabs: [{ id: 7, url: "https://gemini.google.com/app", active: true, windowId: 1 }],
+    lastError: "Could not establish connection. Receiving end does not exist.",
+  });
+  await assertThrowsAsync(
+    () =>
+      messagingLib.sendTabMessage(chromeRef, 7, { type: "GEMINI_ASSISTANT_PING" }),
+    /Receiving end does not exist/,
+  );
+});
+
+test("messaging: getTargetGeminiTab prefers active+currentWindow", async () => {
+  const chromeRef = makeMockChrome({
+    tabs: [
+      { id: 99, url: "https://example.com", active: true, windowId: 1 },
+      { id: 7, url: "https://gemini.google.com/app", active: false, windowId: 1 },
+    ],
+  });
+  const tab = await messagingLib.getTargetGeminiTab(chromeRef);
+  assertEqual(tab.id, 7);
+  // Two queries: active+currentWindow, then full scan.
+  assertEqual(chromeRef.tabs.calls.length, 2);
+  assertEqual(chromeRef.tabs.calls[0].query.active, true);
+  assertEqual(chromeRef.tabs.calls[0].query.currentWindow, true);
+});
+
+test("messaging: getTargetGeminiTab falls back to any-window scan", async () => {
+  // First query returns only non-Gemini tabs.
+  // We use a custom mock to keep the responses distinct.
+  const chromeRef = makeMockChromeWithMultiQuery([
+    // active+currentWindow: nothing Gemini
+    [{ id: 50, url: "https://example.com", active: true, windowId: 1 }],
+    // full scan: the Gemini tab in another window
+    [
+      { id: 50, url: "https://example.com", active: false, windowId: 1 },
+      { id: 88, url: "https://gemini.google.com/app", active: false, windowId: 2 },
+    ],
+  ]);
+  const tab = await messagingLib.getTargetGeminiTab(chromeRef);
+  assertEqual(tab.id, 88);
+});
+
+test("messaging: getTargetGeminiTab throws when no Gemini tab is open", async () => {
+  const chromeRef = makeMockChrome({
+    tabs: [{ id: 50, url: "https://example.com", active: true, windowId: 1 }],
+  });
+  await assertThrowsAsync(
+    () => messagingLib.getTargetGeminiTab(chromeRef),
+    /No Gemini tab found/,
+  );
+});
+
+test("messaging: sendToGemini resolves tab and forwards the typed payload", async () => {
+  const chromeRef = makeMockChrome({
+    tabs: [{ id: 7, url: "https://gemini.google.com/app", active: true, windowId: 1 }],
+    responses: {
+      GEMINI_ASSISTANT_PING: { ok: true, url: "https://gemini.google.com/app" },
+    },
+  });
+  const res = await messagingLib.sendToGemini(chromeRef, "GEMINI_ASSISTANT_PING");
+  assertEqual(res, { ok: true, url: "https://gemini.google.com/app" });
+  assertEqual(chromeRef.tabs.calls[0].message.type, "GEMINI_ASSISTANT_PING");
+});
+
+test("messaging: sendToGemini rejects bad type", async () => {
+  const chromeRef = makeMockChrome();
+  await assertThrowsAsync(
+    () => messagingLib.sendToGemini(chromeRef, ""),
+    /type required/,
+  );
+  await assertThrowsAsync(
+    () => messagingLib.sendToGemini(chromeRef, null),
+    /type required/,
+  );
+});
+
+test("messaging: sendToGemini rejects non-object payload", async () => {
+  const chromeRef = makeMockChrome();
+  await assertThrowsAsync(
+    () => messagingLib.sendToGemini(chromeRef, "X", "not-an-object"),
+    /payload must be an object/,
+  );
+  // null payload is allowed.
+  const res = await messagingLib.sendToGemini(chromeRef, "GEMINI_ASSISTANT_PING", null);
+  assertEqual(res && res.ok, true);
+});
+
+test("messaging: pingGemini returns target tab diagnostic on success", async () => {
+  const chromeRef = makeMockChrome({
+    tabs: [{ id: 7, url: "https://gemini.google.com/app", active: true, windowId: 1 }],
+    responses: { GEMINI_ASSISTANT_PING: { ok: true, url: "https://gemini.google.com/app" } },
+  });
+  const r = await messagingLib.pingGemini(chromeRef);
+  assert(r.ok, "ping should succeed");
+  assertEqual(r.targetTabId, 7);
+  assertEqual(r.targetTabUrl, "https://gemini.google.com/app");
+  assertEqual(r.targetTabActive, true);
+  assertEqual(r.targetTabWindowId, 1);
+});
+
+test("messaging: pingGemini returns structured error when no Gemini tab", async () => {
+  const chromeRef = makeMockChrome({
+    tabs: [{ id: 50, url: "https://example.com", active: true, windowId: 1 }],
+  });
+  const r = await messagingLib.pingGemini(chromeRef);
+  assert(!r.ok);
+  assert(/No Gemini tab/.test(r.error));
+});
+
+// ----- helpers for messaging tests -----------------------------------
+
+function makeMockChrome(opts) {
+  const tabs = (opts && opts.tabs) || [];
+  const responses = (opts && opts.responses) || {};
+  const lastError = (opts && opts.lastError) || null;
+  const calls = [];
+  return {
+    runtime: {
+      get lastError() {
+        return lastError ? { message: lastError } : null;
+      },
+    },
+    tabs: {
+      calls,
+      query(queryInfo, cb) {
+        calls.push({ query: queryInfo, args: arguments.length });
+        // Always honor the active+currentWindow filter when given.
+        const filtered = tabs.filter((t) => {
+          if (queryInfo && queryInfo.active === true && !t.active) return false;
+          if (queryInfo && queryInfo.currentWindow === true) {
+            // mock only has windowId 1, so this matches all our tabs.
+          }
+          return true;
+        });
+        const result = filtered.length > 0 ? filtered : tabs;
+        // Simulate lastError.
+        if (lastError && calls.length === 1) {
+          setTimeout(() => cb([]), 0);
+        } else {
+          setTimeout(() => cb(result), 0);
+        }
+      },
+      sendMessage(tabId, message, cb) {
+        calls.push({
+          method: "sendMessage",
+          tabId,
+          message,
+          args: arguments.length,
+        });
+        const response =
+          (responses && responses[message && message.type]) || { ok: true };
+        setTimeout(() => {
+          if (lastError && calls.filter((c) => c.method === "sendMessage").length === 1) {
+            cb(undefined);
+          } else {
+            cb(response);
+          }
+        }, 0);
+      },
+    },
+  };
+}
+
+function makeMockChromeWithMultiQuery(perQueryResponses) {
+  const calls = [];
+  let qIndex = 0;
+  return {
+    runtime: {
+      get lastError() {
+        return null;
+      },
+    },
+    tabs: {
+      calls,
+      query(queryInfo, cb) {
+        calls.push({ query: queryInfo, args: arguments.length });
+        const list = perQueryResponses[qIndex] || [];
+        qIndex++;
+        setTimeout(() => cb(list), 0);
+      },
+      sendMessage(tabId, message, cb) {
+        calls.push({ method: "sendMessage", tabId, message, args: arguments.length });
+        setTimeout(() => cb({ ok: true }), 0);
+      },
+    },
+  };
+}
+
+async function assertThrowsAsync(fn, pattern) {
+  let thrown = null;
+  try {
+    await fn();
+  } catch (e) {
+    thrown = e;
+  }
+  if (!thrown) {
+    throw new Error("expected async throw; got success");
+  }
+  if (pattern && !pattern.test(thrown.message)) {
+    throw new Error(
+      `error message did not match pattern ${pattern}\n      got: ${thrown.message}`,
+    );
+  }
+}
+
+// ----- end messaging helpers ------------------------------------------
 
 console.log(`\n${C.bold}orchestrator.js (v0.6)${C.reset}`);
+
+// ----- orchestrator.js (v0.6) ---------------------------------------
 
 function makeFakeFile(name) {
   return { name, type: "image/png", size: 1024 };
@@ -1151,11 +1527,10 @@ function makeOrchestrator() {
   const log = [];
   const phases = [];
   const progresses = [];
-  let tabId = null;
   const orch = orchestratorLib.createOrchestrator({
-    sendToTab: async (id, msg) => {
-      tabId = id;
-      // The fake "tab" responds based on the message type.
+    sendToTab: async (msg) => {
+      // v0.6.1: the orchestrator no longer passes a tabId here; tab
+      // resolution lives in src/lib/messaging.js.
       if (msg.type === "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE") {
         return { ok: true, mode: "activated" };
       }
@@ -1205,7 +1580,6 @@ function makeOrchestrator() {
       log.push(`${level}:${message}`);
     },
   });
-  orch._tabId = 7;
   return { orch, phases, progresses, log };
 }
 
@@ -1344,13 +1718,13 @@ test("orchestrator: preflight fails if composer attachments don't match expected
   await orch.attachAll([makeFakeResolvedRef("a", "A")]);
   await orch.insertPrompt("p");
   // Now monkeypatch sendToTab to lie about attachments.
-  orch.deps.sendToTab = async () => ({
+  orch._setSendToTab(async () => ({
     ok: true,
     attachmentCount: 0,
     pendingUploadCount: 0,
     promptLength: 1,
     imageModeActive: true,
-  });
+  }));
   const ok = await orch.preflight({ taskId: "x", promptLength: 1, resolvedRefs: [{}] });
   assert(!ok);
   assertEqual(orch.state.phase, "error");
@@ -1387,10 +1761,10 @@ test("orchestrator: cancel() transitions to cancelled and short-circuits pending
   // After cancel, ensureImageMode should NOT fire (it should observe the
   // cancelled flag and return false without calling sendToTab).
   let called = false;
-  orch.deps.sendToTab = async () => {
+  orch._setSendToTab(async () => {
     called = true;
     return { ok: true };
-  };
+  });
   const ok = await orch.ensureImageMode();
   assert(!ok);
   assert(!called, "sendToTab must not be called after cancel()");
@@ -1411,6 +1785,162 @@ test("orchestrator: download fails when no generated image", async () => {
   const ok = await orch.download("x", "y", "image/png");
   assert(!ok);
   assertEqual(orch.state.phase, "error");
+});
+
+// v0.6.1 regression: the v0.6 bug was that the orchestrator invoked
+// sendToTab with a `null` tabId (the closure variable was never set),
+// which Chrome rejected with "No matching signature". After the fix,
+// sendToTab takes only the message; tabId lives in the messaging
+// helper.
+test("orchestrator: sendToTab is called with one argument (message), not two", async () => {
+  const calls = [];
+  const { orch } = makeOrchestrator();
+  orch._setSendToTab(async (msg) => {
+    calls.push({ keys: Object.keys(msg || {}), type: msg && msg.type });
+    if (msg && msg.type === "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE") {
+      return { ok: true, mode: "activated" };
+    }
+    if (msg && msg.type === "GEMINI_ASSISTANT_INSERT_PROMPT") {
+      return { ok: true, length: (msg.text || "").length, method: "quill" };
+    }
+    return { ok: true };
+  });
+  const refs = [makeFakeResolvedRef("a", "A")];
+  await orch.prepareTask({ taskId: "x", prompt: "p", resolvedRefs: refs });
+  // Every sendToTab call receives a single object argument.
+  assert(calls.length >= 4, `expected several sendToTab calls, got ${calls.length}`);
+  for (const c of calls) {
+    assert(typeof c === "object" && c !== null, "sendToTab should receive an object");
+    assert(typeof c.type === "string", "message must have a type field");
+  }
+});
+
+test("orchestrator: sendToTab failure surfaces as friendly error and short-circuits workflow", async () => {
+  const { orch } = makeOrchestrator();
+  orch._setSendToTab(async () => {
+    throw new Error("invalid tabId");
+  });
+  const ok = await orch.prepareTask({
+    taskId: "x",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+  });
+  assert(!ok);
+  assertEqual(orch.state.phase, "error");
+  assertEqual(orch.state.error.phase, "preparing-image-mode");
+  // The error message we surface in the UI mentions "Could not communicate".
+  assert(
+    /Could not communicate with Gemini content script/.test(
+      orch.state.error.error,
+    ),
+    `unexpected error: ${orch.state.error.error}`,
+  );
+});
+
+test("orchestrator: messaging failure at preparing-image-mode halts the workflow", async () => {
+  const { orch, phases } = makeOrchestrator();
+  orch._setSendToTab(async () => {
+    throw new Error("invalid tabId");
+  });
+  await orch.prepareTask({
+    taskId: "x",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+  });
+  const visited = phases.map((p) => p.phase);
+  // Image mode phase was attempted; attachment, prompt, etc. were NOT.
+  assert(visited.includes("preparing-image-mode"));
+  assert(!visited.includes("preparing-attachments"));
+  assert(!visited.includes("preparing-prompt"));
+  assert(!visited.includes("sending"));
+});
+
+test("orchestrator: messaging failure at preparing-attachments does not run preparing-prompt", async () => {
+  const { orch, phases } = makeOrchestrator();
+  let callIndex = 0;
+  orch._setSendToTab(async (msg) => {
+    callIndex++;
+    if (msg.type === "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE") {
+      return { ok: true, mode: "activated" };
+    }
+    if (msg.type === "GEMINI_ASSISTANT_ATTACH_WITH_MENU") {
+      throw new Error("Could not communicate");
+    }
+    return { ok: true };
+  });
+  const ok = await orch.prepareTask({
+    taskId: "x",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A"), makeFakeResolvedRef("b", "B")],
+  });
+  assert(!ok);
+  const visited = phases.map((p) => p.phase);
+  assert(visited.includes("preparing-image-mode"));
+  assert(visited.includes("preparing-attachments"));
+  assert(!visited.includes("preparing-prompt"));
+  assert(!visited.includes("sending"));
+});
+
+test("orchestrator: messaging failure at preparing-attachments does not run send", async () => {
+  const { orch, phases } = makeOrchestrator();
+  let callIndex = 0;
+  orch._setSendToTab(async (msg) => {
+    callIndex++;
+    if (msg.type === "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE") {
+      return { ok: true, mode: "activated" };
+    }
+    if (msg.type === "GEMINI_ASSISTANT_INSERT_PROMPT") {
+      return { ok: true, length: 1, method: "quill" };
+    }
+    if (msg.type === "GEMINI_ASSISTANT_ATTACH_WITH_MENU") {
+      throw new Error("Could not communicate");
+    }
+    return { ok: true };
+  });
+  await orch.prepareTask({
+    taskId: "x",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+  });
+  // prepareTask halted at attachments; subsequent generateTask must not
+  // skip past it (sending must NOT appear in phases).
+  await orch.generateTask({
+    taskId: "x",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+    basename: "x",
+    projectId: "p",
+    mimeOrExt: "image/png",
+  });
+  const visited = phases.map((p) => p.phase);
+  assert(!visited.includes("sending"));
+});
+
+test("orchestrator: messaging failure at send does not run waiting-for-generation", async () => {
+  const { orch, phases } = makeOrchestrator();
+  // Make prepareTask succeed by default.
+  await orch.prepareTask({
+    taskId: "x",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+  });
+  // Now poison send.
+  orch._setSendToTab(async (msg) => {
+    if (msg.type === "GEMINI_ASSISTANT_SEND_COMPOSER") {
+      throw new Error("Could not communicate");
+    }
+    return { ok: true };
+  });
+  await orch.generateTask({
+    taskId: "x",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+    basename: "x",
+    projectId: "p",
+    mimeOrExt: "image/png",
+  });
+  const visited = phases.map((p) => p.phase);
+  assert(!visited.includes("waiting-for-generation"));
 });
 
 // ----- end ----------------------------------------------------------------

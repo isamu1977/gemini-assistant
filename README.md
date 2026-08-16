@@ -360,6 +360,98 @@ side panel and the content script is documented in
 
 ## Bug history
 
+### v0.6.1 — Messaging stabilization (Side Panel → Gemini)
+
+**Symptom**: clicking *Ensure Image Mode* or *Prepare Task* failed
+immediately with
+
+```
+Error in invocation of tabs.sendMessage(
+  integer tabId,
+  any message,
+  optional object options,
+  optional function callback
+):
+No matching signature.
+```
+
+The state machine recorded `[phase] idle -> preparing-image-mode ->
+error` before any DOM logic ran. The Side Panel's self-test
+(`GEMINI_ASSISTANT_PING`) and *Insert Prompt* still worked, so the bug
+was specific to the v0.6 workflow.
+
+**Root cause**: the v0.6 orchestrator held a closure variable
+`let tabId = null;` that was never assigned. Every `sendToTab(tabId,
+msg)` call therefore invoked `chrome.tabs.sendMessage(null, msg,
+callback)`, which Chrome rejects because `null` is not an integer.
+
+**Fix**:
+
+- New `src/lib/messaging.js` is the single source of truth for
+  `chrome.tabs.sendMessage` calls. It exposes:
+  - `getTargetGeminiTab(chrome)` — resolves the Gemini tab, prefers
+    `active + currentWindow`, falls back to scanning every window,
+    throws a clear error when no Gemini tab is open.
+  - `sendTabMessage(chrome, tabId, message)` — validates that
+    `tabId` is a positive integer (rejects `null`, `undefined`,
+    strings, floats, negatives), validates that the message has a
+    non-empty `type` and is structured-cloneable, then calls
+    `chrome.tabs.sendMessage(tabId, message, callback)` with strict
+    3-arg discipline (never 4-arg with `undefined` options).
+  - `sendToGemini(chrome, type, payload)` — convenience wrapper used
+    by the orchestrator.
+  - `pingGemini(chrome)` — returns `{ ok, targetTabId, targetTabUrl,
+    targetTabActive, targetTabWindowId }` for the UI's
+    *Messaging ✓/✕* row.
+  - `MESSAGE_TYPES` — frozen map of canonical message type strings,
+    shared between side panel and content script.
+- The orchestrator no longer accepts a `tabId`. Its `sendToTab` dep
+  is `(message) => Promise<response>`, eliminating the whole class
+  of "forgot to pass tabId" bugs. A wrapper inside the orchestrator
+  normalises errors to the friendly text
+  `Could not communicate with Gemini content script: …` that the
+  UI surfaces.
+- The Side Panel UI gained a *Messaging* row in the Generation card
+  and a *Ping Gemini* button. Failures show `✕ Error` with the full
+  reason in the Debug card; the main UI never shows a raw
+  `Error in invocation of tabs.sendMessage(...)` line.
+- PT-BR fallback added to `findUploadFilesMenuitem`
+  (UPLOAD_FILES_TEXT_CANDIDATES, including *Enviar arquivos*). The
+  existing *Criar imagem* fallback for Create Image was preserved.
+
+**Regression coverage** (`tests/run.js`, +20 tests):
+
+- `messaging`:
+  - `isGeminiUrl`, `isPositiveInteger`, `isMessageSerializable` shape checks.
+  - `sendTabMessage` rejects `null`/`undefined`/string/float/zero/negative
+    `tabId`; rejects messages without `type`; rejects non-serializable
+    payloads (functions, symbols, DOM nodes).
+  - 3-arg `chrome.tabs.sendMessage` invocation is verified by the mock
+    harness (`args.length === 3`).
+  - `getTargetGeminiTab` prefers active+currentWindow and falls back
+    to a full-window scan.
+  - `sendToGemini` rejects bad `type` and bad payload shape.
+  - `pingGemini` returns the structured diagnostic.
+  - `chrome.runtime.lastError` is propagated as a real Error.
+- `orchestrator`:
+  - `sendToTab` is called with exactly one argument (the message).
+  - Messaging failure at *preparing-image-mode* halts the workflow
+    and surfaces a friendly error.
+  - Messaging failure at *preparing-attachments* does NOT advance
+    to *preparing-prompt*.
+  - Messaging failure at *preparing-attachments* does NOT advance
+    to *sending*.
+  - Messaging failure at *send* does NOT advance to
+    *waiting-for-generation*.
+
+**What did NOT change**:
+
+- Project / Task manager, folder binding, asset resolver, Insert
+  Prompt, single Attach — all still work as in v0.6.0.
+- The orchestrator's PHASES list, preflight checks, and download
+  pipeline are untouched.
+- No batch, no auto-next, no retry, no JingJing integration.
+
 ### v0.6.0 — End-to-End Single Task Image Generation
 
 - New `task.output.basename` optional field for download filenames. Sanitized at parse time; path traversal rejected.

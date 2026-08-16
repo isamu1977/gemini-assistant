@@ -63,8 +63,11 @@
   /**
    * Build an Orchestrator. The caller provides:
    *
-   *   sendToTab(tabId, message) -> Promise<response>
-   *     Wraps chrome.tabs.sendMessage. The orchestrator never imports chrome.
+   *   sendToTab(message) -> Promise<response>
+   *     Wraps chrome.tabs.sendMessage. The orchestrator never imports
+   *     chrome. The side panel is responsible for resolving the right
+   *     Gemini tab (see src/lib/messaging.js). Returning a rejection
+   *     here — for any reason — short-circuits the workflow.
    *
    *   onPhaseChange(phase, info)
    *     UI hook fired on every transition. info is a small object with
@@ -79,10 +82,16 @@
    *
    * The orchestrator also exposes `.state` for read-only inspection and
    * `.cancel()` for abort.
+   *
+   * v0.6.1: the previous signature `sendToTab(tabId, message)` caused
+   * chrome.tabs.sendMessage to be invoked with `tabId === null` because
+   * the internal closure variable was never assigned, which Chrome
+   * rejects with "No matching signature". The orchestrator now delegates
+   * tabId resolution to the caller (via src/lib/messaging.js).
    */
   function createOrchestrator(deps) {
     if (!deps || typeof deps.sendToTab !== "function") {
-      throw new Error("Orchestrator requires deps.sendToTab(tabId, message)");
+      throw new Error("Orchestrator requires deps.sendToTab(message)");
     }
     const onPhaseChange =
       typeof deps.onPhaseChange === "function" ? deps.onPhaseChange : () => {};
@@ -91,6 +100,20 @@
         ? deps.onAttachmentProgress
         : () => {};
     const onLog = typeof deps.onLog === "function" ? deps.onLog : () => {};
+
+    // The single messaging choke point. Defends against malformed
+    // payloads and normalises the error shape so the UI can render a
+    // stable message regardless of which phase failed.
+    async function sendToTab(message) {
+      try {
+        return await deps.sendToTab(message);
+      } catch (e) {
+        const reason = e?.message ?? String(e);
+        throw new Error(
+          `Could not communicate with Gemini content script: ${reason}`,
+        );
+      }
+    }
 
     const state = {
       phase: "idle",
@@ -109,7 +132,6 @@
     };
 
     let currentTask = null; // Promise that resolves the in-flight phase.
-    let tabId = null;
 
     function log(level, message, info) {
       try {
@@ -140,8 +162,11 @@
     }
 
     function ensureTabId(id) {
-      if (!id) throw new Error("orchestrator: tabId required");
-      tabId = id;
+      // Backwards-compat shim. v0.6.1 no longer needs a tabId on the
+      // orchestrator (the messaging helper owns it). External code that
+      // still calls this method should not crash.
+      if (typeof id !== "undefined" && id !== null) return;
+      // No-op.
     }
 
     function reset(task) {
@@ -179,7 +204,7 @@
     async function ensureImageMode() {
       transition("preparing-image-mode");
       try {
-        const res = await deps.sendToTab(tabId, {
+        const res = await sendToTab({
           type: "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE",
         });
         state.imageMode = {
@@ -260,7 +285,7 @@
 
         let res;
         try {
-          res = await deps.sendToTab(tabId, {
+          res = await sendToTab({
             type: "GEMINI_ASSISTANT_ATTACH_WITH_MENU",
             file: ref.fileObj,
             fileName: ref.fileName,
@@ -317,7 +342,7 @@
         return false;
       }
       try {
-        const res = await deps.sendToTab(tabId, {
+        const res = await sendToTab({
           type: "GEMINI_ASSISTANT_INSERT_PROMPT",
           text: promptText,
         });
@@ -368,7 +393,7 @@
       // 2. Composer state
       let composer = null;
       try {
-        composer = await deps.sendToTab(tabId, {
+        composer = await sendToTab({
           type: "GEMINI_ASSISTANT_COMPOSER_STATE",
         });
       } catch (e) {
@@ -410,7 +435,7 @@
       // 6. Send button enabled. We rely on the DOM adapter to check.
       let sendBtn = null;
       try {
-        const r = await deps.sendToTab(tabId, {
+        const r = await sendToTab({
           type: "GEMINI_ASSISTANT_FIND_SEND_BUTTON",
         });
         sendBtn = r;
@@ -444,7 +469,7 @@
     async function send() {
       transition("sending");
       try {
-        const res = await deps.sendToTab(tabId, {
+        const res = await sendToTab({
           type: "GEMINI_ASSISTANT_SEND_COMPOSER",
         });
         state.send = { ok: !!(res && res.ok), error: res?.error ?? null };
@@ -462,7 +487,7 @@
 
     async function captureBaseline() {
       try {
-        const res = await deps.sendToTab(tabId, {
+        const res = await sendToTab({
           type: "GEMINI_ASSISTANT_CAPTURE_BASELINE",
         });
         return res;
@@ -474,7 +499,7 @@
     async function waitForGeneratedImage(baseline, timeoutMs) {
       transition("waiting-for-generation");
       try {
-        const res = await deps.sendToTab(tabId, {
+        const res = await sendToTab({
           type: "GEMINI_ASSISTANT_WAIT_FOR_GENERATED_IMAGE",
           baseline,
           timeoutMs,
@@ -627,6 +652,23 @@
       // Internal — exposed for tests:
       _transition: transition,
       _failWith: failWith,
+      _deps: deps,
+      _setSendToTab(fn) {
+        if (typeof fn !== "function") {
+          throw new Error("orchestrator: _setSendToTab expects a function");
+        }
+        sendToTab = async (message) => {
+          try {
+            return await fn(message);
+          } catch (e) {
+            throw new Error(
+              `Could not communicate with Gemini content script: ${
+                e?.message ?? String(e)
+              }`,
+            );
+          }
+        };
+      },
     };
   }
 

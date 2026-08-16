@@ -132,9 +132,14 @@
       <section class="card workflow-card">
         <div class="card-header">
           <span class="card-title">Generation</span>
+          <button id="ping-gemini-btn" type="button" class="ghost" title="Round-trip PING to the Gemini content script">
+            Ping Gemini
+          </button>
         </div>
         <div class="card-body">
           <dl class="diag-list">
+            <dt>Messaging</dt>
+            <dd id="workflow-messaging" class="muted">—</dd>
             <dt>Image Mode</dt>
             <dd id="workflow-image-mode" class="muted">…probing…</dd>
             <dt>References</dt>
@@ -236,11 +241,12 @@
       </div>
     </div>
 
-    <script src="../lib/project.js"></script>
-    <script src="../lib/storage.js"></script>
-    <script src="../lib/assets.js"></script>
-    <script src="../lib/output.js"></script>
-    <script src="../workflow/orchestrator.js"></script>
-    <script src="sidepanel.js"></script>
+<script src="../lib/project.js"></script>
+      <script src="../lib/storage.js"></script>
+      <script src="../lib/assets.js"></script>
+      <script src="../lib/output.js"></script>
+      <script src="../lib/messaging.js"></script>
+      <script src="../workflow/orchestrator.js"></script>
+      <script src="sidepanel.js"></script>
   </body>
 </html>

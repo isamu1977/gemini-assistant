@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.6.0",
-  "description": "Generic project and task manager for gemini.google.com. v0.6: end-to-end single-task image generation — activate Create Image mode, attach references, insert prompt, send, detect result, and download to Downloads/Gemini Assistant/<project-id>/.",
+  "version": "0.6.1",
+  "description": "Generic project and task manager for gemini.google.com. v0.6.1: stabilizes Side Panel ↔ Gemini content script messaging (single sendToGemini helper, strict tabId validation, PT-BR menu fallback). v0.6: end-to-end single-task image generation — activate Create Image mode, attach references, insert prompt, send, detect result, and download to Downloads/Gemini Assistant/<project-id>/.",
   "minimum_chrome_version": "116",
 
   "permissions": ["storage", "sidePanel", "downloads"],

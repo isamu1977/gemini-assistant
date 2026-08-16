@@ -6,9 +6,39 @@ Playwright DOM tests do **not** substitute for these — they validate the
 state machine; only real Gemini proves the wiring.
 
 > Pre-requisites:
-> - Gemini Assistant v0.6.0 installed (Chrome `chrome://extensions` → Load unpacked → repo root).
+> - Gemini Assistant v0.6.1 installed (Chrome `chrome://extensions` → Load unpacked → repo root).
 > - Signed in to gemini.google.com as Pro (image generation needs it).
 > - A real project folder with the `tests/references/` images, OR your own.
+
+> v0.6.1 addition: a new **Ping Gemini** button in the Generation card
+> runs `GEMINI_ASSISTANT_PING` end-to-end. Use it to confirm the
+> Side Panel ↔ content script bridge is alive before testing anything
+> else. The **Messaging** row in the Generation card shows
+> `✓ Connected` (ok) or `✕ Error` (with the reason in the Debug card).
+
+---
+
+## Test 0 — Messaging (v0.6.1 prerequisite)
+
+**Goal**: verify that the Side Panel can talk to the Gemini content
+script at all.
+
+1. Open `https://gemini.google.com/app`.
+2. Open the Gemini Assistant Side Panel.
+3. Click **Ping Gemini** in the Generation card header.
+
+Expected:
+- Status line: `Messaging ✓ connected (tab N, https://gemini.google.com/app)`.
+- The **Messaging** row in the Generation card shows `✓ Connected`.
+- The Debug card shows the self-test JSON (same as in v0.6.0).
+
+Failure modes:
+- `✕ Error: No Gemini tab found. Open https://gemini.google.com/...`
+  → the page is on a different host. Open the Gemini tab first.
+- `✕ Error: Could not establish connection. Receiving end does not
+  exist.` → content script not injected (rare — re-load the extension).
+
+If Test 0 fails, **stop** — Tests A–D cannot pass.
 
 ---
 
@@ -17,12 +47,11 @@ state machine; only real Gemini proves the wiring.
 **Goal**: verify the popup can reliably switch Gemini to Image
 Generation mode.
 
-1. Open `https://gemini.google.com/app` (a fresh chat).
-2. Open the Gemini Assistant Side Panel.
-3. Load the bundled example project (`examples/example-project-v2.json`).
-4. Bind the project folder to the repo root (containing `tests/references/`).
-5. Select **scene-001**.
-6. Click **Ensure Image Mode**.
+1. Pass Test 0 first.
+2. Load the bundled example project (`examples/example-project-v2.json`).
+3. Bind the project folder to the repo root (containing `tests/references/`).
+4. Select **scene-001**.
+5. Click **Ensure Image Mode**.
 
 Expected:
 - Workflow phase indicator shows `preparing-image-mode` briefly, then
@@ -34,10 +63,14 @@ Expected:
 - Status line: "Image Generation mode ready."
 
 Failure modes:
+- "Could not communicate with Gemini content script." — re-run Test 0
+  to see the underlying error in the Debug card.
 - "Could not find the + (Upload & tools) button." — Gemini UI changed;
   re-inspect DOM and add a new fallback in `findPlusButton`.
 - "Could not find 'Create image' in the + menu." — Gemini changed the
-  menu structure; re-inspect and update `findCreateImageMenuitem`.
+  menu structure. v0.6.1 already accepts the PT-BR variant "Criar
+  imagem"; check the Debug card's imageMode probe and update
+  `findCreateImageMenuitem` if needed.
 - "Clicked Create image but image mode did not become active within the
   timeout." — Gemini added a confirmation step; check if a dialog
   needs closing.
