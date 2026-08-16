@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "output-test", "name": "Output test project" },
+  "assets": {
+    "a": { "label": "Asset A", "type": "character", "file": "refs/a.png" }
+  },
+  "tasks": [
+    { "id": "scene-001", "prompt": "p1", "references": ["a"], "output": { "basename": "scene-001" } },
+    { "id": "scene-002", "prompt": "p2", "references": ["a"], "output": { "basename": "Scene 002 - The Return" } },
+    { "id": "scene-003", "prompt": "p3" }
+  ]
+}

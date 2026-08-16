@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "output-invalid", "name": "Invalid output" },
+  "assets": {},
+  "tasks": [
+    { "id": "ok", "prompt": "p", "output": { "basename": "../../etc/passwd" } }
+  ]
+}

@@ -61,6 +61,58 @@
     "Enviar mensaje",
   ];
 
+  // Labels for the menu trigger "+" (Upload & tools). Localized variants
+  // we have observed. We use this as a soft fallback; the structural
+  // detection (icon `plus` + position in input area) is the primary.
+  const PLUS_BUTTON_LABEL_CANDIDATES = [
+    "Upload & tools",
+    "Upload and tools",
+    "Upload",
+    "Add files and tools",
+    "Carregar e ferramentas",
+    "Cargar y herramientas",
+    "Téléverser et outils",
+    "Hochladen und Tools",
+    "アップロードとツール",
+    "업로드 및 도구",
+    "上传和工具",
+  ];
+
+  // Locale-aware labels for "Create image" inside the + menu.
+  // We use text matching only as a FALLBACK. The primary detector is the
+  // structural role `menuitemcheckbox` (Create image is a toggle, not an
+  // action) combined with the icon name `image_create`.
+  const CREATE_IMAGE_TEXT_CANDIDATES = [
+    "Create image",
+    "Criar imagem",
+    "Créer une image",
+    "Crear imagen",
+    "Immagine erstellen",
+    "画像を作成",
+    "이미지 만들기",
+    "创建图片",
+    "Tạo hình ảnh",
+  ];
+
+  // Labels for the "Deselect Images" toggle button that appears in the
+  // composer toolbar ONLY when Image Generation mode is active.
+  // This is the most reliable structural indicator of image-mode ON.
+  const DESELECT_IMAGE_LABEL_CANDIDATES = [
+    "Deselect Images",
+    "Deselect Image",
+    "Cancel image generation",
+    "Image generation on",
+    "Imagens selecionadas",
+    "Imágenes seleccionadas",
+    "Images sélectionnées",
+    "画像を選択中",
+    "이미지 선택됨",
+    "已选择图片",
+  ];
+
+  // Labels for the menuitemcheckbox "Create image" toggle inside the menu.
+  const CREATE_IMAGE_MENUITEM_LABEL_CANDIDATES = CREATE_IMAGE_TEXT_CANDIDATES;
+
   // Candidate selectors. Each is independent of locale.
   // Order matters: earlier = more specific.
   const CANDIDATE_SELECTORS = Object.freeze([
@@ -264,6 +316,260 @@
       qlEditorCount: qlEditors.length,
       textboxRoleCount: textboxRoles.length,
       ariaLabelsSample: ariaLabels,
+    };
+  }
+
+  // ---- Image Generation Mode (v0.6) -----------------------------------------
+
+  // Image mode is a structural state in the Gemini composer. When active:
+  //   1. A toggle button "Deselect Images" appears next to the + button.
+  //      We accept multiple locale variants.
+  //   2. The textbox placeholder switches to "Describe your image".
+  //   3. The menuitemcheckbox "Create image" in the + menu shows a
+  //      checked state.
+  //
+  // We use ALL THREE signals to confirm. We never click anything if
+  // already active.
+
+  const IMAGE_MODE_CONFIRM_TIMEOUT_MS = 4000;
+  const IMAGE_MODE_ACTIVATE_POLL_MS = 120;
+
+  /**
+   * Find the "Deselect Images" toggle that appears when image mode is on.
+   * Returns the button element or null.
+   */
+  function findDeselectImagesToggle() {
+    const allBtns = Array.from(document.querySelectorAll("button, gem-button"));
+    for (const el of allBtns) {
+      const label = (el.getAttribute && el.getAttribute("aria-label")) || "";
+      if (!label) continue;
+      if (DESELECT_IMAGE_LABEL_CANDIDATES.some((l) => label === l || label.includes(l))) {
+        return el;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Find the + (Upload & tools) button. Falls back from aria-label to
+   * structural detection (icon name `plus` inside the input-area-v2).
+   */
+  function findPlusButton() {
+    const buttons = Array.from(
+      document.querySelectorAll("button[aria-label], gem-button[aria-label]"),
+    );
+    for (const b of buttons) {
+      const label = (b.getAttribute("aria-label") || "").toLowerCase();
+      if (PLUS_BUTTON_LABEL_CANDIDATES.some((l) => label.includes(l.toLowerCase()))) {
+        return b;
+      }
+    }
+    const area = document.querySelector("input-area-v2");
+    if (area) {
+      const candidates = Array.from(area.querySelectorAll("button, gem-button"));
+      for (const b of candidates) {
+        const img = b.querySelector("img");
+        if (!img) continue;
+        const alt = (img.getAttribute("alt") || img.textContent || "").toLowerCase();
+        if (alt === "plus" || alt.includes("plus")) return b;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Find the menuitemcheckbox matching "Create image" inside the + menu.
+   * Accepts text match OR icon-name match. Returns the best candidate or
+   * null. We never throw.
+   */
+  function findCreateImageMenuitem() {
+    const items = Array.from(document.querySelectorAll('[role="menuitemcheckbox"]'));
+    const area = document.querySelector("input-area-v2");
+    const candidates = items.filter((i) => {
+      const r = i.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      if (area) {
+        const ar = area.getBoundingClientRect();
+        const dx = Math.abs(r.left + r.width / 2 - (ar.left + ar.width / 2));
+        const dy = Math.abs(r.top + r.height / 2 - (ar.top + ar.height / 2));
+        if (dx > 600 || dy > 600) return false;
+      }
+      return true;
+    });
+
+    let best = null;
+    let bestScore = 0;
+    for (const el of candidates) {
+      const text = (el.textContent || "").trim().toLowerCase();
+      const img = el.querySelector("img");
+      const alt = img ? (img.getAttribute("alt") || "").toLowerCase() : "";
+      let score = 0;
+      if (CREATE_IMAGE_TEXT_CANDIDATES.some((c) => c.toLowerCase() === text)) score += 50;
+      if (CREATE_IMAGE_TEXT_CANDIDATES.some((c) => text.includes(c.toLowerCase()))) score += 30;
+      if (alt === "image_create" || alt.includes("image_create")) score += 40;
+      if (score > bestScore) {
+        best = el;
+        bestScore = score;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Non-destructive probe: returns structured info about Image Generation
+   * mode without clicking anything. Used by the sidepanel for status.
+   */
+  function imageModeProbe() {
+    const deselect = findDeselectImagesToggle();
+    const tb = document.querySelector('[role="textbox"]') || findPromptInput();
+    const placeholder =
+      (tb && tb.getAttribute("aria-placeholder")) ||
+      (tb && tb.getAttribute("placeholder")) ||
+      (tb && tb.getAttribute("data-placeholder")) ||
+      null;
+    const composerTextSample = tb ? (tb.textContent || "").trim().slice(0, 80) : null;
+    const area = document.querySelector("input-area-v2");
+    const createHeader = area
+      ? Array.from(area.querySelectorAll("h1, h2, h3")).find((h) =>
+          /create images?|create with/i.test(h.textContent || ""),
+        )
+      : null;
+
+    return {
+      probeAt: new Date().toISOString(),
+      deselectImagesToggleFound: !!deselect,
+      textboxPlaceholder: placeholder,
+      composerTextSample,
+      createImagesHeaderFound: !!createHeader,
+      imageModeActive:
+        !!deselect ||
+        (placeholder &&
+          /describe (your|uma|une|una|ein) image|describe uma imagem|descreva sua imagem/i.test(
+            placeholder,
+          )) ||
+        !!createHeader,
+    };
+  }
+
+  /**
+   * Idempotent: ensure Gemini is in Image Generation mode.
+   *   - If already active, return immediately without clicking.
+   *   - Otherwise: open the + menu, find Create image, click it, then
+   *     poll for the Deselect Images toggle to appear.
+   */
+  async function ensureImageGenerationMode() {
+    const before = imageModeProbe();
+    if (before.imageModeActive) {
+      return { ok: true, mode: "already-active", probe: before };
+    }
+
+    const plus = findPlusButton();
+    if (!plus) {
+      return {
+        ok: false,
+        mode: "no-plus-button",
+        error: "Could not find the + (Upload & tools) button.",
+        probe: before,
+      };
+    }
+
+    if (isAttachmentMenuOpen()) {
+      try {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Escape",
+            code: "Escape",
+            keyCode: 27,
+            bubbles: true,
+          }),
+        );
+      } catch (_) {
+        /* ignore */
+      }
+      await sleep(120);
+    }
+
+    try {
+      plus.click();
+    } catch (e) {
+      return {
+        ok: false,
+        mode: "click-plus-failed",
+        error: `Click on + button failed: ${e?.message ?? "unknown"}`,
+        probe: imageModeProbe(),
+      };
+    }
+
+    const start = Date.now();
+    let createItem = null;
+    while (Date.now() - start < IMAGE_MODE_CONFIRM_TIMEOUT_MS) {
+      createItem = findCreateImageMenuitem();
+      if (createItem) break;
+      await sleep(IMAGE_MODE_ACTIVATE_POLL_MS);
+    }
+
+    if (!createItem) {
+      try {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "Escape",
+            code: "Escape",
+            keyCode: 27,
+            bubbles: true,
+          }),
+        );
+      } catch (_) {
+        /* ignore */
+      }
+      return {
+        ok: false,
+        mode: "no-create-image-item",
+        error:
+          "Could not find 'Create image' in the + menu. The Gemini UI may have changed.",
+        probe: imageModeProbe(),
+      };
+    }
+
+    try {
+      createItem.click();
+    } catch (e) {
+      return {
+        ok: false,
+        mode: "click-create-failed",
+        error: `Click on Create image failed: ${e?.message ?? "unknown"}`,
+        probe: imageModeProbe(),
+      };
+    }
+
+    const start2 = Date.now();
+    let probeAfter = imageModeProbe();
+    while (Date.now() - start2 < IMAGE_MODE_CONFIRM_TIMEOUT_MS) {
+      probeAfter = imageModeProbe();
+      if (probeAfter.imageModeActive) break;
+      await sleep(IMAGE_MODE_ACTIVATE_POLL_MS);
+    }
+
+    try {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", {
+          key: "Escape",
+          code: "Escape",
+          keyCode: 27,
+          bubbles: true,
+        }),
+      );
+    } catch (_) {
+      /* ignore */
+    }
+
+    return {
+      ok: probeAfter.imageModeActive,
+      mode: probeAfter.imageModeActive ? "activated" : "activate-timeout",
+      error: probeAfter.imageModeActive
+        ? null
+        : "Clicked Create image but image mode did not become active within the timeout.",
+      probeBefore: before,
+      probeAfter,
     };
   }
 
@@ -982,7 +1288,20 @@
     findAttachmentTrigger,
     findFileInputs,
     isAttachmentMenuOpen,
+    // v0.6: image generation mode
+    ensureImageGenerationMode,
+    imageModeProbe,
+    findPlusButton,
+    findDeselectImagesToggle,
+    findCreateImageMenuitem,
+    // Locale candidates (read-only)
     CANDIDATE_SELECTORS,
+    SEND_BUTTON_LABEL_CANDIDATES,
+    PLUS_BUTTON_LABEL_CANDIDATES,
+    CREATE_IMAGE_TEXT_CANDIDATES,
+    DESELECT_IMAGE_LABEL_CANDIDATES,
+    IMAGE_MODE_CONFIRM_TIMEOUT_MS,
+    IMAGE_MODE_ACTIVATE_POLL_MS,
     SCORE_BREAKDOWN: Object.freeze({
       insideRichTextarea: 50,
       insideInputArea: 25,

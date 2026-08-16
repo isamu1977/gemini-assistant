@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 2,
+  "project": { "id": "output-shape", "name": "Output shape test" },
+  "assets": {},
+  "tasks": [
+    { "id": "ok", "prompt": "p", "output": { "basename": "ok-name", "extraKey": "should-fail" } }
+  ]
+}

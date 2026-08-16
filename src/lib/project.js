@@ -45,6 +45,14 @@
   const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([1, 2]);
   const CURRENT_SCHEMA_VERSION = 2;
 
+  // Optional output block on tasks (added in v0.6, additive).
+  // Lazily required so project.js can still be loaded standalone in tests
+  // that don't touch the output block.
+  const outputLib =
+    (typeof require === "function" && typeof module !== "undefined" && module.exports)
+      ? null
+      : globalScope.GeminiAssistantOutput || null;
+
   const STATUSES = Object.freeze([
     "pending",
     "generated",
@@ -301,11 +309,38 @@
         }
       }
 
+      // output (optional, both v1 and v2; added in v0.6)
+      let normalizedOutput = null;
+      if (t.output !== undefined) {
+        if (
+          typeof globalScope === "undefined" ||
+          !globalScope.GeminiAssistantOutput ||
+          typeof globalScope.GeminiAssistantOutput.validateTaskOutput !== "function"
+        ) {
+          return {
+            ok: false,
+            error: `${fieldBase}.output present but output.js was not loaded; cannot validate`,
+            field: `${fieldBase}.output`,
+          };
+        }
+        const out = globalScope.GeminiAssistantOutput.validateTaskOutput(t.output);
+        if (!out.ok) {
+          return {
+            ok: false,
+            error: `${fieldBase}.output: ${out.error}`,
+            field: `${fieldBase}.output`,
+          };
+        }
+        // out.output may be null (absent) or { basename: "..." }.
+        normalizedOutput = out.output && out.output.basename ? out.output : null;
+      }
+
       normalizedTasks.push({
         id: t.id,
         title: t.title ?? "",
         prompt: t.prompt,
         references: normalizedRefs,
+        output: normalizedOutput,
       });
     }
 
@@ -337,6 +372,30 @@
       };
     }
     return out;
+  }
+
+  /**
+   * Resolve the effective `output.basename` for a given task id.
+   * Returns null when no usable basename exists.
+   * Pure: does not touch the DOM, chrome.*, or storage.
+   */
+  function resolveTaskOutputBasename(project, taskId) {
+    if (!project || !Array.isArray(project.tasks)) return null;
+    const task = project.tasks.find((t) => t && t.id === taskId);
+    if (!task) return null;
+    // Defer to outputLib if loaded; otherwise fall back to task.id.
+    if (
+      typeof globalScope !== "undefined" &&
+      globalScope.GeminiAssistantOutput &&
+      typeof globalScope.GeminiAssistantOutput.resolveTaskBasename === "function"
+    ) {
+      const r = globalScope.GeminiAssistantOutput.resolveTaskBasename(task);
+      if (r && r.ok) return r.basename;
+      return null;
+    }
+    // Fallback: use task.id verbatim when output.js hasn't been loaded yet.
+    // Callers (Node tests) must load output.js if they want sanitization.
+    return task.id || null;
   }
 
   /**
@@ -438,6 +497,7 @@
         title: t.title ?? "",
         prompt: t.prompt,
         references: Array.isArray(t.references) ? [...t.references] : [],
+        output: t.output && t.output.basename ? { basename: t.output.basename } : null,
       })),
     };
   }
@@ -460,6 +520,7 @@
     resolveReferences,
     countAssets,
     normalizeImportedProject,
+    resolveTaskOutputBasename,
   });
 
   if (typeof module !== "undefined" && module.exports) {

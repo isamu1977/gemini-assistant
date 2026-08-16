@@ -129,6 +129,35 @@
         return true;
       }
 
+      case "GEMINI_ASSISTANT_IMAGE_MODE_PROBE": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter || typeof adapter.imageModeProbe !== "function") {
+          sendResponse({ ok: false, error: "adapter does not support image mode probe" });
+          return false;
+        }
+        try {
+          sendResponse({ ok: true, probe: adapter.imageModeProbe() });
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        }
+        return false;
+      }
+
+      case "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter || typeof adapter.ensureImageGenerationMode !== "function") {
+          sendResponse({ ok: false, error: "adapter does not support ensureImageGenerationMode" });
+          return false;
+        }
+        adapter
+          .ensureImageGenerationMode()
+          .then((result) => sendResponse({ ok: true, ...result }))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) })
+          );
+        return true;
+      }
+
       default:
         sendResponse({ ok: false, error: `unknown type: ${msg.type}` });
         return false;

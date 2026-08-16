@@ -37,31 +37,36 @@
       "id": "task-001",
       "title": "Opening shot",
       "prompt": "Wide shot of the snow village at night with the main character walking toward the camera.",
-      "references": ["character-main", "environment-village", "style-master"]
+      "references": ["character-main", "environment-village", "style-master"],
+      "output": { "basename": "scene-001" }
     },
     {
       "id": "task-002",
       "title": "Meeting the second character",
       "prompt": "Close-up of the main character meeting the secondary character by the lantern.",
-      "references": ["character-main", "character-secondary", "object-lantern"]
+      "references": ["character-main", "character-secondary", "object-lantern"],
+      "output": { "basename": "scene-002" }
     },
     {
       "id": "task-003",
       "title": "Shared environment with no character",
       "prompt": "Empty snow village square, no characters, atmospheric shot.",
-      "references": ["environment-village", "style-master"]
+      "references": ["environment-village", "style-master"],
+      "output": { "basename": "scene-003" }
     },
     {
       "id": "task-004",
       "title": "Stylistic frame",
       "prompt": "Abstract frame demonstrating the master visual style only.",
-      "references": ["style-master"]
+      "references": ["style-master"],
+      "output": { "basename": "scene-004" }
     },
     {
       "id": "task-005",
       "title": "Free composition (no references)",
       "prompt": "Open prompt without any reference image.",
-      "references": []
+      "references": [],
+      "output": { "basename": "scene-005" }
     }
   ]
 }

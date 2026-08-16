@@ -14,9 +14,17 @@ const fs = require("fs");
 const path = require("path");
 
 const ROOT = path.resolve(__dirname, "..");
+
+// Load output.js FIRST so project.js can find GeminiAssistantOutput
+// on globalThis when validating the optional `task.output` block.
+// In the browser sidepanel, output.js is loaded via a <script> tag
+// BEFORE project.js (see src/sidepanel/sidepanel.html).
+globalThis.GeminiAssistantOutput = require(path.join(ROOT, "src/lib/output.js"));
+
 const projectLib = require(path.join(ROOT, "src/lib/project.js"));
 const storageLib = require(path.join(ROOT, "src/lib/storage.js"));
 const assetsLib = require(path.join(ROOT, "src/lib/assets.js"));
+const outputLib = globalThis.GeminiAssistantOutput;
 
 const FIXTURES = path.join(__dirname, "fixtures");
 
@@ -875,6 +883,245 @@ test("buildMissingDiagnostic: tolerates null handle and partial asset", () => {
   assertEqual(d.logicalPath, "refs/x.png");
   assertEqual(d.selectedRootName, null);
   assertEqual(d.matched, false);
+});
+
+// ----- output.js (v0.6) -----
+
+console.log(`\n${C.bold}output.js (v0.6)${C.reset}`);
+
+test("output: sanitizeBasename accepts a clean name", () => {
+  const r = outputLib.sanitizeBasename("scene-001");
+  assert(r.ok, r.error);
+  assertEqual(r.basename, "scene-001");
+});
+
+test("output: sanitizeBasename collapses whitespace", () => {
+  const r = outputLib.sanitizeBasename("   scene   001   ");
+  assert(r.ok);
+  assertEqual(r.basename, "scene 001");
+});
+
+test("output: sanitizeBasename trims trailing dots but rejects embedded ..", () => {
+  // Leading/trailing dot-only is sanitized away, but the literal string ".."
+  // anywhere in the basename is a traversal attempt and is rejected outright.
+  const r1 = outputLib.sanitizeBasename(".scene-001.");
+  assert(r1.ok, r1.error);
+  assertEqual(r1.basename, "scene-001");
+  // ".." anywhere -> rejected as traversal.
+  const r2 = outputLib.sanitizeBasename("..scene-001..");
+  assert(!r2.ok);
+  assertEqual(r2.reason, "traversal");
+});
+
+test("output: sanitizeBasename rejects path traversal", () => {
+  const r = outputLib.sanitizeBasename("../etc/passwd");
+  assert(!r.ok, "should reject");
+  assertEqual(r.reason, "traversal");
+});
+
+test("output: sanitizeBasename rejects embedded ..", () => {
+  const r = outputLib.sanitizeBasename("a/../b");
+  assert(!r.ok);
+  assertEqual(r.reason, "traversal");
+});
+
+test("output: sanitizeBasename rejects forward slash", () => {
+  const r = outputLib.sanitizeBasename("a/b");
+  assert(!r.ok);
+  assertEqual(r.reason, "illegal-char");
+});
+
+test("output: sanitizeBasename rejects backslash", () => {
+  const r = outputLib.sanitizeBasename("a\\b");
+  assert(!r.ok);
+  assertEqual(r.reason, "illegal-char");
+});
+
+test("output: sanitizeBasename rejects control chars", () => {
+  const r = outputLib.sanitizeBasename("scene\u0000-001");
+  assert(!r.ok);
+  assertEqual(r.reason, "illegal-char");
+});
+
+test("output: sanitizeBasename rejects Windows-reserved names", () => {
+  const r = outputLib.sanitizeBasename("CON");
+  assert(!r.ok);
+  assertEqual(r.reason, "reserved");
+  const r2 = outputLib.sanitizeBasename("nul");
+  assert(!r2.ok);
+});
+
+test("output: sanitizeBasename rejects empty", () => {
+  const r = outputLib.sanitizeBasename("");
+  assert(!r.ok);
+  assertEqual(r.reason, "empty");
+  const r2 = outputLib.sanitizeBasename("   ");
+  assert(!r2.ok);
+  assertEqual(r2.reason, "empty");
+});
+
+test("output: sanitizeBasename rejects non-string", () => {
+  const r = outputLib.sanitizeBasename(null);
+  assert(!r.ok);
+  assertEqual(r.reason, "not-a-string");
+  const r2 = outputLib.sanitizeBasename(undefined);
+  assert(!r2.ok);
+});
+
+test("output: sanitizeBasename rejects Windows-reserved characters", () => {
+  // <>:"/\|?*  — forward slash is already covered; spot-check the rest.
+  for (const c of ["<", ">", ":", '"', "|", "?", "*"]) {
+    const r = outputLib.sanitizeBasename("scene" + c + "001");
+    assert(!r.ok, `should reject '${c}'`);
+  }
+});
+
+test("output: sanitizeBasename truncates to MAX_BASENAME_LENGTH", () => {
+  const huge = "a".repeat(outputLib.MAX_BASENAME_LENGTH + 50);
+  const r = outputLib.sanitizeBasename(huge);
+  assert(r.ok);
+  assertEqual(r.basename.length, outputLib.MAX_BASENAME_LENGTH);
+});
+
+test("output: validateTaskOutput returns null when absent", () => {
+  assertEqual(outputLib.validateTaskOutput(undefined).output, null);
+  assertEqual(outputLib.validateTaskOutput(null).output, null);
+});
+
+test("output: validateTaskOutput accepts empty object as 'use task.id'", () => {
+  assertEqual(outputLib.validateTaskOutput({}).output, null);
+});
+
+test("output: validateTaskOutput rejects non-object", () => {
+  assertEqual(outputLib.validateTaskOutput("nope").ok, false);
+  assertEqual(outputLib.validateTaskOutput([]).ok, false);
+});
+
+test("output: validateTaskOutput rejects unknown keys", () => {
+  const r = outputLib.validateTaskOutput({ basename: "ok", extra: "no" });
+  assert(!r.ok);
+  assertEqual(r.reason, "unknown-key");
+});
+
+test("output: validateTaskOutput returns normalized basename", () => {
+  const r = outputLib.validateTaskOutput({ basename: "Scene 002 - The Return" });
+  assert(r.ok);
+  assertEqual(r.output.basename, "Scene 002 - The Return");
+});
+
+test("output: resolveTaskBasename prefers output.basename over task.id", () => {
+  const r = outputLib.resolveTaskBasename({
+    id: "scene-001",
+    output: { basename: "explicit-name" },
+  });
+  assert(r.ok);
+  assertEqual(r.basename, "explicit-name");
+  assertEqual(r.source, "output");
+});
+
+test("output: resolveTaskBasename falls back to task.id when output absent", () => {
+  const r = outputLib.resolveTaskBasename({ id: "scene-003" });
+  assert(r.ok);
+  assertEqual(r.basename, "scene-003");
+  assertEqual(r.source, "task.id");
+});
+
+test("output: resolveTaskBasename rejects unsafe task.id", () => {
+  const r = outputLib.resolveTaskBasename({ id: "../escape" });
+  assert(!r.ok);
+  assertEqual(r.reason, "traversal");
+});
+
+test("output: buildDownloadFilename joins basename + extension", () => {
+  assertEqual(outputLib.buildDownloadFilename("scene-001", "image/png"), "scene-001.png");
+  assertEqual(outputLib.buildDownloadFilename("scene-001", "image/jpeg"), "scene-001.jpg");
+  assertEqual(outputLib.buildDownloadFilename("scene-001", ".webp"), "scene-001.webp");
+  assertEqual(outputLib.buildDownloadFilename("scene-001", "png"), "scene-001.png");
+});
+
+test("output: buildDownloadFilename returns null on unknown MIME", () => {
+  assertEqual(outputLib.buildDownloadFilename("scene-001", "application/octet-stream"), null);
+});
+
+test("output: buildDownloadFilename rejects path traversal in result", () => {
+  // Even if sanitization were bypassed, the assembler defends itself.
+  assertEqual(outputLib.buildDownloadFilename("../escape", "image/png"), null);
+  assertEqual(outputLib.buildDownloadFilename("a/b", "image/png"), null);
+});
+
+test("output: buildDownloadFolder produces 'Gemini Assistant/<project-id>/'", () => {
+  assertEqual(outputLib.buildDownloadFolder("yuki-video-001"), "Gemini Assistant/yuki-video-001");
+});
+
+test("output: buildDownloadFolder rejects unsafe projectId", () => {
+  assertEqual(outputLib.buildDownloadFolder("../escape"), null);
+  assertEqual(outputLib.buildDownloadFolder("a/b"), null);
+});
+
+// ----- project.js v0.6 integration -----
+
+console.log(`\n${C.bold}project.js (v0.6: task.output)${C.reset}`);
+
+test("v0.6: task.output optional block is accepted and normalized", () => {
+  const r = projectLib.parseProjectJson(readFixture("output-valid.json"));
+  assert(r.ok, r.error);
+  assertEqual(r.project.tasks.length, 3);
+  assertEqual(r.project.tasks[0].output, { basename: "scene-001" });
+  // Multi-word with whitespace is preserved verbatim (sanitizer collapses runs).
+  assertEqual(r.project.tasks[1].output, { basename: "Scene 002 - The Return" });
+  // No output -> normalized to null (fallback to task.id at use-site).
+  assertEqual(r.project.tasks[2].output, null);
+});
+
+test("v0.6: task.output with traversal basename is rejected", () => {
+  const r = projectLib.parseProjectJson(readFixture("output-invalid.json"));
+  assert(!r.ok);
+  assert(/output/i.test(r.error), r.error);
+  assert(/traversal|'..'/i.test(r.error), r.error);
+});
+
+test("v0.6: task.output with unknown keys is rejected", () => {
+  const r = projectLib.parseProjectJson(readFixture("output-shape-invalid.json"));
+  assert(!r.ok);
+  assert(/unknown key/i.test(r.error), r.error);
+});
+
+test("v0.6: project without any task.output still validates (back-compat)", () => {
+  // valid-v2.json has no task.output anywhere.
+  const r = projectLib.parseProjectJson(readFixture("valid-v2.json"));
+  assert(r.ok, r.error);
+  for (const t of r.project.tasks) {
+    assertEqual(t.output, null);
+  }
+});
+
+test("v0.6: normalizeImportedProject preserves output block", () => {
+  const r = projectLib.parseProjectJson(readFixture("output-valid.json"));
+  const n = projectLib.normalizeImportedProject(r.project);
+  assertEqual(n.tasks[0].output, { basename: "scene-001" });
+  assertEqual(n.tasks[2].output, null);
+});
+
+test("v0.6: resolveTaskOutputBasename returns output.basename when set", () => {
+  const r = projectLib.parseProjectJson(readFixture("output-valid.json"));
+  assertEqual(
+    projectLib.resolveTaskOutputBasename(r.project, "scene-001"),
+    "scene-001",
+  );
+  assertEqual(
+    projectLib.resolveTaskOutputBasename(r.project, "scene-002"),
+    "Scene 002 - The Return",
+  );
+});
+
+test("v0.6: resolveTaskOutputBasename falls back to task.id when output absent", () => {
+  const r = projectLib.parseProjectJson(readFixture("output-valid.json"));
+  assertEqual(projectLib.resolveTaskOutputBasename(r.project, "scene-003"), "scene-003");
+});
+
+test("v0.6: resolveTaskOutputBasename returns null for unknown task", () => {
+  const r = projectLib.parseProjectJson(readFixture("output-valid.json"));
+  assertEqual(projectLib.resolveTaskOutputBasename(r.project, "does-not-exist"), null);
 });
 
 // ----- end ----------------------------------------------------------------
