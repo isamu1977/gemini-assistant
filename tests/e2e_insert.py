@@ -23,7 +23,7 @@ import sys
 from playwright.sync_api import sync_playwright
 
 EXT_PATH = "/Users/isamumatsuyama/Documents/development/gemini-assistant"
-POPUP = f"file://{EXT_PATH}/src/popup/popup.html"
+POPUP = f"file://{EXT_PATH}/src/sidepanel/sidepanel.html"
 
 # Mock chrome.* APIs. sendMessage is wrapped to capture the messages and
 # return a configurable response (success or failure path).

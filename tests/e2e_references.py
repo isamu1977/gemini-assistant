@@ -10,7 +10,7 @@ import sys
 from playwright.sync_api import sync_playwright
 
 EXT_PATH = "/Users/isamumatsuyama/Documents/development/gemini-assistant"
-POPUP = f"file://{EXT_PATH}/src/popup/popup.html"
+POPUP = f"file://{EXT_PATH}/src/sidepanel/sidepanel.html"
 
 MOCK = r"""
 (() => {
@@ -116,12 +116,11 @@ def reset(page):
 def references_html(page):
     return page.evaluate(
         """() => {
-          const items = Array.from(document.querySelectorAll('#references-list .ref-item'));
+          const items = Array.from(document.querySelectorAll('#references-list .ref-card'));
           return items.map(li => ({
             badge: li.querySelector('.ref-badge')?.textContent || '',
             label: li.querySelector('.ref-label')?.textContent || '',
             file: li.querySelector('.ref-file')?.textContent || '',
-            id: li.querySelector('.ref-id')?.textContent || '',
           }));
         }"""
     )
@@ -258,11 +257,9 @@ def _case_v2_first_task(page, reset_fn, seed_fn, refs_html, rc, empty_v):
     assert rc(page) == "2"
     assert not empty_v(page), "empty msg should be hidden"
     # Order preserved
-    assert items[0]["id"] == "character-main"
     assert items[0]["badge"] == "character"
     assert items[0]["label"] == "Main"
     assert items[0]["file"] == "refs/main.png"
-    assert items[1]["id"] == "style-master"
     assert items[1]["badge"] == "style"
 
 
@@ -302,8 +299,9 @@ def _case_v2_single_ref(page, reset_fn, seed_fn, refs_html, rc):
     page.wait_for_timeout(300)
     items = refs_html(page)
     assert len(items) == 1
-    assert items[0]["id"] == "environment-village"
     assert items[0]["badge"] == "environment"
+    assert items[0]["label"] == "Village"
+    assert items[0]["file"] == "refs/village.png"
     assert rc(page) == "1"
 
 
@@ -336,7 +334,7 @@ def _case_navigation_updates(page, reset_fn, seed_fn, refs_html, rc):
     page.wait_for_timeout(300)
     items = refs_html(page)
     assert len(items) == 1
-    assert items[0]["id"] == "environment-village"
+    assert items[0]["label"] == "Village"
     # Prev to t2
     page.evaluate("document.getElementById('prev-btn').click()")
     page.wait_for_timeout(300)
@@ -376,7 +374,8 @@ def _case_reload(page, reset_fn, seed_fn, refs_html):
     page.wait_for_timeout(800)
     items_after = refs_html(page)
     assert len(items_after) == 2
-    assert items_after[0]["id"] == items_before[0]["id"]
+    assert items_after[0]["label"] == items_before[0]["label"]
+    assert items_after[0]["file"] == items_before[0]["file"]
 
 
 if __name__ == "__main__":

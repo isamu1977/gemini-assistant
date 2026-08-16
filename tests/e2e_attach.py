@@ -23,7 +23,7 @@ import sys
 from playwright.sync_api import sync_playwright
 
 EXT_PATH = "/Users/isamumatsuyama/Documents/development/gemini-assistant"
-POPUP = f"file://{EXT_PATH}/src/popup/popup.html"
+POPUP = f"file://{EXT_PATH}/src/sidepanel/sidepanel.html"
 
 MOCK = r"""
 (() => {
@@ -179,10 +179,10 @@ def reset(page):
 
 
 def ref_state(page, index):
-    """Return the state string for the Nth ref-item (0-indexed)."""
+    """Return the state string for the Nth ref-card (0-indexed)."""
     return page.evaluate(
         """(i) => {
-          const items = document.querySelectorAll('#references-list .ref-item');
+          const items = document.querySelectorAll('#references-list .ref-card');
           if (i >= items.length) return null;
           const s = items[i].querySelector('.ref-state');
           return s ? s.textContent : null;
@@ -194,7 +194,7 @@ def ref_state(page, index):
 def ref_states(page):
     """Return all ref state glyphs in order."""
     return page.evaluate(
-        """() => Array.from(document.querySelectorAll('#references-list .ref-item .ref-state'))
+        """() => Array.from(document.querySelectorAll('#references-list .ref-card .ref-state'))
             .map(s => s.textContent)"""
     )
 
@@ -202,7 +202,7 @@ def ref_states(page):
 def attach_btn_disabled(page, index):
     return page.evaluate(
         """(i) => {
-          const items = document.querySelectorAll('#references-list .ref-item');
+          const items = document.querySelectorAll('#references-list .ref-card');
           if (i >= items.length) return null;
           const b = items[i].querySelector('.ref-attach');
           return b ? b.disabled : null;
@@ -266,7 +266,7 @@ def inject_resolved_refs(page, ref_index, fake_file_info):
 def click_attach(page, ref_index):
     page.evaluate(
         """(i) => {
-          const items = document.querySelectorAll('#references-list .ref-item');
+          const items = document.querySelectorAll('#references-list .ref-card');
           if (i >= items.length) return;
           const b = items[i].querySelector('.ref-attach');
           if (b && !b.disabled) b.click();

@@ -217,6 +217,44 @@ Gemini editor. The integration popup → adapter is covered by
 `tests/e2e_insert.py` (which asserts the payload reaches the content
 script contract correctly).
 
+## End-to-end Attachment Diagnostics tests (v0.5.1)
+
+The side panel surfaces a structured diagnostic of the Gemini upload
+surface (`<input type="file">` lifecycle, menu open, trigger found).
+The e2e suite locks the content-script contract for the new messages:
+
+```bash
+python3 tests/e2e_diagnostics.py
+```
+
+Scenarios:
+
+- On Gemini: initial probe shows trigger found, input not mounted.
+- Clicking the Probe button fires `GEMINI_ASSISTANT_ATTACH_PROBE`.
+- The probe response renders structured diagnostics (no error).
+- `fileInputCount: 0` is NOT treated as an error when
+  `inputLikelyDynamic: true`.
+- A stubbed probe failure surfaces an error in the status line.
+
+## End-to-end Wrong-root Selection tests (v0.5.1)
+
+The side panel detects when the user picked a subfolder (e.g.
+`references/`) instead of the project root. The e2e suite locks the
+banner logic and the Rebind CTA:
+
+```bash
+python3 tests/e2e_wrong_root.py
+```
+
+Scenarios:
+
+- Selecting `references` triggers the wrong-root banner.
+- The banner body mentions the selected folder, the first segment, and
+  "project root".
+- All refs remain `Missing` while the wrong-root banner is shown.
+- The wrong-root banner is hidden when the spot-check I/O fails.
+- The banner's Rebind button re-opens the folder picker.
+
 ## Manual regression for the Gemini DOM adapter
 
 The PoC's main user-visible behavior (Insert Prompt populating the Gemini

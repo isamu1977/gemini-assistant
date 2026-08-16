@@ -339,14 +339,249 @@
     const inputs = findFileInputs();
     const area = findPromptInputArea();
     return {
-      attachmentButtonFound: !!document.querySelector(
-        '[aria-label*="upload" i], [aria-label*="file" i], button[aria-haspopup]',
-      ),
+      attachmentButtonFound: !!findAttachmentTrigger(),
       fileInputCount: inputs.length,
       fileInputAccept: inputs[0]?.accept ?? null,
       fileInputMultiple: inputs[0]?.multiple ?? false,
       attachmentContainerFound: !!area,
       currentAttachmentHints: countAttachmentHints(area),
+    };
+  }
+
+  /**
+   * Structured, verbose snapshot of the attachment surface. Used by the
+   * side panel's Debug section. Designed to be readable by humans AND
+   * stable across Gemini UI changes: it never asserts which element is
+   * "the right one", it just reports what is present.
+   *
+   * State fields:
+   *   triggerFound       boolean — did we find a likely "+" / upload button?
+   *   fileInputCount     number  — how many <input type="file"> exist now?
+   *   fileInputAccept    string|null — accept attr of the first input
+   *   fileInputMultiple  boolean
+   *   menuOrPopoverOpen  boolean — any popover/menu/dialog currently visible?
+   *   attachmentAreaFound boolean — could we identify the upload area?
+   *   currentHints       number  — count of attachment thumbnail hints
+   *   inputLikelyDynamic boolean — deduction; see below
+   *   notes              string[] — short human-readable notes
+   */
+  function attachmentProbe() {
+    const inputs = findFileInputs();
+    const area = findPromptInputArea();
+    const trigger = findAttachmentTrigger();
+    const menuOpen = isAttachmentMenuOpen();
+
+    const notes = [];
+    if (inputs.length === 0) {
+      notes.push(
+        "No <input type=\"file\"> currently mounted. Gemini typically mounts the input only after the user opens the attachment menu.",
+      );
+    }
+    if (!trigger) {
+      notes.push(
+        "No obvious \"+\" / upload button found in the composer toolbar (we tried aria-label and structural heuristics).",
+      );
+    }
+    if (!area) {
+      notes.push(
+        "Could not localize the upload area near the prompt textbox.",
+      );
+    }
+
+    return {
+      probeAt: new Date().toISOString(),
+      url: location.href,
+      triggerFound: !!trigger,
+      triggerDescriptor: describeTrigger(trigger),
+      fileInputCount: inputs.length,
+      fileInputAccept: inputs[0]?.accept ?? null,
+      fileInputMultiple: inputs[0]?.multiple ?? false,
+      menuOrPopoverOpen: menuOpen,
+      attachmentAreaFound: !!area,
+      currentHints: countAttachmentHints(area),
+      inputLikelyDynamic: inputs.length === 0 && !!trigger && !!area,
+      notes,
+    };
+  }
+
+  /**
+   * Heuristic: find a button that likely opens the attachment menu.
+   * Locale-independent: we look for structural attributes first
+   * (aria-haspopup, mat-icon naming hints) and then fall back to a
+   * small set of common aria-label fragments in multiple languages.
+   *
+   * Does NOT click anything. Returns the element or null.
+   */
+  function findAttachmentTrigger() {
+    // 1. Structural: any button with aria-haspopup inside the prompt area.
+    const area = findPromptInputArea();
+    if (area) {
+      const structural = area.querySelector(
+        'button[aria-haspopup], button[aria-controls], [role="button"][aria-haspopup]',
+      );
+      if (structural) return structural;
+    }
+
+    // 2. Aria-label hints (locale-independent fragments).
+    const HINTS = [
+      "upload",
+      "attach",
+      "file",
+      "add file",
+      "add image",
+      "insert file",
+      "plus",
+      "more",
+      "tools",
+      "media",
+      "imagen",
+      "video",
+      "carregar",
+      "adjuntar",
+      "archivo",
+      "fichier",
+      "anhang",
+      "Datei",
+      "添付",
+      "ファイル",
+      "업로드",
+      "파일",
+    ];
+    const buttons = document.querySelectorAll("button[aria-label], [role='button'][aria-label]");
+    for (const b of buttons) {
+      const label = (b.getAttribute("aria-label") || "").toLowerCase();
+      if (HINTS.some((h) => label.includes(h))) return b;
+    }
+
+    // 3. Icon-name hint (mat-icon, material symbol, etc.): a button whose
+    //    icon child has a name commonly used for "add"/"attach".
+    const ICON_HINTS = ["add", "attach", "upload", "plus", "image"];
+    const iconButtons = document.querySelectorAll("button");
+    for (const b of iconButtons) {
+      const icon = b.querySelector(
+        'mat-icon, [class*="material-symbols"], [class*="mat-icon"], i[class*="icon"]',
+      );
+      if (!icon) continue;
+      const name = (
+        icon.getAttribute("fontset") ||
+        icon.getAttribute("data-mat-icon-name") ||
+        icon.textContent ||
+        ""
+      ).toLowerCase();
+      if (ICON_HINTS.some((h) => name.includes(h))) return b;
+    }
+
+    return null;
+  }
+
+  function describeTrigger(el) {
+    if (!el) return null;
+    return {
+      tag: el.tagName?.toLowerCase() ?? null,
+      ariaLabel: el.getAttribute("aria-label") ?? null,
+      ariaHasPopup: el.getAttribute("aria-haspopup") ?? null,
+      classHint: (el.className || "").toString().slice(0, 80),
+    };
+  }
+
+  /**
+   * Heuristic: is a popover / menu / dialog currently visible?
+   * We look for elements commonly used by Gemini for menus: mat-menu,
+   * role="menu", role="dialog", or popover-class attributes.
+   */
+  function isAttachmentMenuOpen() {
+    const menu = document.querySelector(
+      '[role="menu"]:not([hidden]), [role="dialog"]:not([hidden]), mat-menu-panel, .cdk-overlay-pane mat-menu-panel, [popover], dialog[open]',
+    );
+    if (!menu) return false;
+    const rect = menu.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  /**
+   * Best-effort: open the attachment menu by clicking the trigger,
+   * then wait a short budget for a file input to appear. Always
+   * returns a structured result; never throws.
+   *
+   * The caller (the side panel "Probe attachment" button) uses this
+   * ONLY for the structured diagnostic. It does NOT auto-attach.
+   *
+   * Phases:
+   *   A. Snapshot pre-click state.
+   *   B. Click the trigger (if found).
+   *   C. Poll for a new file input or a visible menu for up to
+   *      ACTIVATE_TIMEOUT_MS.
+   *   D. Capture the post-click state.
+   *   E. Restore the original state as best we can (close the menu by
+   *      pressing Escape, re-click the trigger again if needed).
+   */
+  const ACTIVATE_TIMEOUT_MS = 2500;
+  const ACTIVATE_POLL_MS = 80;
+
+  async function activateAttachmentFlow() {
+    const probeBefore = attachmentProbe();
+    const trigger = findAttachmentTrigger();
+
+    if (!trigger) {
+      return {
+        ok: false,
+        reason: "no-trigger",
+        message: "Could not find an attachment-related button to click.",
+        probeBefore,
+        probeAfter: probeBefore,
+      };
+    }
+
+    // Click the trigger. Use a real click so any listeners fire.
+    try {
+      trigger.click();
+    } catch (e) {
+      return {
+        ok: false,
+        reason: "click-failed",
+        message: `Click on the trigger failed: ${e?.message ?? "unknown"}`,
+        probeBefore,
+        probeAfter: attachmentProbe(),
+      };
+    }
+
+    // Wait for the menu / input to appear.
+    const start = Date.now();
+    let probeAfter = probeBefore;
+    while (Date.now() - start < ACTIVATE_TIMEOUT_MS) {
+      await sleep(ACTIVATE_POLL_MS);
+      probeAfter = attachmentProbe();
+      if (probeAfter.menuOrPopoverOpen || probeAfter.fileInputCount > 0) {
+        break;
+      }
+    }
+
+    // Restore: send Escape to close the menu so the user is not left
+    // holding an open dialog. Best-effort; failures are non-fatal.
+    try {
+      const esc = new KeyboardEvent("keydown", {
+        key: "Escape",
+        code: "Escape",
+        keyCode: 27,
+        bubbles: true,
+      });
+      document.dispatchEvent(esc);
+    } catch (_) {
+      // ignore
+    }
+
+    return {
+      ok: probeAfter.menuOrPopoverOpen || probeAfter.fileInputCount > 0,
+      reason:
+        probeAfter.menuOrPopoverOpen || probeAfter.fileInputCount > 0
+          ? "activated"
+          : "no-change",
+      message:
+        probeAfter.menuOrPopoverOpen || probeAfter.fileInputCount > 0
+          ? "Attachment menu opened (or file input appeared). Use this to drive the actual Attach in the next milestone."
+          : "Click on the trigger did not produce a visible menu or a file input within the timeout. The Gemini UI may have changed; check the trigger descriptor.",
+      probeBefore,
+      probeAfter,
     };
   }
 
@@ -368,10 +603,19 @@
     const diag = attachmentDiagnostics();
     const inputs = findFileInputs();
     if (inputs.length === 0) {
+      // The input is most likely mounted only after the user opens the
+      // attachment menu. We do NOT auto-click here; we tell the caller
+      // what's missing so they can use the side panel's "Probe" button
+      // to drive the activation flow in a user-visible way.
+      const probe = attachmentProbe();
+      const hint = probe.inputLikelyDynamic
+        ? " Gemini mounts the <input type=\"file\"> only after the user opens the attachment menu. Use the Probe button in the side panel to surface the actual flow."
+        : " Gemini's composer toolbar does not appear to expose an upload control right now.";
       return {
         ok: false,
-        error: "Gemini upload control not found.",
-        diagnostics: diag,
+        error: "Gemini upload control not found." + hint,
+        diagnostics: probe,
+        requiresActivation: probe.inputLikelyDynamic,
       };
     }
     const input = inputs[0];
@@ -706,7 +950,7 @@
     const selected = findPromptInput();
     const selectedQuill = selected ? locateQuill(selected) : null;
     const contentLength = selected ? textboxTextLength(selected) : null;
-    const attachment = attachmentDiagnostics();
+    const attachment = attachmentProbe();
 
     return {
       url: location.href,
@@ -733,6 +977,11 @@
     selfTest,
     describeEl,
     attachmentDiagnostics,
+    attachmentProbe,
+    activateAttachmentFlow,
+    findAttachmentTrigger,
+    findFileInputs,
+    isAttachmentMenuOpen,
     CANDIDATE_SELECTORS,
     SCORE_BREAKDOWN: Object.freeze({
       insideRichTextarea: 50,

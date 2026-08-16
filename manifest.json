@@ -1,24 +1,32 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.5.0",
-  "description": "Generic project and task manager for gemini.google.com. Loads a Project JSON, binds a project folder, and attaches individual reference images to Gemini's composer (single-file PoC). Insert Prompt and Attach are both manual — never auto-sends.",
+  "version": "0.5.1",
+  "description": "Generic project and task manager for gemini.google.com. Loads a Project JSON, binds a project folder, and attaches individual reference images to Gemini's composer. Project + Task UI lives in the Chrome Side Panel. Insert Prompt and Attach are both manual — never auto-sends.",
   "minimum_chrome_version": "116",
 
-  "permissions": ["storage"],
+  "permissions": ["storage", "sidePanel"],
 
   "host_permissions": [
     "https://gemini.google.com/*"
   ],
 
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+
   "action": {
-    "default_popup": "src/popup/popup.html",
-    "default_title": "Gemini Assistant",
+    "default_title": "Open Gemini Assistant",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
+  },
+
+  "side_panel": {
+    "default_path": "src/sidepanel/sidepanel.html"
   },
 
   "icons": {

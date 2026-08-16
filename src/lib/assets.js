@@ -219,6 +219,127 @@
     return resolved.filter((r) => r && r.state === "resolved" && r.file).map((r) => r.file);
   }
 
+  /**
+   * Detect a likely "wrong-root selection" — when the user picked a
+   * subfolder (e.g. `references/`) instead of the project root that
+   * contains it.
+   *
+   * The heuristic is conservative; it ONLY flags when:
+   *   1. Every asset's relative path begins with the same first segment.
+   *   2. That first segment equals the bound folder's name.
+   *   3. The spot-check I/O confirms: looking up the basename (the part
+   *      AFTER the first segment) inside the bound folder SUCCEEDS.
+   *      That is, the file the resolver *should* find at
+   *      `<boundRoot>/<basename>` actually exists there.
+   *
+   * When the I/O check succeeds, we know with high confidence that the
+   * user's selected folder is the first-segment subfolder, and the
+   * intended project root is its parent.
+   *
+   * This is a SIDE-CHANNEL check: do NOT auto-fix. We return a structured
+   * signal that the UI uses to show a banner.
+   *
+   * Returns:
+   *   { isWrongRoot: false } when the heuristic does not apply.
+   *   {
+   *     isWrongRoot: true,
+   *     selectedRootName: "references",
+   *     firstSegment: "references",
+   *     sampleCount: 3,
+   *     sampleRelativePath: "references/character-main.png",
+   *     sampleMatchedBasename: "character-main.png",
+   *   } when it does.
+   */
+  async function detectWrongRootSelection(directoryHandle, refs) {
+    if (
+      !directoryHandle ||
+      typeof directoryHandle.getFileHandle !== "function" ||
+      !Array.isArray(refs) ||
+      refs.length === 0
+    ) {
+      return { isWrongRoot: false };
+    }
+
+    const rootName = typeof directoryHandle.name === "string" ? directoryHandle.name : "";
+    if (!rootName) return { isWrongRoot: false };
+
+    // Phase 1: every asset's first segment must match rootName.
+    let firstSegment = null;
+    let sample = null;
+    let sampleCount = 0;
+    for (const r of refs) {
+      const rel = normalizeRelativePath(r?.file);
+      if (!rel) return { isWrongRoot: false };
+      const seg = rel.split("/")[0];
+      if (!seg) return { isWrongRoot: false };
+      if (firstSegment === null) {
+        firstSegment = seg;
+      } else if (seg !== firstSegment) {
+        // Mixed-first-segments: cannot be a single-subfolder misalignment.
+        return { isWrongRoot: false };
+      }
+      if (sample === null) sample = rel;
+      sampleCount++;
+    }
+
+    if (firstSegment !== rootName) {
+      return { isWrongRoot: false };
+    }
+
+    // Phase 2: confirm with a single I/O probe against the first asset.
+    // If the basename after the first segment actually exists inside the
+    // bound folder, we are confident the user picked the wrong root.
+    const firstRel = sample;
+    const parts = firstRel.split("/");
+    if (parts.length < 2) return { isWrongRoot: false };
+    const basename = parts[parts.length - 1];
+    try {
+      const handle = await directoryHandle.getFileHandle(basename);
+      // Touch the handle to confirm it's actually usable, not stale.
+      if (!handle || typeof handle.getFile !== "function") {
+        return { isWrongRoot: false };
+      }
+      const f = await handle.getFile();
+      if (!f) return { isWrongRoot: false };
+      return {
+        isWrongRoot: true,
+        selectedRootName: rootName,
+        firstSegment,
+        sampleCount,
+        sampleRelativePath: firstRel,
+        sampleMatchedBasename: basename,
+        sampleFoundFile: { name: f.name, size: f.size, type: f.type },
+      };
+    } catch (_) {
+      // NotFoundError or denied. Not a wrong-root case.
+      return { isWrongRoot: false };
+    }
+  }
+
+  /**
+   * Build a structured diagnostic object for a missing asset. Safe to
+   * call for any state — fields are filled with what is known.
+   *
+   * Privacy: never include absolute filesystem paths. The caller passes
+   * the relative path that the resolver was looking for; we attach the
+   * bound folder name (which the user already knows) and a matched flag.
+   */
+  function buildMissingDiagnostic({ asset, directoryHandle, expectedRelativePath }) {
+    return {
+      assetId: asset?.id ?? null,
+      assetLabel: asset?.label ?? null,
+      assetFile: asset?.file ?? null,
+      assetType: asset?.type ?? null,
+      logicalPath: expectedRelativePath ?? normalizeRelativePath(asset?.file) ?? null,
+      selectedRootName:
+        directoryHandle && typeof directoryHandle.name === "string"
+          ? directoryHandle.name
+          : null,
+      expectedRelativePath: expectedRelativePath ?? null,
+      matched: false,
+    };
+  }
+
   const api = Object.freeze({
     SUPPORTED_IMAGE_MIME,
     SUPPORTED_IMAGE_EXTENSIONS,
@@ -229,6 +350,8 @@
     resolveAssetFile,
     resolveReferences,
     filesFromResolved,
+    detectWrongRootSelection,
+    buildMissingDiagnostic,
   });
 
   if (typeof module !== "undefined" && module.exports) {

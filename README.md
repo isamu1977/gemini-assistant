@@ -12,8 +12,9 @@ It does not call the Gemini API. It does not click Send. It only:
 3. Shows the tasks, status, and editable prompts.
 4. Lets you navigate, edit, mark status, insert the current task's
    prompt into Gemini's textbox for manual review and sending.
-5. **v0.5 PoC:** attach one resolved reference image at a time to
+5. **v0.5.1:** attach one resolved reference image at a time to
    Gemini's composer — manually, one per click, no batch.
+6. **v0.5.1:** the entire UI is now in the Chrome Side Panel.
 
 The Gemini DOM is touched only by `src/dom/geminiDomAdapter.js` — one
 file, isolated, language-independent (validated in EN and PT).
@@ -27,15 +28,17 @@ file, isolated, language-independent (validated in EN and PT).
 ├── manifest.json
 ├── icons/                        16/48/128.png
 ├── src/
-│   ├── popup/                    popup.html, popup.css, popup.js
+│   ├── sidepanel/                sidepanel.html, sidepanel.css, sidepanel.js
+│   ├── background/
+│   │   └── service-worker.js     registers sidePanel on toolbar click
 │   ├── content/
-│   │   └── content.js            bridges popup <-> adapter (Insert + Attach)
+│   │   └── content.js            bridges side panel <-> adapter (Insert + Attach + Probe)
 │   ├── dom/
 │   │   └── geminiDomAdapter.js   ⭐ only file that touches Gemini's DOM
 │   └── lib/
 │       ├── project.js            Project JSON schema + validation
 │       ├── storage.js            chrome.storage.local wrapper
-│       └── assets.js             asset resolver (resolved / missing / unsupported)
+│       └── assets.js             asset resolver + wrong-root detection
 ├── examples/
 │   └── example-project.json      5 tasks for manual testing
 └── tests/
@@ -47,6 +50,27 @@ file, isolated, language-independent (validated in EN and PT).
 
 > **No build step.** Plain JavaScript, no bundler, no npm install
 > required. Load the folder directly via Chrome's `Load unpacked`.
+
+---
+
+## Chrome Side Panel (v0.5.1)
+
+The UI is now a **Chrome Side Panel** (Manifest V3, Chrome 116+). The
+toolbar icon opens the side panel directly. There is no popup.
+
+- Click the **Gemini Assistant** toolbar icon on a `gemini.google.com`
+  tab → the side panel opens.
+- The side panel host resizes to the available width (default ~320 px,
+  user-resizable). It uses the full viewport height.
+- The side panel is scoped to the active tab. While it's open, you can
+  switch tabs without losing the project state (the state is in
+  `chrome.storage.local`).
+
+If a future Chrome version requires a fallback, the side panel is
+loaded from `src/sidepanel/sidepanel.html` and the service worker
+(`src/background/service-worker.js`) registers the behavior. See
+`manifest.json` for the `side_panel.default_path` and the `sidePanel`
+permission.
 
 ---
 
@@ -153,43 +177,54 @@ After editing any source file, hit the **Reload** icon on the extension's
 card in `chrome://extensions/`, then hard-reload any Gemini tab
 (`Cmd/Ctrl + Shift + R`).
 
+> **Minimum Chrome version:** 116. The Side Panel API
+> (`chrome.sidePanel`) requires Chrome 114+; we declare 116 to be safe.
+
 ---
 
 ## Usage
 
 1. Open `https://gemini.google.com` and sign in.
-2. Click the **Gemini Assistant** icon.
+2. Click the **Gemini Assistant** toolbar icon. The Side Panel opens.
 3. Click **Import Project** and pick a JSON file (try
    `examples/example-project-v2.json` for the attachment flow).
-4. Click **Bind…** under *Project folder* and pick the folder that
-   contains your reference images. The popup shows the folder name and
-   resolves each reference against it. **Binding is session-only** —
-   closing and reopening the popup requires re-binding.
-5. Use the dropdown or **Prev / Next** to navigate.
-6. For each reference row you see one of:
+4. Click **Bind folder…** under *Project Files* and pick the folder
+   that contains your reference images. The side panel shows the
+   folder name and resolves each reference against it.
+   **Binding is session-only** — closing and reopening the side panel
+   requires re-binding.
+5. If you accidentally picked a subfolder (e.g. `references/` instead
+   of the project root), the **Wrong folder selected** banner appears
+   at the top. Click **Rebind** to pick the correct root.
+6. Use the dropdown or **Previous / Next** to navigate.
+7. For each reference card you see a state badge:
    - `✓` resolved (PNG/JPEG/WEBP found) → **Attach** enabled
-   - `✕` missing (file not found in the bound folder) → disabled
+   - `✕` missing (file not found) → disabled
    - `✕` unsupported (file found but wrong type, e.g. GIF/PDF) → disabled
    - `·` unbound (no folder bound) → disabled
-7. Click **Attach** on a resolved row — the image is attached to the
+8. Click **Attach** on a resolved card — the image is attached to the
    current Gemini composer. **Review and send manually.**
-8. Edit the prompt if needed — saves locally with a 350 ms debounce.
-9. Click **Insert Prompt** — the text lands in Gemini's prompt field.
-   Send manually.
-10. Change the task's status via the dropdown.
+9. Edit the prompt if needed — saves locally with a 350 ms debounce.
+10. Click **Insert Prompt** — the text lands in Gemini's prompt field.
+    Send manually.
+11. Change the task's status via the dropdown.
+12. Open the **Attachment** panel for structured diagnostics. Click
+    **Probe attachment** to inspect the Gemini UI without sending a file.
+
+The **Debug** panel shows the raw JSON self-test (collapsed by default).
 
 If you re-import while a project is already loaded, a confirmation modal
 appears. Re-importing **discards the current progress, prompt edits, and
 the bound folder**.
 
-Project state (project, tasks, edits, status) persists across popup
-close and Chrome restart. Folder binding and the resolved-file cache
-are session-only.
+Project state (project, tasks, edits, status) persists across side
+panel close and Chrome restart. Folder binding and the resolved-file
+cache are session-only.
 
 ### Keyboard shortcuts (in the prompt textarea)
 
 - `Cmd/Ctrl + Enter` → Insert Prompt
-- `Alt + ArrowLeft` / `Alt + ArrowRight` → Prev / Next
+- `Alt + ArrowLeft` / `Alt + ArrowRight` → Previous / Next
 
 ---
 
@@ -197,20 +232,38 @@ are session-only.
 
 ### View extension logs
 
-- **Service worker / popup errors:** `chrome://extensions/` → click
-  **Service worker** under the extension.
-- **Content script logs (most useful):** Open DevTools on the Gemini tab.
-  Filter the console by `[Gemini Assistant`.
+- **Service worker / side panel errors:** `chrome://extensions/` →
+  click **Service worker** under the extension.
+- **Content script logs (most useful):** Open DevTools on the Gemini
+  tab. Filter the console by `[Gemini Assistant`.
 
 Prefixes used:
 - `[Gemini Assistant:dom]` — DOM adapter (`src/dom/geminiDomAdapter.js`)
 - `[Gemini Assistant:content]` — content script (`src/content/content.js`)
+- `[Gemini Assistant:sp]` — side panel (`src/sidepanel/sidepanel.js`)
+- `[Gemini Assistant:sw]` — service worker (`src/background/service-worker.js`)
 
 ### Self-test panel
 
-The popup's **Self-test** disclosure shows a live snapshot of the
+The side panel's **Debug** disclosure shows a live snapshot of the
 adapter's view of the current page (locale, candidate count, send-button
 location, ranked candidates). Open it whenever the Insert Prompt fails.
+
+### Attachment diagnostics
+
+The side panel's **Attachment** disclosure shows the live state of the
+upload affordance:
+
+- `Trigger` — did we find a likely "+" / upload button?
+- `Input mounted` — is the `<input type="file">` currently in the DOM?
+- `Menu open` — is a popover / menu visible?
+- `Attachment area` — could we localize the upload area?
+- `Current hints` — count of attachment thumbnail hints
+- `Likely dynamic` — Gemini's input is most likely mounted only after
+  the user opens the attachment menu.
+
+Click **Probe attachment** to re-run the probe on demand. The probe
+does NOT auto-attach; it only inspects state.
 
 ### Run the test suite
 
@@ -218,15 +271,19 @@ location, ranked candidates). Open it whenever the Insert Prompt fails.
 node tests/run.js
 ```
 
-25 tests cover the project parser, validation, navigation helpers,
-storage roundtrip, and the shipped example file. See `tests/README.md`.
+69 tests cover the project parser, validation, navigation helpers,
+storage roundtrip, the asset resolver, and the new wrong-root detection.
+
+The e2e Python suite (Playwright) covers the side panel DOM contract:
+modal, references, insert, attach, diagnostics, and wrong-root. Run
+with `python3 tests/e2e_*.py` (each file is independent).
 
 ---
 
 ## Architecture (who knows what)
 
 ```
-popup (UI)
+sidepanel (UI)
   ↓ uses projectLib + storageLib
   ↓ invokes content.js via chrome.tabs.sendMessage
 content.js (isolated world, runs in gemini.google.com)
@@ -235,12 +292,90 @@ geminiDomAdapter.js
   ↓ only file that touches Gemini's DOM
 ```
 
-The popup knows nothing about Gemini's DOM. The DOM adapter knows
+The side panel knows nothing about Gemini's DOM. The DOM adapter knows
 nothing about projects, status, or storage. The protocol between the
-popup and the content script is documented in
+side panel and the content script is documented in
 `src/content/content.js`.
 
 ## Bug history
+
+### v0.5.1 — Wrong-root selection + Attachment diagnostics + Side Panel
+
+**Root cause of `Missing` when the user selects the wrong folder:**
+
+The resolver treats `directoryHandle` as a literal project root. If
+the user picks `references/` directly, the resolver tries
+`references/references/character-main.png` → `NotFoundError` →
+`missing`. The behavior is deterministic and correct; the missing
+piece was the UX that **detects** the mis-selection.
+
+**Fix:** `src/lib/assets.js` got a new helper, `detectWrongRootSelection`,
+which fires only when:
+
+1. Every asset's relative path begins with the same first segment.
+2. That first segment equals the bound folder's name.
+3. **A spot-check I/O confirms it:** looking up the basename (the part
+   after the first segment) inside the bound folder SUCCEEDS.
+
+When the three conditions hold, the side panel shows a **Wrong
+folder selected** banner with the message:
+
+> The selected folder is "references".
+> That looks like the project subfolder "references", not the project root.
+> Select the project root folder that contains:
+>   references/
+
+The banner never auto-fixes. The user must click **Rebind** and pick
+the correct folder.
+
+**Missing asset card:** when a ref is missing, the card shows a
+compact `Missing` badge. The full diagnostic (assetId, expectedRelativePath,
+selectedRootName, matched: false) is in the card's tooltip and the
+Debug JSON panel. The resolver never logs absolute filesystem paths.
+
+**Attachment file input lifecycle (v0.5.1):**
+
+The v0.5.0 self-test reported `fileInputCount: 0` on the idle composer.
+That was NOT a bug — Gemini's `<input type="file">` is dynamically
+mounted only after the user opens the attachment menu. Gemini's SPA
+keeps the input out of the DOM until it is needed.
+
+**Diagnostic additions** (`src/dom/geminiDomAdapter.js`):
+
+- `attachmentProbe()` — structured snapshot of the upload surface:
+  triggerFound, fileInputCount, menuOrPopoverOpen, attachmentAreaFound,
+  currentHints, inputLikelyDynamic, notes.
+- `activateAttachmentFlow()` — best-effort: finds the trigger, clicks
+  it, polls for a menu/input to appear, then sends Escape to close the
+  menu. Never errors.
+- `attachFileToGemini()` now distinguishes "input not found" from
+  "input permanently missing" — when `inputLikelyDynamic` is true, the
+  error message tells the user to use the Probe button.
+
+**Single attachment flow:** unchanged in v0.5.1. It still requires the
+file input to be mounted at the moment of the click. The next
+milestone will wire Attach All / Prepare Task using the activation
+probe.
+
+**Side Panel migration:**
+
+The main UI moved from `src/popup/popup.html` to
+`src/sidepanel/sidepanel.html`. The toolbar icon now opens the side
+panel directly via `chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })`.
+
+- `manifest.json` gains `"sidePanel"` permission and
+  `side_panel.default_path`.
+- `src/background/service-worker.js` registers the behavior on install
+  and on startup.
+- `src/popup/` is deleted.
+- The side panel reuses `projectLib`, `storageLib`, `assetsLib`, and
+  the `content.js` message bridge. Only the UI shell changed.
+- All e2e tests now target `src/sidepanel/sidepanel.html`.
+
+The side panel layout: PROJECT, PROJECT FILES, TASK, PROMPT, PROGRESS
+(collapsible), ASSETS (collapsible), ATTACHMENT (collapsible), DEBUG
+(collapsible). Sections collapse independently; Debug is closed by
+default.
 
 ### v0.5.0 — Single reference attachment (PoC)
 
@@ -403,18 +538,19 @@ will fail the test (verified — 5/6 scenarios fail when the rule is removed).
 
 | File | Purpose |
 |---|---|
-| `manifest.json` | Manifest V3 declaration. |
-| `src/popup/popup.html` | Popup markup (empty + loaded states). |
-| `src/popup/popup.css` | Popup styling. |
-| `src/popup/popup.js` | UI orchestration: storage, navigation, status, Insert Prompt, Attach, folder binding. |
-| `src/content/content.js` | Message bridge between popup and adapter (Insert + Attach). |
-| `src/dom/geminiDomAdapter.js` | Sole point of contact with Gemini's DOM (Insert + Attach). |
+| `manifest.json` | Manifest V3 declaration (sidePanel, service worker). |
+| `src/sidepanel/sidepanel.html` | Side Panel markup. |
+| `src/sidepanel/sidepanel.css` | Side Panel styling. |
+| `src/sidepanel/sidepanel.js` | UI orchestration: storage, navigation, status, Insert Prompt, Attach, folder binding, wrong-root banner, attachment diagnostics. |
+| `src/background/service-worker.js` | Registers `chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })`. |
+| `src/content/content.js` | Message bridge between side panel and adapter (Insert + Attach + Probe + Activate). |
+| `src/dom/geminiDomAdapter.js` | Sole point of contact with Gemini's DOM. |
 | `src/lib/project.js` | Project JSON schema, validation, helpers. |
 | `src/lib/storage.js` | `chrome.storage.local` wrapper with in-memory shim. |
-| `src/lib/assets.js` | Asset resolver: resolved / missing / unsupported / unbound. |
+| `src/lib/assets.js` | Asset resolver + wrong-root detection + missing diagnostic. |
 | `examples/example-project.json` | 5-task example for manual testing. |
 | `examples/example-project-v2.json` | 5-task v2 example with 5 assets. |
-| `tests/run.js` | Pure-Node test runner (60 tests). |
+| `tests/run.js` | Pure-Node test runner (69 tests). |
 | `tests/fixtures/*.json` | Validation fixtures. |
 | `tests/e2e_*.py` | Playwright DOM tests (mocked). |
 | `icons/icon*.png` | Toolbar and store icons. |

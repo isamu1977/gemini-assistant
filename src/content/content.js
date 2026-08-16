@@ -1,17 +1,22 @@
 /*
  * content.js
  *
- * Bridges the extension popup to the Gemini DOM via geminiDomAdapter.
- * The adapter is loaded BEFORE this script (see manifest.json order),
- * so globalThis.RedSunDomAdapter is already available.
+ * Bridges the extension side panel (formerly popup) to the Gemini DOM
+ * via geminiDomAdapter. The adapter is loaded BEFORE this script (see
+ * manifest.json order), so globalThis.RedSunDomAdapter is already
+ * available.
  *
- * Message protocol (popup -> content):
+ * Message protocol (side panel -> content):
  *   { type: "GEMINI_ASSISTANT_PING" }
  *     -> { ok: true, url, selfTest }
  *   { type: "GEMINI_ASSISTANT_INSERT_PROMPT", text: string }
  *     -> { ok: true, length } | { ok: false, error }
  *   { type: "GEMINI_ASSISTANT_ATTACH", file: File, fileName?, fileType?, fileSize? }
- *     -> { ok: true, method, fileName, fileType, fileSize } | { ok: false, error, diagnostics }
+ *     -> { ok: true, method, fileName, fileType, fileSize } | { ok: false, error, diagnostics, requiresActivation? }
+ *   { type: "GEMINI_ASSISTANT_ATTACH_PROBE" }
+ *     -> { ok: true, probe, activated? } | { ok: false, error }
+ *   { type: "GEMINI_ASSISTANT_ATTACH_ACTIVATE" }
+ *     -> { ok, reason, message, probeBefore, probeAfter }
  *
  * The File in ATTACH is structured-cloneable (it is a Blob), so it
  * crosses the chrome.tabs.sendMessage boundary without base64. The
@@ -80,6 +85,44 @@
         adapter
           .attachFileToGemini(file)
           .then((result) => sendResponse(result))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) })
+          );
+        return true;
+      }
+
+      case "GEMINI_ASSISTANT_ATTACH_PROBE": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter) {
+          sendResponse({ ok: false, error: "adapter not loaded" });
+          return false;
+        }
+        if (typeof adapter.attachmentProbe !== "function") {
+          sendResponse({ ok: false, error: "adapter does not support probe" });
+          return false;
+        }
+        try {
+          const probe = adapter.attachmentProbe();
+          sendResponse({ ok: true, probe });
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        }
+        return false;
+      }
+
+      case "GEMINI_ASSISTANT_ATTACH_ACTIVATE": {
+        const adapter = globalThis.RedSunDomAdapter;
+        if (!adapter) {
+          sendResponse({ ok: false, error: "adapter not loaded" });
+          return false;
+        }
+        if (typeof adapter.activateAttachmentFlow !== "function") {
+          sendResponse({ ok: false, error: "adapter does not support activate" });
+          return false;
+        }
+        adapter
+          .activateAttachmentFlow()
+          .then((result) => sendResponse({ ok: true, ...result }))
           .catch((e) =>
             sendResponse({ ok: false, error: e?.message ?? String(e) })
           );

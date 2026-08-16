@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Gemini Assistant</title>
+    <link rel="stylesheet" href="sidepanel.css" />
+  </head>
+  <body>
+    <!-- Empty state: no project loaded -->
+    <section id="empty-state" class="empty-state" hidden>
+      <header class="brand-header">
+        <h1>Gemini Assistant</h1>
+        <p class="subtitle">Project &amp; Task Manager</p>
+      </header>
+
+      <p class="hint">
+        Load a Project JSON to start. The schema is versioned; see
+        <code>examples/example-project-v2.json</code>.
+      </p>
+
+      <div class="actions">
+        <button id="import-btn" type="button" class="primary">Import Project</button>
+      </div>
+
+      <input id="file-input" type="file" accept="application/json,.json" hidden />
+    </section>
+
+    <!-- Loaded state: project + tasks UI -->
+    <section id="loaded-state" hidden>
+      <header class="brand-header">
+        <h1>Gemini Assistant</h1>
+      </header>
+
+      <!-- PROJECT -->
+      <section class="card project-card">
+        <div class="card-header">
+          <span class="card-title">Project</span>
+          <button id="reimport-btn" type="button" class="ghost" title="Replace current project">
+            Replace
+          </button>
+        </div>
+        <div class="card-body">
+          <h2 id="project-name">Project</h2>
+          <p id="project-desc" class="project-desc" hidden></p>
+          <p id="project-stats" class="project-stats" hidden></p>
+        </div>
+      </section>
+
+      <!-- Wrong-root banner (shown only when detected) -->
+      <section id="wrong-root-banner" class="banner banner-warn" hidden>
+        <div class="banner-content">
+          <strong>Wrong folder selected.</strong>
+          <p id="wrong-root-body"></p>
+        </div>
+        <button id="wrong-root-rebind" type="button" class="ghost">Rebind</button>
+      </section>
+
+      <!-- PROJECT FILES -->
+      <section class="card folder-card">
+        <div class="card-header">
+          <span class="card-title">Project Files</span>
+        </div>
+        <div class="card-body folder-card-body">
+          <div class="folder-row">
+            <span id="folder-binding-name" class="folder-binding-name unbound">Not bound</span>
+            <span id="folder-binding-summary" class="folder-binding-summary"></span>
+          </div>
+          <button id="folder-bind-btn" type="button" class="secondary full-width">
+            Bind folder…
+          </button>
+        </div>
+      </section>
+
+      <!-- TASK -->
+      <section class="card task-card">
+        <div class="card-header">
+          <span class="card-title">Task</span>
+          <span class="task-counter">
+            <span id="task-current">1</span> / <span id="task-total">1</span>
+          </span>
+        </div>
+        <div class="card-body">
+          <label for="task-select" class="visually-hidden">Task</label>
+          <select id="task-select" class="task-select"></select>
+
+          <div class="task-status-row">
+            <label for="status-select">Status</label>
+            <select id="status-select" class="status-select"></select>
+          </div>
+
+          <div class="task-title-row">
+            <span id="task-title" class="task-title"></span>
+          </div>
+
+          <div class="references-section">
+            <div class="references-header">
+              <span class="references-label">References</span>
+              <span class="references-count" id="references-count">0</span>
+            </div>
+            <ul id="references-list" class="references-list"></ul>
+            <p id="references-empty" class="references-empty" hidden>
+              No references for this task.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- PROMPT -->
+      <section class="card prompt-card">
+        <div class="card-header">
+          <span class="card-title">Prompt</span>
+        </div>
+        <div class="card-body">
+          <textarea
+            id="prompt"
+            placeholder="Prompt of the current task…"
+            rows="6"
+            spellcheck="false"
+            autocomplete="off"
+          ></textarea>
+          <div class="prompt-actions">
+            <button id="insert-btn" type="button" class="primary">Insert Prompt</button>
+          </div>
+          <div class="nav-row">
+            <button id="prev-btn" type="button" class="secondary">← Previous</button>
+            <button id="next-btn" type="button" class="secondary">Next →</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- PROGRESS (collapsible) -->
+      <details class="card collapsible">
+        <summary class="card-header">
+          <span class="card-title">Progress</span>
+        </summary>
+        <div class="card-body">
+          <div id="progress-summary" class="progress-grid"></div>
+        </div>
+      </details>
+
+      <!-- ASSETS (collapsible) -->
+      <details class="card collapsible" id="assets-panel" hidden>
+        <summary class="card-header">
+          <span class="card-title">Assets</span>
+          <span id="assets-summary" class="card-badge"></span>
+        </summary>
+        <div class="card-body">
+          <ul id="assets-list" class="assets-list"></ul>
+        </div>
+      </details>
+
+      <!-- ATTACHMENT DIAGNOSTICS (collapsible) -->
+      <details class="card collapsible">
+        <summary class="card-header">
+          <span class="card-title">Attachment</span>
+          <span id="attachment-summary" class="card-badge"></span>
+        </summary>
+        <div class="card-body">
+          <dl id="attachment-diagnostics" class="diag-list"></dl>
+          <div class="diag-actions">
+            <button id="probe-attachment-btn" type="button" class="secondary">
+              Probe attachment
+            </button>
+          </div>
+        </div>
+      </details>
+
+      <!-- DEBUG (collapsible, default closed) -->
+      <details class="card collapsible">
+        <summary class="card-header">
+          <span class="card-title">Debug</span>
+        </summary>
+        <div class="card-body">
+          <pre id="selftest" class="selftest-pre"></pre>
+        </div>
+      </details>
+    </section>
+
+    <!-- Status line shown in both states -->
+    <section class="status" id="status" data-state="idle">
+      <span class="status-indicator" aria-hidden="true"></span>
+      <span id="status-text">Open on gemini.google.com to use Insert / Attach.</span>
+    </section>
+
+    <!-- Confirm modal for replacing an existing project -->
+    <div id="confirm-overlay" class="overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+        <h3 id="confirm-title">Replace current project?</h3>
+        <p id="confirm-body">
+          You already have a project loaded with progress. Importing another
+          JSON will discard the current progress and any prompt edits.
+        </p>
+        <div class="modal-actions">
+          <button id="confirm-cancel" type="button" class="secondary">Cancel</button>
+          <button id="confirm-ok" type="button" class="primary">Replace</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="../lib/project.js"></script>
+    <script src="../lib/storage.js"></script>
+    <script src="../lib/assets.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

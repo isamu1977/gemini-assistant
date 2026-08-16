@@ -769,6 +769,114 @@ test("assets: filesFromResolved extracts File objects in order", async () => {
   assertEqual(out[1], f2);
 });
 
+// ----- wrong-root selection detection (v0.5.1) ----------------------------
+
+console.log(`\n${C.bold}assets.js (wrong-root detection)${C.reset}`);
+
+test("detectWrongRootSelection: returns false when no handle", async () => {
+  const r = await assetsLib.detectWrongRootSelection(null, [
+    { label: "X", type: "character", file: "refs/x.png" },
+  ]);
+  assertEqual(r.isWrongRoot, false);
+});
+
+test("detectWrongRootSelection: returns false when refs empty", async () => {
+  const r = await assetsLib.detectWrongRootSelection({ name: "refs" }, []);
+  assertEqual(r.isWrongRoot, false);
+});
+
+test("detectWrongRootSelection: returns false when folder name does not match first segment", async () => {
+  // assets live in "refs/" but user selected a folder named "my-project"
+  const handle = { name: "my-project" };
+  const r = await assetsLib.detectWrongRootSelection(handle, [
+    { label: "X", type: "character", file: "refs/x.png" },
+  ]);
+  assertEqual(r.isWrongRoot, false);
+});
+
+test("detectWrongRootSelection: returns false when first segments are mixed", async () => {
+  // cannot be a single-subfolder misalignment
+  const handle = { name: "refs" };
+  const r = await assetsLib.detectWrongRootSelection(handle, [
+    { label: "X", type: "character", file: "refs/x.png" },
+    { label: "Y", type: "style", file: "other/y.png" },
+  ]);
+  assertEqual(r.isWrongRoot, false);
+});
+
+test("detectWrongRootSelection: returns false when name matches but spot-check I/O fails", async () => {
+  // folder name == first segment, but the basename does NOT exist in the
+  // bound folder (so the user is correctly inside the project root that
+  // happens to contain a subfolder with the same name)
+  const fakeNotFound = { name: "refs" };
+  const r = await assetsLib.detectWrongRootSelection(fakeNotFound, [
+    { label: "X", type: "character", file: "refs/x.png" },
+  ]);
+  assertEqual(r.isWrongRoot, false);
+});
+
+test("detectWrongRootSelection: returns true when name matches AND spot-check I/O succeeds", async () => {
+  // The user picked "references" but the basename "yuki.png" exists at
+  // the bound root -> with high confidence the user picked the wrong level.
+  const fakeFile = { name: "yuki.png", type: "image/png", size: 42 };
+  const handle = {
+    name: "references",
+    async getFileHandle(name) {
+      if (name !== "yuki.png") {
+        throw new DOMException("missing", "NotFoundError");
+      }
+      return { async getFile() { return fakeFile; } };
+    },
+  };
+  const refs = [
+    { label: "Yuki", type: "character", file: "references/yuki.png" },
+    { label: "Village", type: "environment", file: "references/village.png" },
+  ];
+  const r = await assetsLib.detectWrongRootSelection(handle, refs);
+  assertEqual(r.isWrongRoot, true);
+  assertEqual(r.selectedRootName, "references");
+  assertEqual(r.firstSegment, "references");
+  assertEqual(r.sampleCount, 2);
+  assertEqual(r.sampleMatchedBasename, "yuki.png");
+  assertEqual(r.sampleRelativePath, "references/yuki.png");
+  assertEqual(r.sampleFoundFile.name, "yuki.png");
+});
+
+test("detectWrongRootSelection: rejects invalid path (..)", async () => {
+  const handle = { name: "refs" };
+  const r = await assetsLib.detectWrongRootSelection(handle, [
+    { label: "X", type: "character", file: "../escape/x.png" },
+  ]);
+  assertEqual(r.isWrongRoot, false);
+});
+
+test("buildMissingDiagnostic: includes assetId, expectedRelativePath, selectedRootName, matched=false", () => {
+  const handle = { name: "my-project" };
+  const d = assetsLib.buildMissingDiagnostic({
+    asset: { id: "character-main", label: "Main", type: "character", file: "refs/main.png" },
+    directoryHandle: handle,
+    expectedRelativePath: "refs/main.png",
+  });
+  assertEqual(d.assetId, "character-main");
+  assertEqual(d.expectedRelativePath, "refs/main.png");
+  assertEqual(d.selectedRootName, "my-project");
+  assertEqual(d.matched, false);
+  // No absolute paths leaked.
+  assertEqual(d.systemPath, undefined);
+});
+
+test("buildMissingDiagnostic: tolerates null handle and partial asset", () => {
+  const d = assetsLib.buildMissingDiagnostic({
+    asset: { id: "x", file: "refs/x.png" },
+    directoryHandle: null,
+    expectedRelativePath: null,
+  });
+  assertEqual(d.assetId, "x");
+  assertEqual(d.logicalPath, "refs/x.png");
+  assertEqual(d.selectedRootName, null);
+  assertEqual(d.matched, false);
+});
+
 // ----- end ----------------------------------------------------------------
 
 console.log(

@@ -1,32 +1,32 @@
 /*
- * popup.js
+ * sidepanel.js
  *
- * UI orchestration for the Project & Task Manager.
+ * UI orchestration for the Gemini Assistant Chrome Side Panel.
  *
  * Responsibilities:
  *   - Load/save state from chrome.storage.local.
  *   - Import Project JSON, validate, confirm replacement.
- *   - Bind a project folder via the File System Access API
- *     (window.showDirectoryPicker) so asset paths can be resolved.
+ *   - Bind a project folder via window.showDirectoryPicker.
  *   - Resolve each task's references against the bound folder; render
- *     state (resolved / missing / unsupported / unbound) and a per-row
- *     Attach button when the asset is an image we support.
+ *     compact reference cards (kept clean even when an asset is missing).
+ *   - Detect the "wrong-root selection" case (user picked a subfolder
+ *     like `references/` instead of the project root) and show a clear,
+ *     persistent banner.
  *   - Render the loaded project: task selector, title, status, prompt.
  *   - Handle Previous/Next navigation and per-task prompt edits.
- *   - Hand off "Insert Prompt" to the content script (which calls the
- *     DOM adapter). Never auto-submits.
- *   - Hand off "Attach" (single reference) to the content script the
- *     same way. Never auto-sends.
+ *   - Hand off "Insert Prompt" / "Attach" to the content script via
+ *     chrome.tabs.sendMessage. Never auto-submits.
+ *   - Probe attachment state (file input lifecycle, menu open) and
+ *     surface a structured diagnostic.
  *
- * The popup knows nothing about Gemini's DOM. The DOM adapter lives in
- * src/dom/geminiDomAdapter.js and is invoked only via the content script
- * message bridge.
+ * The side panel knows nothing about Gemini's DOM. The DOM adapter lives
+ * in src/dom/geminiDomAdapter.js and is invoked only via the content
+ * script message bridge.
  *
  * Folder binding is kept in-memory for the PoC: the
- * FileSystemDirectoryHandle cannot be reliably rehydrated across a popup
- * close without re-prompting the user. Closing and reopening the popup
- * requires re-binding. This is documented in the UI ("bound to this
- * session").
+ * FileSystemDirectoryHandle cannot be reliably rehydrated across a panel
+ * re-open without re-prompting the user. Closing and reopening the side
+ * panel requires re-binding. This is documented in the UI.
  */
 
 (function () {
@@ -37,8 +37,7 @@
   const assetsLib = globalThis.GeminiAssistantAssets;
 
   if (!projectLib || !storageLib || !assetsLib) {
-    document.body.textContent =
-      "Internal error: GeminiAssistant libs not loaded.";
+    document.body.textContent = "Internal error: GeminiAssistant libs not loaded.";
     return;
   }
 
@@ -55,11 +54,20 @@
   const projectNameEl = $("#project-name");
   const projectDescEl = $("#project-desc");
   const projectStatsEl = $("#project-stats");
+
+  const wrongRootBannerEl = $("#wrong-root-banner");
+  const wrongRootBodyEl = $("#wrong-root-body");
+  const wrongRootRebindBtn = $("#wrong-root-rebind");
+
+  const folderBindingNameEl = $("#folder-binding-name");
+  const folderBindingSummaryEl = $("#folder-binding-summary");
+  const folderBindBtn = $("#folder-bind-btn");
+
   const taskSelectEl = $("#task-select");
   const statusSelectEl = $("#status-select");
   const taskTitleEl = $("#task-title");
-  const taskCurrentEls = [$("#task-current"), $("#task-current-2")];
-  const taskTotalEls = [$("#task-total"), $("#task-total-2")];
+  const taskCurrentEls = [$("#task-current")];
+  const taskTotalEls = [$("#task-total")];
   const promptEl = $("#prompt");
   const insertBtn = $("#insert-btn");
   const prevBtn = $("#prev-btn");
@@ -70,17 +78,18 @@
   const referencesListEl = $("#references-list");
   const referencesEmptyEl = $("#references-empty");
 
-  const folderBindingEl = $("#folder-binding");
-  const folderBindingNameEl = $("#folder-binding-name");
-  const folderBindBtn = $("#folder-bind-btn");
-
   const assetsPanelEl = $("#assets-panel");
   const assetsListEl = $("#assets-list");
   const assetsSummaryEl = $("#assets-summary");
 
+  const attachmentSummaryEl = $("#attachment-summary");
+  const attachmentDiagnosticsEl = $("#attachment-diagnostics");
+  const probeAttachmentBtn = $("#probe-attachment-btn");
+
+  const selfTestEl = $("#selftest");
+
   const statusEl = $("#status");
   const statusText = $("#status-text");
-  const selfTestEl = $("#selftest");
 
   const overlayEl = $("#confirm-overlay");
   const confirmCancelBtn = $("#confirm-cancel");
@@ -89,26 +98,25 @@
   // ----- state (in-memory) ------------------------------------------------
 
   let state = storageLib.emptyState();
-  // last user-typed prompt (debounced-saved)
   let promptSaveTimer = null;
-  // Folder binding is intentionally session-only (see file header).
+  // Folder binding is intentionally session-only.
   let folderHandle = null;
   let folderName = "";
-  // Cache of resolved refs for the current task. Shape:
-  //   [{ id, label, type, file, state, fileObj|null, error|null, fileName?, fileType?, fileSize? }]
-  // fileObj is dropped on task navigation to avoid holding bytes.
+  // Cache of resolved refs for the current task.
   let resolvedRefsCache = null;
+  // Wrong-root detection result (null = not detected or not yet probed).
+  let wrongRootInfo = null;
 
   // ----- helpers ----------------------------------------------------------
 
-  const POPUP_LOG_PREFIX = "[Gemini Assistant:popup]";
+  const LOG_PREFIX = "[Gemini Assistant:sp]";
 
-  function popupLog(...args) {
-    console.log(POPUP_LOG_PREFIX, ...args);
+  function log(...args) {
+    console.log(LOG_PREFIX, ...args);
   }
 
-  function popupWarn(...args) {
-    console.warn(POPUP_LOG_PREFIX, ...args);
+  function warn(...args) {
+    console.warn(LOG_PREFIX, ...args);
   }
 
   function setStatusLine(state, text) {
@@ -195,12 +203,11 @@
     try {
       handle = await window.showDirectoryPicker({ mode: "read" });
     } catch (e) {
-      // User cancelled or denied. Not an error — just leave state as-is.
       if (e && (e.name === "AbortError" || e.code === 20)) {
-        popupLog("folder bind: cancelled by user");
+        log("folder bind: cancelled by user");
         return;
       }
-      popupWarn("folder bind failed", e?.message ?? String(e));
+      warn("folder bind failed", e?.message ?? String(e));
       setStatusLine("error", `Failed to bind folder: ${e?.message ?? "unknown error"}`);
       return;
     }
@@ -208,21 +215,9 @@
     folderName = handle?.name ?? "Bound folder";
     setStatusLine("ok", `Bound to folder: ${folderName}.`);
     renderFolderBinding();
-    // Re-resolve references for the current task, if any.
+    await refreshWrongRoot();
     if (currentTask()) {
       await resolveCurrentRefs();
-      renderReferences();
-    }
-  }
-
-  function unbindFolder() {
-    folderHandle = null;
-    folderName = "";
-    // Drop any cached File objects to free memory.
-    resolvedRefsCache = null;
-    setStatusLine("info", "Folder unbound.");
-    renderFolderBinding();
-    if (currentTask()) {
       renderReferences();
     }
   }
@@ -231,14 +226,71 @@
     if (folderHandle) {
       folderBindingNameEl.textContent = folderName || "Bound";
       folderBindingNameEl.classList.remove("unbound");
-      folderBindBtn.textContent = "Rebind";
+      folderBindBtn.textContent = folderHandle ? "Rebind folder" : "Bind folder";
       folderBindBtn.title = "Re-bind this project to a folder";
     } else {
       folderBindingNameEl.textContent = "Not bound (session only)";
       folderBindingNameEl.classList.add("unbound");
-      folderBindBtn.textContent = "Bind…";
+      folderBindBtn.textContent = "Bind folder…";
       folderBindBtn.title = "Bind a local folder so reference paths resolve";
     }
+    // Summary is filled by renderReferences after resolution.
+    folderBindingSummaryEl.textContent = "";
+  }
+
+  // ----- wrong-root detection ---------------------------------------------
+
+  async function refreshWrongRoot() {
+    if (!folderHandle || !state.source) {
+      wrongRootInfo = null;
+      renderWrongRootBanner();
+      return;
+    }
+    try {
+      const refs = collectAllAssetRefs(state.source.project);
+      if (refs.length === 0) {
+        wrongRootInfo = null;
+        renderWrongRootBanner();
+        return;
+      }
+      const info = await assetsLib.detectWrongRootSelection(folderHandle, refs);
+      wrongRootInfo = info.isWrongRoot ? info : null;
+    } catch (e) {
+      warn("detectWrongRootSelection failed:", e?.message ?? String(e));
+      wrongRootInfo = null;
+    }
+    renderWrongRootBanner();
+  }
+
+  function collectAllAssetRefs(project) {
+    // Build a list of unique assets across the project. We don't need
+    // per-task references for the spot-check; the first segment of
+    // every asset.file must agree across the project to trigger.
+    const out = [];
+    const seen = new Set();
+    if (!project || !project.assets) return out;
+    for (const id of Object.keys(project.assets)) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(project.assets[id]);
+    }
+    return out;
+  }
+
+  function renderWrongRootBanner() {
+    if (!wrongRootInfo) {
+      wrongRootBannerEl.hidden = true;
+      return;
+    }
+    const info = wrongRootInfo;
+    wrongRootBannerEl.hidden = false;
+    const lines = [
+      `The selected folder is "${info.selectedRootName}".`,
+      `That looks like the project subfolder "references", not the project root.`,
+      `Select the project root folder that contains:`,
+      `  ${info.firstSegment}/`,
+    ];
+    wrongRootBodyEl.textContent = lines.join("\n");
   }
 
   // ----- asset resolution -------------------------------------------------
@@ -250,8 +302,6 @@
     const rawRefs = projectLib.resolveReferences(state.source.project, task.id);
     if (rawRefs.length === 0) return;
     if (!folderHandle) {
-      // No folder bound: cache as "unbound" placeholders so the UI can
-      // still render them with a disabled Attach button.
       resolvedRefsCache = rawRefs.map((r) => ({
         id: r.id,
         label: r.label,
@@ -260,12 +310,21 @@
         state: "unbound",
         fileObj: null,
         error: "Bind the project folder to enable Attach",
+        diagnostic: null,
       }));
       return;
     }
     const results = await assetsLib.resolveReferences(folderHandle, rawRefs);
     resolvedRefsCache = results.map((res, i) => {
       const r = rawRefs[i];
+      const diagnostic =
+        res.state === "missing"
+          ? assetsLib.buildMissingDiagnostic({
+              asset: r,
+              directoryHandle: folderHandle,
+              expectedRelativePath: res.path,
+            })
+          : null;
       return {
         id: r.id,
         label: r.label,
@@ -277,6 +336,7 @@
         fileName: res.fileName ?? null,
         fileType: res.fileType ?? null,
         fileSize: res.fileSize ?? null,
+        diagnostic,
       };
     });
   }
@@ -287,7 +347,7 @@
     if (!state.source) {
       emptyStateEl.hidden = false;
       loadedStateEl.hidden = true;
-      setStatusLine("idle", "Idle");
+      setStatusLine("idle", "Open on gemini.google.com to use Insert / Attach.");
       return;
     }
     emptyStateEl.hidden = true;
@@ -305,15 +365,14 @@
 
     const assetCount = projectLib.countAssets(proj);
     if (assetCount > 0) {
-      projectStatsEl.textContent =
-        `${assetCount} asset${assetCount === 1 ? "" : "s"} in catalog`;
+      projectStatsEl.textContent = `${assetCount} asset${assetCount === 1 ? "" : "s"} in catalog`;
       projectStatsEl.hidden = false;
     } else {
       projectStatsEl.hidden = true;
     }
 
-    // Folder binding (always rendered when a project is loaded).
     renderFolderBinding();
+    renderWrongRootBanner();
 
     // Task selector
     taskSelectEl.innerHTML = "";
@@ -344,12 +403,9 @@
     for (const el of taskTotalEls) el.textContent = String(total);
     taskTitleEl.textContent = currentTask()?.title ?? "";
 
-    // References (current task) — render from cache when available,
-    // otherwise from raw metadata with "unbound" state.
     renderReferences();
-
-    // Asset catalog (collapsible)
     renderAssetCatalog();
+    renderProgress();
 
     // Prompt
     promptEl.value = cur?.prompt ?? currentTask()?.prompt ?? "";
@@ -357,9 +413,6 @@
     // Prev/Next enable state
     prevBtn.disabled = projectLib.prevTaskId(proj, state.currentTaskId) === null;
     nextBtn.disabled = projectLib.nextTaskId(proj, state.currentTaskId) === null;
-
-    // Progress
-    renderProgress();
   }
 
   function renderProgress() {
@@ -395,53 +448,48 @@
     if (rawRefs.length === 0) {
       referencesCountEl.textContent = "0";
       referencesEmptyEl.hidden = false;
+      updateFolderSummary(0, 0);
       return;
     }
     referencesCountEl.textContent = String(rawRefs.length);
     referencesEmptyEl.hidden = true;
 
+    let resolvedCount = 0;
     for (let i = 0; i < rawRefs.length; i++) {
       const r = rawRefs[i];
       const cached = resolvedRefsCache && resolvedRefsCache[i];
+      if (cached && cached.state === "resolved") resolvedCount++;
+
       const li = document.createElement("li");
-      li.className = "ref-item";
+      li.className = "ref-card";
+      const stateName = (cached && cached.state) || (folderHandle ? "missing" : "unbound");
+      if (stateName !== "resolved") {
+        li.classList.add(`state-${stateName}`);
+      }
+
+      const row = document.createElement("div");
+      row.className = "ref-row";
 
       const stateIcon = document.createElement("span");
-      stateIcon.className = "ref-state";
-      const stateName = (cached && cached.state) || (folderHandle ? "missing" : "unbound");
-      stateIcon.classList.add(`state-${stateName}`);
+      stateIcon.className = `ref-state state-${stateName}`;
       stateIcon.textContent = stateGlyph(stateName);
       stateIcon.title = stateTitle(stateName, cached);
-      li.appendChild(stateIcon);
+      row.appendChild(stateIcon);
 
       const badge = document.createElement("span");
       badge.className = `ref-badge type-${r.type}`;
       badge.textContent = r.type;
-      li.appendChild(badge);
+      row.appendChild(badge);
 
-      const meta = document.createElement("div");
-      meta.className = "ref-meta";
-      const label = document.createElement("div");
-      label.className = "ref-label";
-      label.textContent = r.label;
-      const file = document.createElement("div");
-      file.className = "ref-file";
-      file.textContent = r.file;
-      file.title = r.file;
-      meta.appendChild(label);
-      meta.appendChild(file);
-      li.appendChild(meta);
+      const labelEl = document.createElement("span");
+      labelEl.className = "ref-label";
+      labelEl.textContent = r.label;
+      labelEl.title = r.label;
+      row.appendChild(labelEl);
 
-      const idEl = document.createElement("span");
-      idEl.className = "ref-id";
-      idEl.textContent = r.id;
-      li.appendChild(idEl);
-
-      // Attach button — present on every row, enabled only when resolved
-      // (i.e. supported image we can find in the bound folder).
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "ref-attach ghost";
+      btn.className = "ref-attach";
       btn.textContent = "Attach";
       btn.dataset.refIndex = String(i);
       const canAttach = stateName === "resolved" && !!(cached && cached.fileObj);
@@ -452,27 +500,53 @@
         btn.title = `Attach ${cached.fileName} (${formatSize(cached.fileSize)}) to Gemini`;
       }
       btn.addEventListener("click", () => onAttach(i, btn));
-      li.appendChild(btn);
+      row.appendChild(btn);
 
-      // Optional one-line note for non-resolved rows so the user knows why.
-      if (stateName !== "resolved") {
-        const note = document.createElement("div");
-        note.className = "ref-state-note";
-        note.textContent = attachDisabledReason(stateName, cached);
-        li.appendChild(note);
+      li.appendChild(row);
+
+      const fileEl = document.createElement("div");
+      fileEl.className = "ref-file";
+      fileEl.textContent = r.file;
+      fileEl.title = r.file;
+      li.appendChild(fileEl);
+
+      const stateLine = document.createElement("div");
+      stateLine.className = `ref-state-line state-${stateName}`;
+      stateLine.textContent = stateLineLabel(stateName);
+      if (cached && cached.diagnostic) {
+        stateLine.title = JSON.stringify(cached.diagnostic, null, 2);
       }
+      li.appendChild(stateLine);
 
       referencesListEl.appendChild(li);
     }
+    updateFolderSummary(resolvedCount, rawRefs.length);
+  }
+
+  function updateFolderSummary(resolvedCount, totalCount) {
+    if (!folderHandle) {
+      folderBindingSummaryEl.textContent = "";
+      return;
+    }
+    if (totalCount === 0) {
+      folderBindingSummaryEl.textContent = "";
+      return;
+    }
+    folderBindingSummaryEl.textContent = `${resolvedCount} / ${totalCount} resolved`;
   }
 
   function stateGlyph(state) {
     switch (state) {
-      case "resolved": return "✓";
-      case "missing": return "✕";
-      case "unsupported": return "✕";
-      case "unbound": return "·";
-      default: return "?";
+      case "resolved":
+        return "✓";
+      case "missing":
+        return "✕";
+      case "unsupported":
+        return "✕";
+      case "unbound":
+        return "·";
+      default:
+        return "?";
     }
   }
 
@@ -481,13 +555,28 @@
       case "resolved":
         return `Resolved (${cached?.fileName ?? "image"})`;
       case "missing":
-        return `File not found at ${cached?.file ?? "(unknown path)"}`;
+        return `File not found at ${cached?.file ?? "(unknown path)"}. Expected: ${cached?.diagnostic?.expectedRelativePath ?? "(unknown)"}.`;
       case "unsupported":
         return `Unsupported file type (${cached?.fileType || "unknown"})`;
       case "unbound":
         return "Bind the project folder to enable attachment";
       default:
         return "Unknown state";
+    }
+  }
+
+  function stateLineLabel(state) {
+    switch (state) {
+      case "resolved":
+        return "Resolved";
+      case "missing":
+        return "Missing";
+      case "unsupported":
+        return "Unsupported";
+      case "unbound":
+        return "Bind folder to enable Attach";
+      default:
+        return "Unknown";
     }
   }
 
@@ -526,7 +615,7 @@
       return;
     }
     assetsPanelEl.hidden = false;
-    assetsSummaryEl.textContent = `Assets · ${assetCount}`;
+    assetsSummaryEl.textContent = String(assetCount);
     assetsListEl.innerHTML = "";
     const assets = proj.assets;
     for (const id of Object.keys(assets)) {
@@ -536,28 +625,22 @@
       const badge = document.createElement("span");
       badge.className = `ref-badge type-${a.type}`;
       badge.textContent = a.type;
-      const meta = document.createElement("div");
-      meta.className = "ref-meta";
-      const label = document.createElement("div");
+      const label = document.createElement("span");
       label.className = "ref-label";
       label.textContent = a.label;
-      const file = document.createElement("div");
+      label.title = a.label;
+      const file = document.createElement("span");
       file.className = "ref-file";
       file.textContent = a.file;
       file.title = a.file;
-      meta.appendChild(label);
-      meta.appendChild(file);
-      const idEl = document.createElement("span");
-      idEl.className = "ref-id";
-      idEl.textContent = id;
       li.appendChild(badge);
-      li.appendChild(meta);
-      li.appendChild(idEl);
+      li.appendChild(label);
+      li.appendChild(file);
       assetsListEl.appendChild(li);
     }
   }
 
-  // ----- persist ----------------------------------------------------------
+  // ----- persistence ------------------------------------------------------
 
   async function persistState() {
     try {
@@ -567,7 +650,6 @@
     }
   }
 
-  // Debounced save when user types in the prompt textarea.
   function schedulePromptSave() {
     if (promptSaveTimer) clearTimeout(promptSaveTimer);
     promptSaveTimer = setTimeout(async () => {
@@ -592,7 +674,6 @@
 
   function triggerImport() {
     if (state.source) {
-      // Confirm before replacing.
       showConfirmModal();
       return;
     }
@@ -626,7 +707,6 @@
       return;
     }
 
-    // Replace state. Existing progress is intentionally discarded.
     const project = projectLib.normalizeImportedProject(parsed.project);
     const newState = {
       schemaVersion: storageLib.STORAGE_SCHEMA_VERSION,
@@ -635,12 +715,15 @@
       currentTaskId: projectLib.firstTaskId(project),
     };
     state = newState;
-    // Re-importing discards the bound folder too — it may not match.
     folderHandle = null;
     folderName = "";
     resolvedRefsCache = null;
+    wrongRootInfo = null;
     await persistState();
-    setStatusLine("ok", `Imported "${project.project.name}" (${project.tasks.length} tasks). Bind a folder to attach images.`);
+    setStatusLine(
+      "ok",
+      `Imported "${project.project.name}" (${project.tasks.length} tasks). Bind a folder to attach images.`,
+    );
     render();
     refreshSelfTest();
   }
@@ -649,14 +732,10 @@
 
   async function navigate(taskId) {
     if (!taskId) return;
-    // Persist current prompt before leaving.
     const cur = currentMutable();
-    if (cur) {
-      cur.prompt = promptEl.value;
-    }
+    if (cur) cur.prompt = promptEl.value;
     state.currentTaskId = taskId;
     await persistState();
-    // Resolve the new task's refs (if a folder is bound) and re-render.
     await resolveCurrentRefs();
     render();
   }
@@ -685,14 +764,13 @@
 
   async function onInsert() {
     const text = promptEl.value;
-    popupLog(`Insert Prompt clicked (length=${text.length})`);
+    log(`Insert Prompt clicked (length=${text.length})`);
 
     if (!text.trim()) {
-      popupWarn("insert aborted: empty prompt");
+      warn("insert aborted: empty prompt");
       setStatusLine("error", "Failed to insert prompt: prompt is empty.");
       return;
     }
-    // Persist the latest edit before sending.
     const cur = currentMutable();
     if (cur && cur.prompt !== text) {
       cur.prompt = text;
@@ -706,14 +784,13 @@
     try {
       tab = await getActiveTab();
     } catch (e) {
-      popupWarn("insert aborted: no active tab", e.message);
+      warn("insert aborted: no active tab", e.message);
       setStatusLine("error", `Failed to insert prompt: ${e.message}`);
       setBusy(false);
       return;
     }
-
     if (!isGeminiUrl(tab.url)) {
-      popupWarn("insert aborted: not on gemini.google.com", tab.url);
+      warn("insert aborted: not on gemini.google.com", tab.url);
       setStatusLine("error", `Failed to insert prompt: open ${GEMINI_HOST}.`);
       setBusy(false);
       return;
@@ -726,7 +803,7 @@
       });
       if (result && result.ok) {
         const method = result.method ? ` via ${result.method}` : "";
-        popupLog(`inserted ${result.length} chars${method}`);
+        log(`inserted ${result.length} chars${method}`);
         setStatusLine(
           "ok",
           `Prompt inserted into Gemini (${result.length} chars${method}). Review and send.`,
@@ -739,12 +816,11 @@
             `${result.diagnostics.textboxRoleCount ?? 0} [role=textbox]]`
           : "";
         const reason = result?.error ?? "unknown error";
-        popupWarn(`insert failed: ${reason}${diag}`);
+        warn(`insert failed: ${reason}${diag}`);
         setStatusLine("error", `Failed to insert prompt: ${reason}${diag}`);
-        refreshSelfTest();
       }
     } catch (e) {
-      popupWarn("insert failed (exception)", e.message);
+      warn("insert failed (exception)", e.message);
       setStatusLine("error", `Failed to insert prompt: ${e.message}`);
     } finally {
       setBusy(false);
@@ -760,15 +836,16 @@
       return;
     }
     if (cached.state !== "resolved" || !cached.fileObj) {
-      setStatusLine("error", `Attachment failed: ${attachDisabledReason(cached.state, cached) || "asset unavailable"}.`);
+      setStatusLine(
+        "error",
+        `Attachment failed: ${attachDisabledReason(cached.state, cached) || "asset unavailable"}.`,
+      );
       return;
     }
     const file = cached.fileObj;
 
-    popupLog(`Attach clicked for ref #${refIndex} (${cached.id} → ${file.name}, ${file.size} B, ${file.type})`);
+    log(`Attach clicked for ref #${refIndex} (${cached.id} → ${file.name}, ${file.size} B, ${file.type})`);
 
-    // Verify we still have a live File handle. (Theoretically the user
-    // could have revoked permission between resolve and attach.)
     if (!folderHandle) {
       setStatusLine("error", "Attachment failed: Asset file is no longer available. Rebind the project folder.");
       return;
@@ -778,12 +855,12 @@
     try {
       tab = await getActiveTab();
     } catch (e) {
-      popupWarn("attach aborted: no active tab", e.message);
+      warn("attach aborted: no active tab", e.message);
       setStatusLine("error", `Attachment failed: ${e.message}`);
       return;
     }
     if (!isGeminiUrl(tab.url)) {
-      popupWarn("attach aborted: not on gemini.google.com", tab.url);
+      warn("attach aborted: not on gemini.google.com", tab.url);
       setStatusLine("error", `Attachment failed: open ${GEMINI_HOST} to attach images.`);
       return;
     }
@@ -794,10 +871,6 @@
     setStatusLine("info", `Attaching ${file.name}…`);
 
     try {
-      // The File is structured-cloneable (it is a Blob), so it survives
-      // the chrome.tabs.sendMessage boundary without base64 conversion.
-      // We do NOT persist bytes anywhere; the message envelope is
-      // ephemeral and goes from popup -> content script -> adapter.
       const result = await sendMessage(tab.id, {
         type: "GEMINI_ASSISTANT_ATTACH",
         file,
@@ -806,7 +879,7 @@
         fileSize: file.size,
       });
       if (result && result.ok) {
-        popupLog(`attached ${result.fileName ?? file.name} via ${result.method ?? "?"}`);
+        log(`attached ${result.fileName ?? file.name} via ${result.method ?? "?"}`);
         setStatusLine(
           "ok",
           `Attached ${result.fileName ?? file.name} (${formatSize(result.fileSize ?? file.size)}) to Gemini. Review and send.`,
@@ -816,16 +889,16 @@
         const diag = result?.diagnostics
           ? ` [inputs=${result.diagnostics.fileInputCount ?? 0}, ` +
             `accept=${result.diagnostics.fileInputAccept ?? "?"}, ` +
-            `multiple=${result.diagnostics.fileInputMultiple ?? "?"}]`
+            `multiple=${result.diagnostics.fileInputMultiple ?? "?"}, ` +
+            `dynamic=${result.diagnostics.inputLikelyDynamic ?? "?"}]`
           : "";
-        popupWarn(`attach failed: ${reason}${diag}`);
+        warn(`attach failed: ${reason}${diag}`);
         setStatusLine("error", `Attachment failed: ${reason}${diag}`);
       }
     } catch (e) {
-      popupWarn("attach failed (exception)", e?.message ?? String(e));
+      warn("attach failed (exception)", e?.message ?? String(e));
       setStatusLine("error", `Attachment failed: ${e?.message ?? "unknown error"}`);
     } finally {
-      // Re-enable the button only if the ref is still attachable.
       const stillResolved =
         resolvedRefsCache &&
         resolvedRefsCache[refIndex] &&
@@ -833,8 +906,36 @@
         resolvedRefsCache[refIndex].fileObj;
       btn.disabled = !stillResolved;
       btn.textContent = originalLabel;
-      refreshSelfTest();
     }
+  }
+
+  // ----- attachment diagnostics -------------------------------------------
+
+  function renderAttachmentDiagnostics(probe) {
+    if (!probe) {
+      attachmentSummaryEl.textContent = "";
+      attachmentDiagnosticsEl.innerHTML = "";
+      return;
+    }
+    const items = [
+      ["Trigger", probe.triggerFound ? "✓ found" : "✗ not found"],
+      ["Input mounted", probe.fileInputCount > 0 ? `✓ ${probe.fileInputCount}` : "○ no file input currently mounted"],
+      ["Menu open", probe.menuOrPopoverOpen ? "✓ yes" : "○ closed"],
+      ["Attachment area", probe.attachmentAreaFound ? "✓ found" : "✗ not found"],
+      ["Current hints", String(probe.currentHints)],
+      ["Likely dynamic", probe.inputLikelyDynamic ? "yes" : "no"],
+    ];
+    attachmentSummaryEl.textContent = probe.triggerFound
+      ? probe.fileInputCount > 0
+        ? "ready"
+        : "menu closed"
+      : "no trigger";
+    attachmentDiagnosticsEl.innerHTML = items
+      .map(([label, value]) => {
+        const cls = value.startsWith("✓") ? "ok" : value.startsWith("✗") || value.startsWith("Likely dynamic: yes") ? "warn" : "";
+        return `<dt>${label}</dt><dd class="${cls}">${value}</dd>`;
+      })
+      .join("");
   }
 
   async function refreshSelfTest() {
@@ -844,9 +945,41 @@
       const res = await sendMessage(tab.id, { type: "GEMINI_ASSISTANT_PING" });
       if (res && res.ok && res.selfTest) {
         selfTestEl.textContent = JSON.stringify(res.selfTest, null, 2);
+        renderAttachmentDiagnostics(res.selfTest.attachment);
       }
     } catch {
       // non-fatal
+    }
+  }
+
+  async function probeAttachment() {
+    setStatusLine("info", "Probing attachment state in Gemini…");
+    let tab;
+    try {
+      tab = await getActiveTab();
+    } catch (e) {
+      setStatusLine("error", `Probe failed: ${e.message}`);
+      return;
+    }
+    if (!isGeminiUrl(tab.url)) {
+      setStatusLine("error", `Probe failed: open ${GEMINI_HOST} first.`);
+      return;
+    }
+    try {
+      const probe = await sendMessage(tab.id, { type: "GEMINI_ASSISTANT_ATTACH_PROBE" });
+      if (probe && probe.ok) {
+        renderAttachmentDiagnostics(probe.probe);
+        setStatusLine(
+          probe.activated ? "ok" : "info",
+          probe.activated
+            ? "Attachment menu opened. (No file was attached — this is a diagnostic.)"
+            : "Probe complete. See the Attachment section for the current state.",
+        );
+      } else {
+        setStatusLine("error", `Probe failed: ${probe?.error ?? "unknown error"}`);
+      }
+    } catch (e) {
+      setStatusLine("error", `Probe failed: ${e?.message ?? "unknown error"}`);
     }
   }
 
@@ -854,10 +987,10 @@
 
   importBtn.addEventListener("click", triggerImport);
   reimportBtn.addEventListener("click", triggerImport);
+  wrongRootRebindBtn.addEventListener("click", bindFolder);
 
   fileInput.addEventListener("change", async () => {
     const file = fileInput.files && fileInput.files[0];
-    // reset so the same file can be selected again later
     fileInput.value = "";
     await handleFileSelected(file);
   });
@@ -872,19 +1005,12 @@
 
   taskSelectEl.addEventListener("change", (e) => navigate(e.target.value));
   statusSelectEl.addEventListener("change", (e) => onChangeStatus(e.target.value));
-
   prevBtn.addEventListener("click", goPrev);
   nextBtn.addEventListener("click", goNext);
-
   insertBtn.addEventListener("click", onInsert);
+  probeAttachmentBtn.addEventListener("click", probeAttachment);
 
-  promptEl.addEventListener("input", () => {
-    // Update prev/next enabled state — none of these depend on prompt.
-    // Just schedule a debounced save.
-    schedulePromptSave();
-  });
-
-  // Cmd/Ctrl + Enter inserts; arrows navigate
+  promptEl.addEventListener("input", schedulePromptSave);
   promptEl.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
@@ -909,13 +1035,12 @@
     }
     render();
 
-    // Always try to populate the self-test panel for the dev/DevTools audience.
-    refreshSelfTest();
-
-    // Friendly hint if user is not on Gemini.
+    // Probe attachment state on load if we are on Gemini.
     try {
       const tab = await getActiveTab();
-      if (!isGeminiUrl(tab.url)) {
+      if (isGeminiUrl(tab.url)) {
+        refreshSelfTest();
+      } else {
         setStatusLine(
           "info",
           `Open ${GEMINI_HOST} to use Insert / Attach. Project manager works everywhere.`,

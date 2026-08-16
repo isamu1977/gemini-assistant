@@ -17,7 +17,7 @@ import sys
 from playwright.sync_api import sync_playwright
 
 EXT_PATH = "/Users/isamumatsuyama/Documents/development/gemini-assistant"
-POPUP = f"file://{EXT_PATH}/src/popup/popup.html"
+POPUP = f"file://{EXT_PATH}/src/sidepanel/sidepanel.html"
 
 # Mock of chrome.* APIs the popup relies on. Persists via localStorage so
 # reloads (which reset the in-memory map) still see the prior writes.
