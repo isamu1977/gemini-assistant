@@ -32,6 +32,36 @@
     ".webp",
   ]);
 
+  /**
+   * Compute a hex SHA-256 digest from an ArrayBuffer or Uint8Array.
+   * Safe across Browser (crypto.subtle) and Node.js environments.
+   */
+  async function computeSha256(buffer) {
+    if (!buffer) return "";
+    try {
+      if (typeof crypto !== "undefined" && crypto.subtle && typeof crypto.subtle.digest === "function") {
+        const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+        const hashArray = Array.from(new Uint8Array(hashBuffer));
+        return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+    } catch (_) {}
+    try {
+      // Node.js fallback
+      if (typeof require === "function") {
+        const nodeCrypto = require("crypto");
+        return nodeCrypto.createHash("sha256").update(Buffer.from(buffer)).digest("hex");
+      }
+    } catch (_) {}
+    // FNV-1a 32-bit fallback
+    let hash = 2166136261;
+    const view = new Uint8Array(buffer);
+    for (let i = 0; i < view.length; i++) {
+      hash ^= view[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return "fnv:" + (hash >>> 0).toString(16);
+  }
+
   function isPlainObject(v) {
     return v !== null && typeof v === "object" && !Array.isArray(v);
   }
@@ -343,6 +373,7 @@
   const api = Object.freeze({
     SUPPORTED_IMAGE_MIME,
     SUPPORTED_IMAGE_EXTENSIONS,
+    computeSha256,
     normalizeRelativePath,
     fileExtension,
     isSupportedImage,

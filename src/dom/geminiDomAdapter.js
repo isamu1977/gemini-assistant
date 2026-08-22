@@ -69,11 +69,16 @@
     "Upload and tools",
     "Upload",
     "Add files and tools",
+    "Envio e ferramentas",
+    "Envio de arquivos e ferramentas",
+    "Envio de ficheiros e ferramentas",
     "Carregar e ferramentas",
     "Cargar y herramientas",
     "Téléverser et outils",
     "Hochladen und Tools",
     "アップロードとツール",
+    "アップロード",
+    "ツールとアップロード",
     "업로드 및 도구",
     "上传和工具",
   ];
@@ -85,10 +90,12 @@
   const CREATE_IMAGE_TEXT_CANDIDATES = [
     "Create image",
     "Criar imagem",
+    "Criar imagens",
     "Créer une image",
     "Crear imagen",
     "Immagine erstellen",
     "画像を作成",
+    "画像生成",
     "이미지 만들기",
     "创建图片",
     "Tạo hình ảnh",
@@ -126,6 +133,14 @@
     "画像を選択中",
     "이미지 선택됨",
     "已选择图片",
+    "Remover",
+    "Remover Criar imagem",
+    "Desmarcar",
+    "Desmarcar imagem",
+    "Fechar",
+    "Fechar modo de imagem",
+    "Remove",
+    "Remove image creation",
   ];
 
   // Labels for the menuitemcheckbox "Create image" toggle inside the menu.
@@ -173,8 +188,30 @@
     return true;
   }
 
+  function getElementClassText(el) {
+    if (!el) return "";
+
+    if (typeof el.className === "string") {
+      return el.className;
+    }
+
+    if (typeof el.className?.baseVal === "string") {
+      return el.className.baseVal;
+    }
+
+    if (typeof el.getAttribute === "function") {
+      return el.getAttribute("class") || "";
+    }
+
+    if (Array.isArray(el._classes)) {
+      return el._classes.join(" ");
+    }
+
+    return "";
+  }
+
   function isNegativeCandidate(el) {
-    const cls = (el.className && el.className.toString()) || "";
+    const cls = getElementClassText(el);
     return NEGATIVE_CLASS_HINTS.some((hint) => cls.includes(hint));
   }
 
@@ -283,7 +320,7 @@
     if (!el) return null;
     return {
       tag: el.tagName?.toLowerCase(),
-      classes: (el.className || "").toString().substring(0, 120),
+      classes: getElementClassText(el).substring(0, 120),
       ariaLabel: el.getAttribute("aria-label"),
       role: el.getAttribute("role"),
       contenteditable: el.getAttribute("contenteditable"),
@@ -373,8 +410,13 @@
    * structural detection (icon name `plus` inside the input-area-v2).
    */
   function findPlusButton() {
+    // 1. Structural: use findAttachmentTrigger()
+    const trigger = findAttachmentTrigger();
+    if (trigger) return trigger;
+
+    // 2. Aria-label candidates
     const buttons = Array.from(
-      document.querySelectorAll("button[aria-label], gem-button[aria-label]"),
+      document.querySelectorAll("button[aria-label], gem-button[aria-label], [role='button'][aria-label]"),
     );
     for (const b of buttons) {
       const label = (b.getAttribute("aria-label") || "").toLowerCase();
@@ -382,55 +424,80 @@
         return b;
       }
     }
-    const area = document.querySelector("input-area-v2");
+    const area = findPromptInputArea() || document.querySelector("input-area-v2");
     if (area) {
-      const candidates = Array.from(area.querySelectorAll("button, gem-button"));
+      const candidates = Array.from(area.querySelectorAll("button, gem-button, [role='button']"));
       for (const b of candidates) {
+        if (b.getAttribute && (b.getAttribute("aria-haspopup") || b.getAttribute("aria-controls"))) {
+          return b;
+        }
         const img = b.querySelector("img");
-        if (!img) continue;
-        const alt = (img.getAttribute("alt") || img.textContent || "").toLowerCase();
-        if (alt === "plus" || alt.includes("plus")) return b;
+        if (img) {
+          const alt = (img.getAttribute("alt") || img.textContent || "").toLowerCase();
+          if (alt === "plus" || alt.includes("plus") || alt.includes("add")) return b;
+        }
+        const icon = b.querySelector("mat-icon, [class*='material-symbols'], [class*='mat-icon'], i");
+        if (icon) {
+          const name = (icon.getAttribute("fontset") || icon.getAttribute("data-mat-icon-name") || icon.textContent || "").toLowerCase();
+          if (name === "add" || name === "plus" || name.includes("add") || name.includes("plus")) return b;
+        }
       }
     }
     return null;
   }
 
   /**
-   * Find the menuitemcheckbox matching "Create image" inside the + menu.
-   * Accepts text match OR icon-name match. Returns the best candidate or
-   * null. We never throw.
+   * Find the menuitem / button matching "Create image" inside the + menu.
+   * Accepts text match OR icon-name match across all menu containers and overlays.
    */
   function findCreateImageMenuitem() {
-    const items = Array.from(document.querySelectorAll('[role="menuitemcheckbox"]'));
-    const area = document.querySelector("input-area-v2");
-    const candidates = items.filter((i) => {
-      const r = i.getBoundingClientRect();
-      if (!(r.width > 0 && r.height > 0)) return false;
-      if (area) {
-        const ar = area.getBoundingClientRect();
-        const dx = Math.abs(r.left + r.width / 2 - (ar.left + ar.width / 2));
-        const dy = Math.abs(r.top + r.height / 2 - (ar.top + ar.height / 2));
-        if (dx > 600 || dy > 600) return false;
-      }
-      return true;
+    const items = Array.from(
+      document.querySelectorAll(
+        '[role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"], button.mat-mdc-menu-item, mat-menu-item, .cdk-overlay-container button, .cdk-overlay-pane [role="menuitem"], [popover] button',
+      ),
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
     });
 
     let best = null;
     let bestScore = 0;
-    for (const el of candidates) {
+    for (const el of items) {
       const text = (el.textContent || "").trim().toLowerCase();
-      const img = el.querySelector("img");
-      const alt = img ? (img.getAttribute("alt") || "").toLowerCase() : "";
+      const aria = (el.getAttribute("aria-label") || "").toLowerCase();
+      const iconEl = el.querySelector("img, mat-icon, [class*='material-symbols'], [class*='icon'], svg");
+      const iconAlt = iconEl
+        ? (iconEl.getAttribute("alt") || iconEl.getAttribute("data-mat-icon-name") || iconEl.textContent || "").toLowerCase().trim()
+        : "";
+
       let score = 0;
-      if (CREATE_IMAGE_TEXT_CANDIDATES.some((c) => c.toLowerCase() === text)) score += 50;
-      if (CREATE_IMAGE_TEXT_CANDIDATES.some((c) => text.includes(c.toLowerCase()))) score += 30;
-      if (alt === "image_create" || alt.includes("image_create")) score += 40;
+      for (const c of CREATE_IMAGE_TEXT_CANDIDATES) {
+        const cLower = c.toLowerCase();
+        if (text === cLower || aria === cLower) score += 60;
+        else if (text.includes(cLower) || aria.includes(cLower)) score += 40;
+      }
+
+      if (
+        iconAlt === "image_create" ||
+        iconAlt.includes("image_create") ||
+        iconAlt === "photo_spark" ||
+        iconAlt.includes("photo_spark")
+      ) {
+        score += 50;
+      } else if (iconAlt.includes("image") || iconAlt.includes("palette") || iconAlt.includes("photo")) {
+        score += 20;
+      }
+
+      if (el.closest && el.closest(".cdk-overlay-container, mat-menu-panel, [role='menu']")) {
+        score += 15;
+      }
+
       if (score > bestScore) {
         best = el;
         bestScore = score;
       }
     }
-    return best;
+    return bestScore >= 30 ? best : null;
   }
 
   /**
@@ -444,33 +511,41 @@
       (tb && tb.getAttribute("aria-placeholder")) ||
       (tb && tb.getAttribute("placeholder")) ||
       (tb && tb.getAttribute("data-placeholder")) ||
+      document.querySelector("rich-textarea")?.getAttribute("data-placeholder") ||
+      document.querySelector("rich-textarea")?.getAttribute("placeholder") ||
+      document.querySelector(".ql-editor")?.getAttribute("data-placeholder") ||
       null;
     const composerTextSample = tb ? (tb.textContent || "").trim().slice(0, 80) : null;
-    const area = document.querySelector("input-area-v2");
+    const area = findPromptInputArea() || document.querySelector("input-area-v2");
+
+    const activeChip = area
+      ? Array.from(area.querySelectorAll("mat-chip, gem-chip, [class*='chip'], [class*='pill'], [class*='tag'], [class*='mode']")).find((c) => {
+          const t = (c.textContent || "").toLowerCase();
+          return CREATE_IMAGE_TEXT_CANDIDATES.some((cand) => t.includes(cand.toLowerCase())) ||
+                 /image_create|photo_spark|criar imagem|create image/i.test(t);
+        })
+      : null;
+
     const createHeader = area
-      ? Array.from(area.querySelectorAll("h1, h2, h3")).find((h) =>
-          /create images?|create with/i.test(h.textContent || ""),
+      ? Array.from(area.querySelectorAll("h1, h2, h3, div, span")).find((h) =>
+          /create images?|create with|criar imagem|crie imagens/i.test(h.textContent || ""),
         )
       : null;
+
+    const isPlaceholderActive = placeholder && (
+      /describe (your|an|the|uma|une|una|ein) image|describe uma imagem|descreva (a|sua|uma|sue?s?) imagem|作成したい画像|画像の説明/i.test(placeholder)
+    );
 
     return {
       probeAt: new Date().toISOString(),
       deselectImagesToggleFound: !!deselect,
       textboxPlaceholder: placeholder,
       composerTextSample,
-      createImagesHeaderFound: !!createHeader,
+      createImagesHeaderFound: !!createHeader || !!activeChip,
       imageModeActive:
         !!deselect ||
-        (placeholder &&
-          /describe (your|uma|une|una|ein) image|describe uma imagem|descreva sua imagem/i.test(
-            placeholder,
-          )) ||
-        !!createHeader ||
-        // Fallback: PT-BR composer placeholder "Descreva sua imagem…"
-        (placeholder &&
-          /descreva (sua|sue?s?) imagem/i.test(placeholder)) ||
-        // Generic structural fallback: any placeholder containing "image"
-        // when the composer is empty AND the createImagesHeader is found.
+        !!activeChip ||
+        !!isPlaceholderActive ||
         false,
     };
   }
@@ -724,7 +799,7 @@
 
     return {
       probeAt: new Date().toISOString(),
-      url: location.href,
+      url: typeof location !== "undefined" ? location.href : "",
       triggerFound: !!trigger,
       triggerDescriptor: describeTrigger(trigger),
       fileInputCount: inputs.length,
@@ -770,6 +845,9 @@
       "media",
       "imagen",
       "video",
+      "envio",
+      "ferramentas",
+      "adicionar",
       "carregar",
       "adjuntar",
       "archivo",
@@ -814,7 +892,7 @@
       tag: el.tagName?.toLowerCase() ?? null,
       ariaLabel: el.getAttribute("aria-label") ?? null,
       ariaHasPopup: el.getAttribute("aria-haspopup") ?? null,
-      classHint: (el.className || "").toString().slice(0, 80),
+      classHint: getElementClassText(el).slice(0, 80),
     };
   }
 
@@ -924,43 +1002,113 @@
    * OR aria-label (the menuitem's aria-label is the most stable; the
    * visible text is the fallback).
    */
-  function findUploadFilesMenuitem() {
-    const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
-    // Prefer the one closest to the composer.
-    const area = document.querySelector("input-area-v2");
-    const candidates = items.filter((i) => {
-      const r = i.getBoundingClientRect();
-      if (!(r.width > 0 && r.height > 0)) return false;
-      if (area) {
-        const ar = area.getBoundingClientRect();
-        const dx = Math.abs(r.left + r.width / 2 - (ar.left + ar.width / 2));
-        const dy = Math.abs(r.top + r.height / 2 - (ar.top + ar.height / 2));
-        if (dx > 600 || dy > 600) return false;
+  function dispatchPasteImage(target, file) {
+    if (!target || !file) return false;
+    try {
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(file);
+      if (typeof target.focus === "function") {
+        target.focus();
       }
+      try {
+        target.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+        target.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+        target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      } catch (_) {}
+
+      const pasteEvent = new ClipboardEvent("paste", {
+        clipboardData: dataTransfer,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      });
+
+      try {
+        Object.defineProperty(pasteEvent, "clipboardData", {
+          value: dataTransfer,
+          configurable: true,
+        });
+      } catch (_) {}
+
+      target.dispatchEvent(pasteEvent);
       return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function dispatchDragAndDrop(target, file) {
+    if (!target || !file) return false;
+    try {
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(file);
+      dataTransfer.dropEffect = "copy";
+      dataTransfer.effectAllowed = "all";
+
+      const rect = typeof target.getBoundingClientRect === "function"
+        ? target.getBoundingClientRect()
+        : { left: 100, top: 100, width: 200, height: 50 };
+      const clientX = (rect.left || 0) + (rect.width || 20) / 2;
+      const clientY = (rect.top || 0) + (rect.height || 20) / 2;
+
+      const init = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        dataTransfer,
+        clientX,
+        clientY,
+        screenX: clientX,
+        screenY: clientY,
+      };
+
+      const dragEnter = new DragEvent("dragenter", init);
+      const dragOver = new DragEvent("dragover", init);
+      const drop = new DragEvent("drop", init);
+
+      try {
+        Object.defineProperty(drop, "dataTransfer", { value: dataTransfer, configurable: true });
+      } catch (_) {}
+
+      target.dispatchEvent(dragEnter);
+      target.dispatchEvent(dragOver);
+      target.dispatchEvent(drop);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Find the "Upload files" item inside the + menu.
+   * Leverages findUploadFilesInOverlay() across all CDK overlays.
+   */
+  function findUploadFilesMenuitem() {
+    const probe = findUploadFilesInOverlay();
+    if (probe && probe.ok && probe.el) {
+      return probe.el;
+    }
+    const items = Array.from(
+      document.querySelectorAll(
+        '[role="menuitem"], [role="menuitemcheckbox"], button.mat-mdc-menu-item, mat-menu-item, .cdk-overlay-container button, .cdk-overlay-pane [role="menuitem"]',
+      ),
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
     });
-    // Score: aria-label is most stable.
+
     let best = null;
     let bestScore = 0;
-    for (const el of candidates) {
-      const label = (el.getAttribute("aria-label") || "").toLowerCase();
-      const text = (el.textContent || "").trim().toLowerCase();
-      const img = el.querySelector("img");
-      const alt = img ? (img.getAttribute("alt") || "").toLowerCase() : "";
-      let score = 0;
-      if (/^upload files?\.?$/i.test(label)) score += 60;
-      if (/^upload files?\.?$/i.test(text)) score += 50;
-      // Locale-aware text fallback for "Upload files" (PT: "Enviar arquivos").
-      if (UPLOAD_FILES_TEXT_CANDIDATES.some((c) => text === c.toLowerCase())) score += 45;
-      if (UPLOAD_FILES_TEXT_CANDIDATES.some((c) => text.includes(c.toLowerCase()) && c.length >= 6)) score += 25;
-      if (/upload/i.test(label) && /file|document/i.test(label)) score += 30;
-      if (alt === "attach_file" || alt.includes("attach_file")) score += 40;
+    for (const el of items) {
+      const desc = describeMenuItem(el);
+      if (!desc) continue;
+      const score = scoreUploadCandidate(el, desc);
       if (score > bestScore) {
         best = el;
         bestScore = score;
       }
     }
-    return best;
+    return bestScore > 0 ? best : null;
   }
 
   /**
@@ -990,7 +1138,6 @@
       if (isAttachmentMenuOpen()) {
         return { ok: true, reason: "opened" };
       }
-      // Fallback signal: file input appeared.
       if (findFileInputs().length > 0) {
         return { ok: true, reason: "input-mounted" };
       }
@@ -1004,21 +1151,164 @@
   }
 
   /**
-   * Public API (v0.6): attach a File to the Gemini composer by:
-   *   1. Opening the + menu (if not already open).
-   *   2. Clicking "Upload files" to ensure a <input type="file"> is
-   *      mounted by Gemini's component.
-   *   3. Injecting the File via DataTransfer + change/input events.
-   *   4. Waiting for the chip to appear in the composer with the
-   *      expected filename.
+   * Count attachments currently in the composer (gem-media-attachment
+   * or blob thumbnails inside composer container / card).
    *
-   * The function is idempotent in the sense that it reuses the menu /
-   * input that is already there. It does NOT remove pre-existing
-   * attachments.
-   *
-   * @param {File} file
-   * @param {{ onProgress?: (phase: string, info?: object) => void, timeoutMs?: number }} [opts]
-   * @returns {Promise<{ ok, error?, method?, fileName?, fileType?, fileSize?, elapsedMs?, diagnostics? }>}
+   * Must strictly count individual attachment items and NEVER count
+   * internal descendant elements multiple times, nor count images in conversation history.
+   */
+  function countComposerAttachments(area) {
+    const rootsToTry = [];
+    if (area) rootsToTry.push(area);
+    const inputArea = findPromptInputArea();
+    if (inputArea && !rootsToTry.includes(inputArea)) rootsToTry.push(inputArea);
+
+    const tb = findPromptInput();
+    if (tb) {
+      let p = tb.parentElement;
+      while (p && p !== document.body) {
+        if (!rootsToTry.includes(p)) rootsToTry.push(p);
+        p = p.parentElement;
+      }
+    }
+    if (!rootsToTry.includes(document)) rootsToTry.push(document);
+
+    for (const root of rootsToTry) {
+      if (!root || typeof root.querySelectorAll !== "function") continue;
+
+      // 1. Primary: dedicated Gemini media attachment elements
+      const gemAttachments = root.querySelectorAll("gem-media-attachment");
+      if (gemAttachments && gemAttachments.length > 0) {
+        const valid = Array.from(gemAttachments).filter((el) => {
+          return !el.closest?.("model-response, user-query, message-content, [data-test-id*='chat-history']");
+        });
+        if (valid.length > 0) return valid.length;
+      }
+
+      // 2. Secondary: mat-chips or specific attachment chips inside composer
+      const chips = root.querySelectorAll("mat-chip, [data-test-id*='media-attachment'], [data-test-id*='attachment-chip'], .attachment-chip");
+      if (chips && chips.length > 0) {
+        const valid = Array.from(chips).filter((el) => {
+          return !el.closest?.("model-response, user-query, message-content, [data-test-id*='chat-history'], mat-sidenav, nav, header");
+        });
+        if (valid.length > 0) return valid.length;
+      }
+
+      // 3. Fallback: attachment containers inside composer
+      const containers = root.querySelectorAll(".attachment-container > *");
+      if (containers && containers.length > 0) {
+        const valid = Array.from(containers).filter((el) => {
+          return !el.closest?.("model-response, user-query, message-content, [data-test-id*='chat-history'], mat-sidenav, nav, header");
+        });
+        if (valid.length > 0) return valid.length;
+      }
+
+      // 4. Fallback: blob/data image thumbnails strictly outside chat history and sidebars
+      const imgs = root.querySelectorAll("img[src^='blob:'], img[src^='data:image/']");
+      if (imgs && imgs.length > 0) {
+        const validThumbs = Array.from(imgs).filter((img) => {
+          const src = (img.getAttribute?.("src") || img.src || "").toLowerCase();
+          const isIconOrAvatar = src.includes("avatar") || src.includes("favicon") || src.includes("logo") || src.includes("sparkle");
+          const inHistory = !!img.closest?.("model-response, user-query, message-content, [data-test-id*='chat-history'], mat-sidenav, nav, header, aside");
+          return !isIconOrAvatar && !inHistory;
+        });
+        if (validThumbs.length > 0) return validThumbs.length;
+      }
+    }
+
+    return 0;
+  }
+
+  /**
+   * Count uploads currently in active progress inside the composer.
+   * Only returns > 0 if there is visible, active uploading UI (indeterminate spinner/bar)
+   * that has NOT reached completion (100% / hidden) and has not produced a loaded thumbnail.
+   */
+  function countActiveUploads(area) {
+    const rootsToTry = [];
+    if (area) rootsToTry.push(area);
+    const inputArea = findPromptInputArea();
+    if (inputArea && !rootsToTry.includes(inputArea)) rootsToTry.push(inputArea);
+    const tb = findPromptInput();
+    if (tb) {
+      let p = tb.parentElement;
+      while (p && p !== document.body) {
+        if (!rootsToTry.includes(p)) rootsToTry.push(p);
+        p = p.parentElement;
+      }
+    }
+    if (!rootsToTry.includes(document)) rootsToTry.push(document);
+
+    for (const root of rootsToTry) {
+      if (!root || typeof root.querySelectorAll !== "function") continue;
+
+      let chips = root.querySelectorAll("gem-media-attachment, .attachment-chip, mat-chip");
+      if (!chips || chips.length === 0) {
+        chips = root.querySelectorAll("img[src^='blob:']");
+      }
+      if (!chips || chips.length === 0) continue;
+
+      const validChips = Array.from(chips).filter((el) => {
+        return !el.closest?.("model-response, user-query, message-content, [data-test-id*='chat-history'], mat-sidenav, nav, header");
+      });
+      if (validChips.length === 0) continue;
+
+      let activeCount = 0;
+      for (const chip of validChips) {
+        const img = chip.tagName?.toLowerCase() === "img" ? chip : chip.querySelector("img");
+        const hasLoadedImg = img && (img.src || img.getAttribute?.("src")) && (img.naturalWidth > 0 || img.complete);
+
+        const allDescendants = chip.querySelectorAll ? Array.from(chip.querySelectorAll("*")) : [];
+        let chipIsUploading = false;
+
+        for (const sp of allDescendants) {
+          const tag = (sp.tagName || "").toLowerCase();
+          const role = (sp.getAttribute?.("role") || "").toLowerCase();
+          const mode = (sp.getAttribute?.("mode") || "").toLowerCase();
+          const cls = getElementClassText(sp).toLowerCase();
+
+          const isSpinnerOrBar =
+            tag.includes("progress") ||
+            tag.includes("spinner") ||
+            role === "progressbar" ||
+            cls.includes("progress") ||
+            cls.includes("spinner") ||
+            cls.includes("loading") ||
+            cls.includes("uploading");
+
+          if (!isSpinnerOrBar) continue;
+
+          if (sp.getAttribute?.("aria-hidden") === "true") continue;
+          if (sp.style && (sp.style.display === "none" || sp.style.visibility === "hidden" || sp.style.opacity === "0")) continue;
+          
+          const val = sp.getAttribute?.("aria-valuenow");
+          if (val === "100") continue;
+
+          if (mode === "indeterminate" || cls.includes("indeterminate") || cls.includes("uploading") || cls.includes("loading") || cls.includes("spinner") || !val) {
+            if (!hasLoadedImg) {
+              chipIsUploading = true;
+              break;
+            }
+          }
+        }
+
+        if (chipIsUploading) {
+          activeCount++;
+        }
+      }
+
+      return activeCount;
+    }
+
+    return 0;
+  }
+
+  /**
+   * Public API (v0.6): attach a File to the Gemini composer by trying:
+   *   1. Direct Clipboard paste onto the editor (.ql-editor).
+   *   2. Enhanced HTML5 Drag & Drop on the editor / container.
+   *   3. Opening the + menu, activating dynamic file input, and assigning via DataTransfer.
+   *   4. Waiting for real visual attachment evidence (chip / thumbnail delta).
    */
   async function attachFileWithMenu(file, opts) {
     const startedAt = Date.now();
@@ -1035,301 +1325,176 @@
     }
     emit("start", { fileName: file.name, size: file.size, type: file.type });
 
-    // 1. Ensure the menu is open.
-    const openRes = await openAttachmentMenu();
-    if (!openRes.ok) {
-      return { ok: false, error: openRes.error, phase: "open-menu" };
-    }
-    emit("menu-open", { reason: openRes.reason });
+    const editorTarget = findPromptInput() || document.querySelector(".ql-editor") || document.querySelector("div[role='textbox']");
+    const area = findPromptInputArea() || document.querySelector("input-area-v2") || document.body;
+    const chipsBefore = countComposerAttachments(area);
+    // Capture the upload queue size BEFORE we dispatch anything. This lets
+    // us confirm our strategy caused a NEW upload (signalsAfter.pendingUploads
+    // > pendingUploadsBefore) instead of inheriting an in-flight upload from
+    // a previous step. Without this guard, attachFileWithMenu could
+    // mistakenly "succeed" on Strategy 1 because of a stale upload and
+    // then the orchestrator would skip the rest of the flow — but more
+    // dangerously, the inverse: if Gemini rejects the paste silently
+    // (pendingUploads unchanged) but waitForAttachmentEvidence still
+    // returns ok=true from the chip-render check on a pre-existing chip,
+    // we'd report success and Gemini would never see our file.
+    const pendingUploadsBefore = countActiveUploads(area);
 
-    // 2. Make sure a file input is mounted. Some Gemini builds keep the
-    //    input mounted after first open; others re-mount per click.
-    let inputs = findFileInputs();
-    if (inputs.length === 0) {
-      const uploadItem = findUploadFilesMenuitem();
-      if (!uploadItem) {
+    // -------------------------------------------------------------
+    // Strategy 1: Paste Event onto Editor (.ql-editor)
+    // -------------------------------------------------------------
+    if (editorTarget) {
+      emit("try-paste", { target: editorTarget.tagName });
+      dispatchPasteImage(editorTarget, file);
+      const pasteResult = await waitForAttachmentEvidence(chipsBefore, 2500);
+      // Defense in depth: require that the strategy actually increased
+      // the upload queue OR produced a chip/thumbnail. This prevents
+      // falling through to Strategy 2 and dispatching the same file a
+      // second time via drag/drop.
+      if (
+        pasteResult.ok &&
+        ((pasteResult.signalsAfter?.pendingUploads ?? 0) > pendingUploadsBefore ||
+          (pasteResult.signalsAfter?.chips ?? 0) > chipsBefore ||
+          (pasteResult.signalsAfter?.thumbnails ?? 0) > 0)
+      ) {
+        emit("attached", { method: "clipboard_paste", signalsAfter: pasteResult.signalsAfter });
         return {
-          ok: false,
-          error: "Could not find 'Upload files' in the + menu.",
-          phase: "find-upload-item",
+          ok: true,
+          method: "clipboard_paste",
+          fileName: file.name,
+          fileType: file.type,
+          fileSize: file.size,
+          chipVisibleAt: pasteResult.chipVisibleAt || Date.now(),
+          uploadCompleteAt: pasteResult.uploadCompleteAt || Date.now(),
+          elapsedMs: Date.now() - startedAt,
+          diagnostics: { chipsBefore, evidence: pasteResult.evidence },
         };
       }
+    }
+
+    // -------------------------------------------------------------
+    // Strategy 2: Enhanced Drag & Drop on Editor and Area
+    // -------------------------------------------------------------
+    const dropTargets = [editorTarget, area, document.querySelector("rich-textarea"), document.body].filter(Boolean);
+    for (const dt of dropTargets) {
+      emit("try-drag-drop", { target: dt.tagName });
+      dispatchDragAndDrop(dt, file);
+      const dropResult = await waitForAttachmentEvidence(chipsBefore, 1000);
+      if (dropResult.ok) {
+        emit("attached", { method: "drag_and_drop", signalsAfter: dropResult.signalsAfter });
+        return {
+          ok: true,
+          method: "drag_and_drop",
+          fileName: file.name,
+          fileType: file.type,
+          fileSize: file.size,
+          chipVisibleAt: dropResult.chipVisibleAt || Date.now(),
+          uploadCompleteAt: dropResult.uploadCompleteAt || Date.now(),
+          elapsedMs: Date.now() - startedAt,
+          diagnostics: { chipsBefore, evidence: dropResult.evidence },
+        };
+      }
+    }
+
+    // -------------------------------------------------------------
+    // Strategy 3: Menu Open + Dynamic Input Injection
+    // -------------------------------------------------------------
+    const openRes = await openAttachmentMenu();
+    emit("menu-open", { reason: openRes.reason || (openRes.ok ? "opened" : "failed") });
+
+    let inputs = findFileInputs();
+    if (inputs.length === 0 && openRes.ok) {
+      const uploadItem = findUploadFilesMenuitem();
+      if (uploadItem) {
+        try {
+          uploadItem.click();
+        } catch (e) {
+          log("Click on Upload files failed:", e?.message);
+        }
+        const startInput = Date.now();
+        while (Date.now() - startInput < ATTACH_MENU_OPEN_TIMEOUT_MS) {
+          inputs = findFileInputs();
+          if (inputs.length > 0) break;
+          await sleep(80);
+        }
+      }
+    }
+
+    if (inputs.length > 0) {
+      emit("input-mounted", { count: inputs.length });
+      const input = inputs[0];
+
+      let dataTransfer;
       try {
-        uploadItem.click();
+        dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
       } catch (e) {
         return {
           ok: false,
-          error: `Click on Upload files failed: ${e?.message ?? "unknown"}`,
-          phase: "click-upload",
+          error: `DataTransfer construction failed: ${e?.message ?? "unknown"}`,
+          phase: "datatransfer",
         };
       }
-      const startInput = Date.now();
-      while (Date.now() - startInput < ATTACH_MENU_OPEN_TIMEOUT_MS) {
-        inputs = findFileInputs();
-        if (inputs.length > 0) break;
-        await sleep(80);
-      }
-      if (inputs.length === 0) {
+      try {
+        if (typeof input.setAttribute === "function") {
+          input.setAttribute("accept", "image/*,*/*");
+        }
+        Object.defineProperty(input, "files", {
+          value: dataTransfer.files,
+          configurable: true,
+        });
+      } catch (e) {
         return {
           ok: false,
-          error: "Click on Upload files did not mount a <input type='file'> within the timeout.",
-          phase: "mount-input",
+          error: `Could not assign file list to input: ${e?.message ?? "unknown"}`,
+          phase: "assign-files",
+        };
+      }
+
+      emit("pre-dispatch", { chipsBefore });
+      input.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true, cancelable: true }));
+
+      try {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
+      } catch (_) {}
+
+      const timeoutMs = (opts && typeof opts.timeoutMs === "number") ? opts.timeoutMs : ATTACH_FILE_TIMEOUT_MS;
+      const result = await waitForAttachmentEvidence(chipsBefore, timeoutMs);
+      if (result.ok) {
+        emit("attached", { signalsAfter: result.signalsAfter });
+        return {
+          ok: true,
+          method: "datatransfer+menu",
+          fileName: file.name,
+          fileType: file.type,
+          fileSize: file.size,
+          chipVisibleAt: result.chipVisibleAt || Date.now(),
+          uploadCompleteAt: result.uploadCompleteAt || Date.now(),
+          elapsedMs: Date.now() - startedAt,
+          diagnostics: { chipsBefore, evidence: result.evidence },
         };
       }
     }
-    emit("input-mounted", { count: inputs.length });
-
-    const input = inputs[0];
-
-    // 3. Inject File via DataTransfer.
-    let dataTransfer;
-    try {
-      dataTransfer = new DataTransfer();
-      dataTransfer.items.add(file);
-    } catch (e) {
-      return {
-        ok: false,
-        error: `DataTransfer construction failed: ${e?.message ?? "unknown"}`,
-        phase: "datatransfer",
-      };
-    }
-    try {
-      Object.defineProperty(input, "files", {
-        value: dataTransfer.files,
-        configurable: true,
-      });
-    } catch (e) {
-      return {
-        ok: false,
-        error: `Could not assign file list to input: ${e?.message ?? "unknown"}`,
-        phase: "assign-files",
-      };
-    }
-
-    // 4. Snapshot the chip count in input-area-v2 BEFORE dispatching events.
-    const area = document.querySelector("input-area-v2");
-    const chipsBefore = countComposerAttachments(area);
-    emit("pre-dispatch", { chipsBefore });
-
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-
-    // 5. Wait for the chip with our filename to appear.
-    const timeoutMs = (opts && typeof opts.timeoutMs === "number") ? opts.timeoutMs : ATTACH_FILE_TIMEOUT_MS;
-    const result = await waitForAttachmentOf(file.name, chipsBefore, timeoutMs);
-    if (!result.ok) {
-      return {
-        ok: false,
-        error: result.error,
-        phase: result.phase,
-        fileName: file.name,
-        fileType: file.type,
-        fileSize: file.size,
-        elapsedMs: Date.now() - startedAt,
-        diagnostics: { chipsBefore, chipsAfter: result.chipsAfter ?? null },
-      };
-    }
-    emit("attached", { chipsAfter: result.chipsAfter });
 
     return {
-      ok: true,
-      method: "datatransfer+menu",
+      ok: false,
+      error: "Could not attach file: no attachment chip or thumbnail appeared after testing paste, drag-and-drop, and input injection.",
+      phase: "wait-for-evidence",
       fileName: file.name,
       fileType: file.type,
       fileSize: file.size,
       elapsedMs: Date.now() - startedAt,
-      chipIndex: result.chipIndex,
-      diagnostics: { chipsBefore, chipsAfter: result.chipsAfter },
+      diagnostics: { chipsBefore },
     };
-  }
-
-  /**
-   * Count attachments currently in the composer (gem-media-attachment
-   * inside input-area-v2).
-   */
-  function countComposerAttachments(area) {
-    if (!area) return 0;
-    return area.querySelectorAll("gem-media-attachment").length;
-  }
-
-  /**
-   * Wait until the chip count in input-area-v2 grows AND a chip
-   * containing the given filename appears.
-   */
-  function waitForAttachmentOf(fileName, chipsBefore, timeoutMs) {
-    const start = Date.now();
-    return new Promise((resolve) => {
-      const area = document.querySelector("input-area-v2");
-      if (!area) {
-        resolve({ ok: false, error: "Composer not found.", phase: "no-area" });
-        return;
-      }
-      let resolved = false;
-      const finalize = (r) => {
-        if (resolved) return;
-        resolved = true;
-        try {
-          obs.disconnect();
-        } catch (_) {
-          /* ignore */
-        }
-        resolve(r);
-      };
-      const tick = () => {
-        const chips = area.querySelectorAll("gem-media-attachment");
-        const chipsAfter = chips.length;
-        if (chipsAfter > chipsBefore) {
-          // Look for our filename in any chip's text.
-          for (let i = 0; i < chips.length; i++) {
-            const text = (chips[i].textContent || "").trim();
-            if (text.includes(fileName)) {
-              finalize({
-                ok: true,
-                chipsAfter,
-                chipIndex: i,
-              });
-              return;
-            }
-          }
-        }
-        if (Date.now() - start >= timeoutMs) {
-          finalize({
-            ok: false,
-            error:
-              "Gemini did not acknowledge the attachment within the timeout. " +
-              "The chip with our filename did not appear.",
-            phase: "wait-for-chip",
-            chipsAfter: chips.length,
-          });
-          return;
-        }
-        // Schedule next tick.
-        setTimeout(tick, 100);
-      };
-      const obs = new MutationObserver(() => {
-        // Don't wait for the periodic tick if the DOM has changed.
-        const chips = area.querySelectorAll("gem-media-attachment");
-        if (chips.length > chipsBefore) {
-          for (let i = 0; i < chips.length; i++) {
-            const text = (chips[i].textContent || "").trim();
-            if (text.includes(fileName)) {
-              finalize({ ok: true, chipsAfter: chips.length, chipIndex: i });
-              return;
-            }
-          }
-        }
-      });
-      obs.observe(area, { childList: true, subtree: true });
-      tick();
-    });
   }
 
   /**
    * Public API: attach a single image File to the Gemini composer.
-   * Does NOT submit. Does NOT remove existing attachments.
-   *
-   * @param {File} file
-   * @returns {Promise<{ ok, error?, method?, fileName?, fileType?, fileSize?, diagnostics?, observedAttachment? }>}
+   * Delegates to attachFileWithMenu for the robust end-to-end flow.
    */
-  async function attachFileToGemini(file) {
-    if (!file || typeof file !== "object" || typeof file.name !== "string") {
-      return { ok: false, error: "No file provided" };
-    }
-
-    log(`attachFileToGemini called (name=${file.name}, size=${file.size}, type=${file.type})`);
-
-    // Pre-flight diagnostics so failures are loud.
-    const diag = attachmentDiagnostics();
-    const inputs = findFileInputs();
-    if (inputs.length === 0) {
-      // The input is most likely mounted only after the user opens the
-      // attachment menu. We do NOT auto-click here; we tell the caller
-      // what's missing so they can use the side panel's "Probe" button
-      // to drive the activation flow in a user-visible way.
-      const probe = attachmentProbe();
-      const hint = probe.inputLikelyDynamic
-        ? " Gemini mounts the <input type=\"file\"> only after the user opens the attachment menu. Use the Probe button in the side panel to surface the actual flow."
-        : " Gemini's composer toolbar does not appear to expose an upload control right now.";
-      return {
-        ok: false,
-        error: "Gemini upload control not found." + hint,
-        diagnostics: probe,
-        requiresActivation: probe.inputLikelyDynamic,
-      };
-    }
-    const input = inputs[0];
-
-    // Build a DataTransfer carrying the file. DataTransfer is supported
-    // in all evergreen browsers and is the closest analog to "the user
-    // picked this file from a system dialog".
-    let dataTransfer;
-    try {
-      dataTransfer = new DataTransfer();
-      dataTransfer.items.add(file);
-    } catch (e) {
-      return {
-        ok: false,
-        error: `DataTransfer construction failed: ${e?.message ?? "unknown"}`,
-        diagnostics: diag,
-      };
-    }
-
-    // Set the file list on the input. Some browsers (and some Gemini
-    // versions) listen for either 'input' or 'change' or both.
-    try {
-      Object.defineProperty(input, "files", {
-        value: dataTransfer.files,
-        configurable: true,
-      });
-    } catch (e) {
-      return {
-        ok: false,
-        error: `Could not assign file list to input: ${e?.message ?? "unknown"}`,
-        diagnostics: diag,
-      };
-    }
-
-    // Snapshot the upload area BEFORE firing events so we can detect
-    // new attachments reliably (we already had a count; we want the
-    // delta).
-    const area = findPromptInputArea();
-    const hintsBefore = countAttachmentHints(area);
-    log(`attachment hints before fire: ${hintsBefore}`);
-
-    // Fire the events Gemini's frontend is listening for. We dispatch on
-    // the input directly; this matches what the native file picker does.
-    const inputEvent = new Event("input", { bubbles: true });
-    const changeEvent = new Event("change", { bubbles: true });
-    input.dispatchEvent(inputEvent);
-    input.dispatchEvent(changeEvent);
-
-    // Observe the upload area for a new attachment chip / thumbnail.
-    const ok = await waitForAttachment(area, hintsBefore);
-    if (!ok.ok) {
-      return {
-        ok: false,
-        error: ok.error,
-        method: "datatransfer",
-        fileName: file.name,
-        fileType: file.type,
-        fileSize: file.size,
-        diagnostics: { ...diag, currentAttachmentHints: countAttachmentHints(area) },
-      };
-    }
-
-    log(
-      `attach success: name=${file.name} size=${file.size} ` +
-        `hintsBefore=${hintsBefore} hintsAfter=${ok.hintsAfter}`,
-    );
-    return {
-      ok: true,
-      method: "datatransfer",
-      fileName: file.name,
-      fileType: file.type,
-      fileSize: file.size,
-      observedAttachment: ok.observed,
-      diagnostics: { ...diag, currentAttachmentHints: ok.hintsAfter },
-    };
+  async function attachFileToGemini(file, opts) {
+    return await attachFileWithMenu(file, opts);
   }
 
   /**
@@ -1401,7 +1566,7 @@
           tag: node?.tagName?.toLowerCase() ?? null,
           srcPrefix:
             node?.getAttribute?.("src")?.slice(0, 12) ?? null,
-          classHint: (node?.className || "").toString().slice(0, 80),
+          classHint: getElementClassText(node).slice(0, 80),
         };
       }
     }
@@ -1432,15 +1597,163 @@
   }
 
   /**
-   * Public API: insert text into the Gemini prompt field.
-   * Replaces existing content (PoC behavior).
+   * Canonical Composer Adapter API (v0.8.1 stabilization)
+   *
+   * ONE canonical API:
+   *   readComposerText()
+   *   clearComposer()
+   *   setComposerText(text)
+   *   verifyComposerText(expected, actual)
    */
-  async function insertPromptIntoGemini(text) {
+
+  function normalizeText(text) {
+    if (typeof text !== "string") return "";
+    return text
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .join("\n");
+  }
+
+  function normalizeExpectedPrompt(text) {
+    return normalizeText(text);
+  }
+
+  function normalizeGeminiComposerText(text) {
+    return normalizeText(text);
+  }
+
+  /**
+   * Strict content equality verification with canonical normalization
+   * and concise mismatch diagnostics (does not dump full prompt).
+   */
+  function verifyComposerText(expectedRaw, actualRaw) {
+    const exp = typeof expectedRaw === "string" ? expectedRaw : "";
+    const act = typeof actualRaw === "string" ? actualRaw : "";
+
+    const normExp = normalizeText(exp);
+    const normAct = normalizeText(act);
+
+    if (normExp === normAct) {
+      return {
+        ok: true,
+        expectedRawLength: exp.length,
+        actualRawLength: act.length,
+        expectedNormLength: normExp.length,
+        actualNormLength: normAct.length,
+        normalizedMatch: true,
+      };
+    }
+
+    // Secondary normalization: check paragraph newline runs (Quill/HTML adds extra blank paragraphs)
+    const normExpPara = normExp.replace(/\n{3,}/g, "\n\n");
+    const normActPara = normAct.replace(/\n{3,}/g, "\n\n");
+    if (normExpPara === normActPara) {
+      return {
+        ok: true,
+        expectedRawLength: exp.length,
+        actualRawLength: act.length,
+        expectedNormLength: normExp.length,
+        actualNormLength: normAct.length,
+        normalizedMatch: true,
+        slackReason: "paragraph-newlines-normalized",
+      };
+    }
+
+    // Determine first mismatch index
+    let mismatchIdx = -1;
+    const minLen = Math.min(normExp.length, normAct.length);
+    for (let i = 0; i < minLen; i++) {
+      if (normExp[i] !== normAct[i]) {
+        mismatchIdx = i;
+        break;
+      }
+    }
+    if (mismatchIdx === -1 && normExp.length !== normAct.length) {
+      mismatchIdx = minLen;
+    }
+
+    const startCtx = Math.max(0, mismatchIdx - 25);
+    const endCtxExp = Math.min(normExp.length, mismatchIdx + 25);
+    const endCtxAct = Math.min(normAct.length, mismatchIdx + 25);
+
+    const expSnippet = normExp.slice(startCtx, endCtxExp);
+    const actSnippet = normAct.slice(startCtx, endCtxAct);
+
+    return {
+      ok: false,
+      expectedRawLength: exp.length,
+      actualRawLength: act.length,
+      expectedNormLength: normExp.length,
+      actualNormLength: normAct.length,
+      normalizedMatch: false,
+      mismatchIndex: mismatchIdx,
+      expectedSnippet: expSnippet,
+      actualSnippet: actSnippet,
+      error: `Prompt verification failed at char ${mismatchIdx}: expected "...${expSnippet}..." but found "...${actSnippet}..." (expected ${normExp.length} normalized chars, found ${normAct.length})`,
+    };
+  }
+
+  // Alias for backward compatibility
+  const verifyPromptContent = verifyComposerText;
+
+  /**
+   * Canonical readback: reads ONLY actual editable text.
+   * Excludes attachment labels, filenames, hidden accessibility spans,
+   * chip metadata, image alt text, and non-editor descendants.
+   */
+  function readComposerText() {
+    const tb = findPromptInput() || document.querySelector('[role="textbox"]') || document.querySelector('.ql-editor');
+    if (!tb) return "";
+    const quill = locateQuill(tb);
+    if (quill && typeof quill.getText === "function") {
+      try {
+        const qText = quill.getText();
+        if (typeof qText === "string") {
+          return qText.replace(/\u00a0/g, " ").replace(/\n$/, "").trim();
+        }
+      } catch (_) {}
+    }
+    // If tb contains attachment chips or media containers or non-editor nodes, exclude them from text
+    let raw = "";
+    if (typeof tb.cloneNode === "function") {
+      const clone = tb.cloneNode(true);
+      const nonTextNodes = clone.querySelectorAll(
+        'gem-media-attachment, mat-chip, mat-chip-row, mat-chip-grid, [role="progressbar"], mat-progress-spinner, progress, button, img, mat-icon, i.material-symbols-outlined, i.google-symbols, .close-button, .attachment-preview, .file-preview, [data-test-id*="attachment"], [data-test-id*="chip"], [aria-hidden="true"], .cdk-visually-hidden, .visually-hidden, [aria-live], .ql-hidden, .ql-clipboard'
+      );
+      for (const n of nonTextNodes) {
+        try { n.remove(); } catch (_) {}
+      }
+      const paragraphs = Array.from(clone.querySelectorAll("p"));
+      if (paragraphs.length > 0) {
+        raw = paragraphs
+          .map((p) => p.innerText || p.textContent || "")
+          .join("\n");
+      } else {
+        raw = clone.innerText || clone.textContent || "";
+      }
+    } else {
+      raw = tb.innerText || tb.textContent || "";
+    }
+    return raw.replace(/\u00a0/g, " ").replace(/\n$/, "").trim();
+  }
+
+  // Alias for backward compatibility
+  const getComposerText = readComposerText;
+
+  /**
+   * Canonical setter: inserts/replaces text in the composer field.
+   */
+  async function setComposerText(text) {
     if (typeof text !== "string") {
       return { ok: false, error: "text must be a string" };
     }
 
-    log(`insertPromptIntoGemini called (length=${text.length})`);
+    log(`setComposerText called (length=${text.length})`);
 
     const textbox = await findTextbox();
     if (!textbox) {
@@ -1454,41 +1767,63 @@
     }
 
     const quill = locateQuill(textbox);
-    const lengthBefore = textboxTextLength(textbox);
+    const textBefore = readComposerText();
+    const lengthBefore = textBefore.length;
 
     if (!quill) {
-      // Fallback: select ALL existing content, then execCommand('insertText').
-      // - Selecting all (NOT collapsing) is what makes this a REPLACE, not an
-      //   append. execCommand('insertText') replaces the current selection.
-      // - We do not write innerHTML (CSP/TrustedHTML would block it).
-      warn("Quill instance not found; using execCommand fallback (replace)");
+      // Diagnostic log for fallback path (normal recoverable state)
+      log("Quill instance not found; using execCommand fallback (replace)");
       try {
         textbox.focus();
         const range = document.createRange();
         range.selectNodeContents(textbox);
-        // Deliberately do NOT collapse the range. Collapsing would move
-        // the caret to one end and make insertText append.
         const sel = window.getSelection();
         sel.removeAllRanges();
         sel.addRange(range);
-        const ok = document.execCommand("insertText", false, text);
-        if (!ok) {
-          return { ok: false, error: "execCommand('insertText') returned false" };
+
+        if (text === "") {
+          if (typeof document.execCommand === "function") {
+            try { document.execCommand("delete", false, null); } catch (_) {}
+          }
+          if (range.deleteContents) {
+            try { range.deleteContents(); } catch (_) {}
+          }
+        } else {
+          let ok = false;
+          if (typeof document.execCommand === "function") {
+            ok = document.execCommand("insertText", false, text);
+          }
+          if (!ok) {
+            textbox.textContent = text;
+          }
         }
+
+        try {
+          textbox.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+          textbox.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+        } catch (_) {}
+
         textbox.focus();
-        const lengthAfter = textboxTextLength(textbox);
+        const textAfter = readComposerText();
         log(
-          `inserted via execCommand fallback (length=${text.length}, ` +
-            `before=${lengthBefore}, after=${lengthAfter})`,
+          `inserted via execCommand fallback (requested=${text.length}, ` +
+            `before=${lengthBefore}, after=${textAfter.length})`,
         );
-        const verified = verifyReplacement(text, lengthAfter);
+        const verified = verifyComposerText(text, textAfter);
         if (!verified.ok) {
+          log(
+            `Composer verification failed: expectedRawLen=${verified.expectedRawLength}, ` +
+              `actualRawLen=${verified.actualRawLength}, expectedNormLen=${verified.expectedNormLength}, ` +
+              `actualNormLen=${verified.actualNormLength}, mismatchIndex=${verified.mismatchIndex}, ` +
+              `expectedSnippet="...${verified.expectedSnippet}...", actualSnippet="...${verified.actualSnippet}..."`
+          );
           return {
             ok: false,
             error: verified.error,
             method: "execCommand",
             lengthBefore,
-            lengthAfter,
+            lengthAfter: textAfter.length,
+            mismatch: verified,
           };
         }
         return {
@@ -1496,34 +1831,41 @@
           length: text.length,
           method: "execCommand",
           lengthBefore,
-          lengthAfter,
+          lengthAfter: textAfter.length,
+          verification: verified,
         };
       } catch (e) {
-        return { ok: false, error: `fallback failed: ${e.message}` };
+        return { ok: false, error: `fallback failed: ${e?.message ?? String(e)}` };
       }
     }
 
     try {
       quill.focus();
       quill.setText("");
-      quill.insertText(0, text);
+      if (text) {
+        quill.insertText(0, text);
+      }
       quill.focus();
-      const lengthAfter = quill.getText().replace(/\n$/, "").length;
+      const textAfter = readComposerText();
       log(
-        `inserted via Quill API (length=${text.length}, ` +
-          `before=${lengthBefore}, after=${lengthAfter})`,
+        `inserted via Quill API (requested=${text.length}, ` +
+          `before=${lengthBefore}, after=${textAfter.length})`,
       );
-      // Note: getText() appends a trailing '\n' to every block; Quill's
-      // internal length matches our input char-for-char for non-newline
-      // content. We compare the un-trailing-newline length.
-      const verified = verifyReplacement(text, lengthAfter);
+      const verified = verifyComposerText(text, textAfter);
       if (!verified.ok) {
+        log(
+          `Composer verification failed: expectedRawLen=${verified.expectedRawLength}, ` +
+            `actualRawLen=${verified.actualRawLength}, expectedNormLen=${verified.expectedNormLength}, ` +
+            `actualNormLen=${verified.actualNormLength}, mismatchIndex=${verified.mismatchIndex}, ` +
+            `expectedSnippet="...${verified.expectedSnippet}...", actualSnippet="...${verified.actualSnippet}..."`
+        );
         return {
           ok: false,
           error: verified.error,
           method: "quill",
           lengthBefore,
-          lengthAfter,
+          lengthAfter: textAfter.length,
+          mismatch: verified,
         };
       }
       return {
@@ -1531,209 +1873,805 @@
         length: text.length,
         method: "quill",
         lengthBefore,
-        lengthAfter,
+        lengthAfter: textAfter.length,
+        verification: verified,
       };
     } catch (e) {
-      warn("Quill API insertion failed:", e.message);
-      return { ok: false, error: `Quill insertion failed: ${e.message}` };
+      log("Quill API insertion failed:", e?.message ?? String(e));
+      return { ok: false, error: `Quill insertion failed: ${e?.message ?? String(e)}` };
     }
   }
 
-  /**
-   * Returns the user-visible text length of a textbox element, ignoring
-   * Quill's trailing newline and any <br> placeholders.
-   */
-  function textboxTextLength(textbox) {
-    const txt = (textbox.innerText || "").replace(/\u00a0/g, " ");
-    return txt.length;
-  }
+  // Alias for backward compatibility
+  const insertPromptIntoGemini = setComposerText;
 
-  /**
-   * Compare what we asked to insert vs what's currently in the textbox.
-   * We do not log content. We return an error if the lengths diverge
-   * in a way that signals appending (lengthAfter >> lengthRequested).
-   */
-  function verifyReplacement(requested, lengthAfter) {
-    const requestedLen = requested.length;
-    if (lengthAfter === requestedLen) return { ok: true };
-    // Allow tiny slack (e.g. trailing newlines Quill adds).
-    if (lengthAfter > requestedLen && lengthAfter - requestedLen <= 2) {
-      return { ok: true };
+  function inspectComposerContent(expectedPrompt, expectedRefCount) {
+    const area = findPromptInputArea() || document.querySelector("input-area-v2") || document.body;
+    const currentText = readComposerText();
+    const promptLength = currentText.length;
+    const attachmentCount = countComposerAttachments(area);
+    const pendingUploadCount = countActiveUploads(area);
+    const imageProbe = typeof imageModeProbe === "function" ? imageModeProbe() : null;
+    const imageModeActive = !!(imageProbe && imageProbe.imageModeActive);
+
+    const check = typeof expectedPrompt === "string" && expectedPrompt.length > 0
+      ? verifyComposerText(expectedPrompt, currentText)
+      : { ok: false };
+
+    let state = "empty";
+    let needsConfirmation = false;
+
+    if (attachmentCount === 0 && promptLength === 0) {
+      state = "empty";
+    } else if (
+      (check.ok && typeof expectedRefCount === "number" && expectedRefCount > 0 && attachmentCount === expectedRefCount) ||
+      (check.ok && (expectedRefCount === 0 || expectedRefCount === undefined))
+    ) {
+      state = "matching-prepared";
+    } else {
+      state = "manual-content";
+      needsConfirmation = true;
     }
-    if (lengthAfter > requestedLen) {
-      return {
-        ok: false,
-        error: `replacement mismatch: editor has ${lengthAfter} chars, expected ${requestedLen} (likely appended instead of replaced)`,
-      };
-    }
+
     return {
-      ok: false,
-      error: `replacement mismatch: editor has ${lengthAfter} chars, expected ${requestedLen}`,
+      ok: true,
+      state,
+      needsConfirmation,
+      promptText: currentText,
+      promptLength,
+      attachmentCount,
+      pendingUploadCount,
+      imageModeActive,
+      composerClean: attachmentCount === 0 && promptLength === 0 && pendingUploadCount === 0,
     };
   }
+
+  /**
+   * Canonical clearComposer:
+   * Phase 1: Clears prompt text.
+   * Phase 2 & 3: Discovers all existing attachment chips in the active composer and clicks their real remove controls.
+   * Phase 4: Waits for Gemini DOM settlement in a bounded loop.
+   * Phase 5: Re-probes the active composer to guarantee count === 0.
+   */
+  async function clearComposer() {
+    log("clearComposer called");
+    // Phase 1: Clear text
+    await setComposerText("");
+
+    // Phase 2, 3, 4: Bounded attachment removal loop
+    const maxDurationMs = 4000;
+    const start = Date.now();
+    let lastAttachmentCount = countComposerAttachments();
+
+    while (lastAttachmentCount > 0 && Date.now() - start < maxDurationMs) {
+      const rootsToTry = [];
+      const inputArea = findPromptInputArea();
+      if (inputArea) rootsToTry.push(inputArea);
+      const tb = findPromptInput();
+      if (tb) {
+        let p = tb.parentElement;
+        while (p && p !== document.body) {
+          if (!rootsToTry.includes(p)) rootsToTry.push(p);
+          p = p.parentElement;
+        }
+      }
+      if (!rootsToTry.includes(document)) rootsToTry.push(document);
+
+      const closeButtons = [];
+      for (const root of rootsToTry) {
+        if (!root || typeof root.querySelectorAll !== "function") continue;
+
+        // 1. Buttons inside attachment chips
+        const chips = root.querySelectorAll("gem-media-attachment, .attachment-chip, mat-chip, .attachment-container > *");
+        for (const chip of chips) {
+          if (chip.closest?.("model-response, user-query, message-content, [data-test-id*='chat-history'], mat-sidenav, nav, header")) continue;
+          
+          const btns = chip.querySelectorAll("button, [role='button'], mat-chip-remove, .close-button, [data-test-id*='remove'], [aria-label*='remover' i], [aria-label*='remove' i], [aria-label*='delete' i], [aria-label*='excluir' i], [aria-label*='close' i], [aria-label*='fechar' i]");
+          for (const b of btns) {
+            if (!closeButtons.includes(b)) closeButtons.push(b);
+          }
+          if (btns.length === 0) {
+            const anyBtn = chip.querySelector("button, [role='button']");
+            if (anyBtn && !closeButtons.includes(anyBtn)) closeButtons.push(anyBtn);
+          }
+        }
+
+        // 2. Direct remove buttons matching aria labels outside chat history
+        const directBtns = root.querySelectorAll('button[aria-label*="remover" i], button[aria-label*="remove" i], button[aria-label*="delete" i], button[aria-label*="excluir" i], button[aria-label*="fechar" i], button[aria-label*="close" i], mat-chip-remove, .close-button');
+        for (const d of directBtns) {
+          if (!d.closest?.("model-response, user-query, message-content, [data-test-id*='chat-history'], mat-sidenav, nav, header") && !closeButtons.includes(d)) {
+            closeButtons.push(d);
+          }
+        }
+      }
+
+      for (const btn of closeButtons) {
+        try {
+          btn.click();
+          if (typeof MouseEvent !== "undefined") {
+            btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: typeof window !== "undefined" ? window : undefined }));
+          }
+        } catch (_) {}
+      }
+
+      await sleep(150);
+      lastAttachmentCount = countComposerAttachments();
+    }
+
+    // Phase 5: Re-probe and settlement
+    await sleep(60);
+    const attachmentsAfter = countComposerAttachments();
+    const textAfter = readComposerText();
+    const clean = textAfter.length === 0 && attachmentsAfter === 0;
+
+    return {
+      ok: clean,
+      promptLength: textAfter.length,
+      attachmentCount: attachmentsAfter,
+      alreadyEmpty: clean,
+    };
+  }
+
+  // Alias for backward compatibility
+  const clearComposerContent = clearComposer;
 
   // ---- Send + Preflight + Generation Detection (v0.6) -------------------
 
   /**
-   * Find the Send button. Locale-aware: we accept any label from
-   * SEND_BUTTON_LABEL_CANDIDATES that matches exactly (case-sensitive).
+   * Find the Send button. Locale-aware and scoped to the active composer where possible.
+   * We accept any label from SEND_BUTTON_LABEL_CANDIDATES or localized equivalents.
    */
-  function findSendButtonLocalized() {
-    const buttons = Array.from(document.querySelectorAll("button[aria-label]"));
-    for (const b of buttons) {
-      const label = (b.getAttribute("aria-label") || "").trim();
-      if (SEND_BUTTON_LABEL_CANDIDATES.includes(label)) return b;
+  function findSendButtonLocalized(area) {
+    const rootsToTry = [];
+    if (area) rootsToTry.push(area);
+    const inputArea = findPromptInputArea();
+    if (inputArea && !rootsToTry.includes(inputArea)) rootsToTry.push(inputArea);
+    const tb = findPromptInput();
+    if (tb) {
+      let p = tb.parentElement;
+      while (p && p !== document.body) {
+        if (!rootsToTry.includes(p)) rootsToTry.push(p);
+        p = p.parentElement;
+      }
+    }
+    if (!rootsToTry.includes(document)) rootsToTry.push(document);
+
+    for (const root of rootsToTry) {
+      if (!root || typeof root.querySelectorAll !== "function") continue;
+      const buttons = Array.from(root.querySelectorAll("button[aria-label]"));
+      for (const b of buttons) {
+        const label = (b.getAttribute("aria-label") || "").trim();
+        if (SEND_BUTTON_LABEL_CANDIDATES.includes(label)) return b;
+      }
+      for (const b of buttons) {
+        const label = (b.getAttribute("aria-label") || "").toLowerCase();
+        if (label.includes("send") || label.includes("enviar") || label.includes("送信") || label.includes("envoyer")) {
+          return b;
+        }
+      }
     }
     return null;
-  }
-
-  /**
-   * Send the current composer. Idempotent: refuse if button disabled.
-   */
-  async function sendCurrentComposer() {
-    const btn = findSendButtonLocalized();
-    if (!btn) {
-      return { ok: false, error: "Send button not found.", disabled: null };
-    }
-    if (btn.disabled || btn.getAttribute("aria-disabled") === "true") {
-      return { ok: false, error: "Send button is disabled.", disabled: true };
-    }
-    const tb = document.querySelector('[role="textbox"]') || findPromptInput();
-    if (tb) {
-      const txt = ((tb.innerText || "") + (tb.textContent || "")).trim();
-      if (txt.length === 0) {
-        return { ok: false, error: "Composer is empty.", disabled: true };
-      }
-    }
-    const baselineUserQueries = Array.from(
-      document.querySelectorAll("user-query"),
-    ).length;
-    try {
-      btn.click();
-    } catch (e) {
-      return { ok: false, error: `Send click failed: ${e?.message ?? "unknown"}` };
-    }
-    const start = Date.now();
-    const SEND_DETECT_TIMEOUT_MS = 5000;
-    while (Date.now() - start < SEND_DETECT_TIMEOUT_MS) {
-      const now = Array.from(document.querySelectorAll("user-query")).length;
-      if (now > baselineUserQueries) {
-        return {
-          ok: true,
-          method: "click",
-          baselineUserQueries,
-          currentUserQueries: now,
-          elapsedMs: Date.now() - start,
-        };
-      }
-      await sleep(80);
-    }
-    return {
-      ok: true,
-      method: "click",
-      baselineUserQueries,
-      currentUserQueries: baselineUserQueries,
-      elapsedMs: Date.now() - start,
-      note: "send-detect-timeout",
-    };
   }
 
   function findSendButtonDiagnostic() {
     const btn = findSendButtonLocalized();
     if (!btn) return { ok: false, found: false };
+    const disabled = btn.disabled || btn.getAttribute("aria-disabled") === "true";
     return {
       ok: true,
       found: true,
-      disabled: btn.disabled || btn.getAttribute("aria-disabled") === "true",
+      disabled: !!disabled,
       label: btn.getAttribute("aria-label") || null,
     };
   }
 
-  function captureConversationBaseline() {
-    const allImgs = Array.from(document.querySelectorAll("img"));
-    const generated = allImgs.filter((i) =>
-      /ai generated|generated by ai|gerada por ia|générée par ia/i.test(
-        i.getAttribute("alt") || "",
-      ),
-    );
+  /**
+   * Send the current composer. Idempotent: refuse if button is missing or disabled.
+   * Verifies submission acknowledgement within a bounded window.
+   */
+  async function sendCurrentComposer() {
+    const btn = findSendButtonLocalized();
+    if (!btn) {
+      return { ok: false, error: "Send button not found.", found: false, disabled: null, clicked: false };
+    }
+    const disabled = btn.disabled || btn.getAttribute("aria-disabled") === "true";
+    if (disabled) {
+      return { ok: false, error: "Send button is disabled.", found: true, disabled: true, clicked: false, label: btn.getAttribute("aria-label") || null };
+    }
+    const txtBefore = readComposerText().trim();
+    const attachmentsBefore = countComposerAttachments();
+    if (txtBefore.length === 0 && attachmentsBefore === 0) {
+      return { ok: false, error: "Composer is empty.", found: true, disabled: true, clicked: false };
+    }
+
+    const baselineUserQueries = Array.from(
+      document.querySelectorAll("user-query, .user-query, [data-test-id='user-query']"),
+    ).length;
+
+    const sendButtonLabel = btn.getAttribute("aria-label") || null;
+    const sendClickAttemptedAt = Date.now();
+    let sendClickedAt = null;
+
+    // Fire the click EXACTLY ONCE. HTMLElement.click() already runs the
+    // full native sequence (mousedown, mouseup, click + default action)
+    // and is what React/Angular handlers listen for. Dispatching a
+    // synthetic MouseEvent("click") on top of that fires Gemini's send
+    // handler a SECOND time and produces duplicate user-query bubbles
+    // — exactly N duplicates per single click of our button. Single-click
+    // is the only correct behavior. (Regression: this used to also call
+    // btn.dispatchEvent(new MouseEvent("click")). Tests assert it does not.)
+    try {
+      btn.click();
+      sendClickedAt = Date.now();
+    } catch (e) {
+      return {
+        ok: false,
+        error: `Send click failed: ${e?.message ?? "unknown"}`,
+        found: true,
+        disabled: false,
+        label: sendButtonLabel,
+        clicked: false,
+        sendClickAttemptedAt,
+      };
+    }
+
+    const start = Date.now();
+    const SEND_DETECT_TIMEOUT_MS = 6000;
+    while (Date.now() - start < SEND_DETECT_TIMEOUT_MS) {
+      const nowQueries = Array.from(
+        document.querySelectorAll("user-query, .user-query, [data-test-id='user-query']"),
+      ).length;
+      if (nowQueries > baselineUserQueries) {
+        return {
+          ok: true,
+          found: true,
+          disabled: false,
+          label: sendButtonLabel,
+          clicked: true,
+          method: "click",
+          evidence: "new-user-query-detected",
+          baselineUserQueries,
+          currentUserQueries: nowQueries,
+          sendButtonFound: true,
+          sendButtonDisabled: false,
+          sendButtonLabel,
+          sendClickAttemptedAt,
+          sendClickedAt,
+          elapsedMs: Date.now() - start,
+        };
+      }
+
+      const curText = readComposerText().trim();
+      const curAttachments = countComposerAttachments();
+      const btnNow = findSendButtonLocalized();
+      const btnDisabled = !btnNow || btnNow.disabled || btnNow.getAttribute("aria-disabled") === "true";
+      const stopBtn = document.querySelector('button[aria-label*="Stop" i], button[aria-label*="Parar" i], button[aria-label*="停止" i]');
+
+      if (txtBefore.length > 0 && curText.length === 0) {
+        return {
+          ok: true,
+          found: true,
+          disabled: false,
+          label: sendButtonLabel,
+          clicked: true,
+          method: "click",
+          evidence: "composer-text-cleared",
+          sendButtonFound: true,
+          sendButtonDisabled: false,
+          sendButtonLabel,
+          sendClickAttemptedAt,
+          sendClickedAt,
+          elapsedMs: Date.now() - start,
+        };
+      }
+
+      if (attachmentsBefore > 0 && curAttachments === 0) {
+        return {
+          ok: true,
+          found: true,
+          disabled: false,
+          label: sendButtonLabel,
+          clicked: true,
+          method: "click",
+          evidence: "attachment-chips-cleared",
+          sendButtonFound: true,
+          sendButtonDisabled: false,
+          sendButtonLabel,
+          sendClickAttemptedAt,
+          sendClickedAt,
+          elapsedMs: Date.now() - start,
+        };
+      }
+
+      if (stopBtn) {
+        return {
+          ok: true,
+          found: true,
+          disabled: false,
+          label: sendButtonLabel,
+          clicked: true,
+          method: "click",
+          evidence: "stop-button-active",
+          sendButtonFound: true,
+          sendButtonDisabled: false,
+          sendButtonLabel,
+          sendClickAttemptedAt,
+          sendClickedAt,
+          elapsedMs: Date.now() - start,
+        };
+      }
+
+      if (btnDisabled) {
+        return {
+          ok: true,
+          found: true,
+          disabled: false,
+          label: sendButtonLabel,
+          clicked: true,
+          method: "click",
+          evidence: "send-button-disabled",
+          sendButtonFound: true,
+          sendButtonDisabled: false,
+          sendButtonLabel,
+          sendClickAttemptedAt,
+          sendClickedAt,
+          elapsedMs: Date.now() - start,
+        };
+      }
+
+      await sleep(100);
+    }
+
     return {
-      capturedAt: Date.now(),
-      userQueryCount: document.querySelectorAll("user-query").length,
-      modelResponseCount: document.querySelectorAll("model-response").length,
-      generatedImageCount: generated.length,
-      generatedImageSrcs: generated
-        .map((i) => i.getAttribute("src"))
-        .filter(Boolean),
+      ok: false,
+      error: "Submission acknowledgement timeout: Gemini did not clear composer or show stop button.",
+      found: true,
+      disabled: false,
+      label: sendButtonLabel,
+      clicked: true,
+      sendButtonFound: true,
+      sendButtonDisabled: false,
+      sendButtonLabel,
+      sendClickAttemptedAt,
+      sendClickedAt,
+      elapsedMs: Date.now() - start,
     };
   }
 
-  async function waitForNewGeneratedImage(baseline, timeoutMs) {
+  const sendComposerPrompt = sendCurrentComposer;
+  const clickSendButton = sendCurrentComposer;
+
+  /**
+   * Detect that image generation has started in Gemini.
+   * Looks for structural signals (new response container, stop button, shimmer/loader)
+   * and localized text signals (EN, PT-BR, JA).
+   */
+  async function detectGenerationStart(baseline, timeoutMs = 15000) {
     const start = Date.now();
-    const POLL_MS = 600;
-    const initialUserQueries = baseline?.userQueryCount ?? 0;
-    const initialGenerated = new Set(baseline?.generatedImageSrcs ?? []);
+    const initialResponses = baseline?.modelResponseCount ?? 0;
+
     while (Date.now() - start < timeoutMs) {
-      const currentUserQueries = document.querySelectorAll("user-query").length;
-      if (currentUserQueries <= initialUserQueries) {
-        await sleep(POLL_MS);
-        continue;
-      }
-      const responses = Array.from(
-        document.querySelectorAll("model-response"),
+      // 1. Structural signals
+      const responses = document.querySelectorAll(
+        "model-response, .model-response, [data-test-id='model-response']",
       );
-      if (responses.length === 0) {
-        await sleep(POLL_MS);
-        continue;
-      }
-      const newestResponse = responses[responses.length - 1];
-      const imgs = Array.from(newestResponse.querySelectorAll("img"));
-      const candidates = imgs.filter((i) => {
-        const cls = (i.className || "").toString();
-        if (!/(\s|^)image(\s|$|animate|loaded)/.test(cls)) return false;
-        const alt = i.getAttribute("alt") || "";
-        if (!/ai generated|generated by ai|gerada por ia|générée par ia/i.test(alt)) {
-          return false;
-        }
-        if (!(i.naturalWidth > 0)) return false;
-        const src = i.getAttribute("src") || "";
-        if (!src) return false;
-        if (initialGenerated.has(src)) return false;
-        return true;
-      });
-      if (candidates.length === 1) {
-        const img = candidates[0];
-        const dlBtn = Array.from(
-          newestResponse.querySelectorAll('button[aria-label*="Download" i]'),
-        )[0];
+      if (responses.length > initialResponses) {
         return {
           ok: true,
-          imageSrc: img.getAttribute("src"),
-          alt: img.getAttribute("alt"),
-          naturalWidth: img.naturalWidth,
-          naturalHeight: img.naturalHeight,
-          downloadControl: dlBtn
-            ? { ariaLabel: dlBtn.getAttribute("aria-label") }
-            : null,
+          evidence: "new-model-response-container",
+          elapsedMs: Date.now() - start,
         };
       }
-      if (candidates.length > 1) {
+
+      const stopBtn = document.querySelector(
+        'button[aria-label*="Stop" i], button[aria-label*="Parar" i], button[aria-label*="停止" i]',
+      );
+      if (stopBtn) {
         return {
-          ok: false,
-          error:
-            "Multiple generated images detected. Manual selection required.",
-          multipleCount: candidates.length,
+          ok: true,
+          evidence: "stop-generation-control-active",
+          elapsedMs: Date.now() - start,
+        };
+      }
+
+      const loaders = document.querySelectorAll(
+        '.loading-indicator, .shimmer, .loading-animation, mat-spinner, mat-progress-spinner, [role="progressbar"]',
+      );
+      for (const l of loaders) {
+        if (!l.closest("nav, mat-sidenav, header, aside")) {
+          return {
+            ok: true,
+            evidence: "active-loading-indicator",
+            elapsedMs: Date.now() - start,
+          };
+        }
+      }
+
+      // 2. Text signals (EN, PT-BR, JA)
+      const pageText = document.body ? (document.body.innerText || "") : "";
+      if (
+        /creating your image|criando sua imagem|画像を生成|gerando imagem|generating image|creating image/i.test(
+          pageText,
+        )
+      ) {
+        return {
+          ok: true,
+          evidence: "generation-text-indicator",
+          elapsedMs: Date.now() - start,
+        };
+      }
+
+      await sleep(150);
+    }
+
+    return {
+      ok: false,
+      error: "Generation-start timeout: Gemini did not start image generation.",
+      elapsedMs: Date.now() - start,
+    };
+  }
+
+  /**
+   * Capture rich conversation baseline immediately before sending.
+   * Ensures that any pre-existing images, queries, and responses are recorded.
+   */
+  function captureConversationBaseline() {
+    const allImgs = Array.from(document.querySelectorAll("img"));
+    const allSrcs = allImgs
+      .map((i) => i.getAttribute("src") || i.src || "")
+      .filter((s) => s.length > 0 && !s.startsWith("data:image/svg"));
+
+    const userQueries = Array.from(
+      document.querySelectorAll("user-query, .user-query, [data-test-id='user-query']"),
+    );
+    const modelResponses = Array.from(
+      document.querySelectorAll("model-response, .model-response, [data-test-id='model-response']"),
+    );
+
+    return {
+      capturedAt: Date.now(),
+      userQueryCount: userQueries.length,
+      modelResponseCount: modelResponses.length,
+      generatedImageCount: allSrcs.length,
+      generatedImageSrcs: Array.from(new Set(allSrcs)),
+    };
+  }
+
+  function nodeContains(parent, child) {
+    if (!parent || !child) return false;
+    if (typeof parent.contains === "function") {
+      try {
+        return parent.contains(child);
+      } catch (_) {}
+    }
+    let cur = child;
+    while (cur) {
+      if (cur === parent) return true;
+      cur = cur.parentElement || cur.parentNode;
+    }
+    return false;
+  }
+
+  function isInsideComposerOrQuery(img) {
+    if (!img) return false;
+    if (typeof img.closest === "function") {
+      try {
+        if (img.closest("gem-media-attachment, mat-chip, input-area, input-area-v2, .attachment-container, rich-textarea, user-query, .user-query")) {
+          return true;
+        }
+      } catch (_) {}
+    }
+    let cur = img;
+    while (cur) {
+      const tag = (cur.tagName || "").toLowerCase();
+      const cls = getElementClassText(cur).toLowerCase();
+      if (
+        tag === "gem-media-attachment" ||
+        tag === "mat-chip" ||
+        tag === "input-area" ||
+        tag === "input-area-v2" ||
+        tag === "rich-textarea" ||
+        tag === "user-query" ||
+        cls.includes("user-query") ||
+        cls.includes("attachment-container")
+      ) {
+        return true;
+      }
+      cur = cur.parentElement || cur.parentNode;
+    }
+    return false;
+  }
+
+  /**
+   * Score an <img> element candidate as a potential new AI generated result.
+   * Returns a numerical score from 0 (rejected) to 100+ (high confidence).
+   */
+  function scoreGeneratedImageCandidate(img, baseline, newestResponse) {
+    if (!img) return { score: 0, reason: "null-element" };
+    const src = img.getAttribute("src") || img.src || "";
+    if (!src || src.length < 5) return { score: 0, reason: "empty-src" };
+
+    // 1. Anti-Old-Image rule: Hard reject if present in pre-send baseline
+    const initialSrcs = new Set(baseline?.generatedImageSrcs || []);
+    if (initialSrcs.has(src)) {
+      return { score: 0, reason: "present-in-baseline" };
+    }
+
+    // 2. Anti-Reference / Anti-Upload / Anti-Composer rule
+    if (isInsideComposerOrQuery(img)) {
+      return { score: 0, reason: "inside-composer-or-user-query" };
+    }
+
+    // 3. Anti-Icon / Anti-Avatar rule
+    const lowerSrc = src.toLowerCase();
+    if (
+      lowerSrc.includes("avatar") ||
+      lowerSrc.includes("profile") ||
+      lowerSrc.includes("favicon") ||
+      lowerSrc.includes("googlelogo") ||
+      lowerSrc.includes("bot_avatar") ||
+      lowerSrc.includes("icon")
+    ) {
+      return { score: 0, reason: "avatar-or-icon-src" };
+    }
+    if (src.startsWith("data:image/svg")) {
+      return { score: 0, reason: "svg-data-uri" };
+    }
+
+    // 4. Hidden element rejection
+    if (img.style && (img.style.display === "none" || img.style.visibility === "hidden" || img.style.opacity === "0")) {
+      return { score: 0, reason: "hidden-element" };
+    }
+
+    let score = 10;
+    const signals = [];
+
+    // 5. Positive: Resides inside the newest model response container
+    if (newestResponse && nodeContains(newestResponse, img)) {
+      score += 40;
+      signals.push("inside-newest-response");
+    }
+
+    // 6. Positive: Alt text indicates AI generation (PT-BR, EN, JA, ES, FR)
+    const alt = (img.getAttribute("alt") || "").toLowerCase();
+    if (
+      /ai generated|generated by ai|gerada por ia|générée par ia|imagen generada|画像|generated|image \d/i.test(
+        alt,
+      )
+    ) {
+      score += 30;
+      signals.push("ai-alt-text");
+    }
+
+    // 7. Positive: Parent is a dedicated image container
+    let isDedicatedContainer = false;
+    if (typeof img.closest === "function") {
+      try {
+        isDedicatedContainer = !!img.closest("generated-image, .generated-image, .image-container, .generated-image-container, mat-card, .model-response-content, .media-container");
+      } catch (_) {}
+    }
+    if (!isDedicatedContainer) {
+      let c = img.parentElement || img.parentNode;
+      while (c) {
+        const t = (c.tagName || "").toLowerCase();
+        const cl = getElementClassText(c).toLowerCase();
+        if (t === "generated-image" || cl.includes("image-container") || cl.includes("generated-image") || cl.includes("model-response-content")) {
+          isDedicatedContainer = true;
+          break;
+        }
+        c = c.parentElement || c.parentNode;
+      }
+    }
+    if (isDedicatedContainer) {
+      score += 25;
+      signals.push("image-container-parent");
+    }
+
+    // 8. Positive: Large dimensions (natural or rendered)
+    const nw = img.naturalWidth || 0;
+    const nh = img.naturalHeight || 0;
+    const rw = img.clientWidth || img.offsetWidth || 0;
+    if (nw >= 200 || rw >= 200) {
+      score += 20;
+      signals.push("large-dimensions");
+    }
+
+    // 9. Positive: Associated with download/share controls
+    let parentContainer = null;
+    if (typeof img.closest === "function") {
+      try {
+        parentContainer = img.closest("model-response, .model-response, [data-test-id='model-response']");
+      } catch (_) {}
+    }
+    if (!parentContainer) {
+      parentContainer = newestResponse;
+    }
+    if (parentContainer) {
+      const buttons = typeof parentContainer.querySelectorAll === "function" ? Array.from(parentContainer.querySelectorAll("button, a, [role='button']")) : [];
+      const hasDownload = buttons.some((b) => {
+        const aria = (b.getAttribute?.("aria-label") || "").toLowerCase();
+        const title = (b.getAttribute?.("title") || "").toLowerCase();
+        const text = (b.textContent || "").toLowerCase();
+        return (
+          aria.includes("download") ||
+          aria.includes("baixar") ||
+          aria.includes("ダウンロード") ||
+          aria.includes("descargar") ||
+          aria.includes("télécharger") ||
+          title.includes("download") ||
+          text.includes("download")
+        );
+      });
+      if (hasDownload) {
+        score += 15;
+        signals.push("download-button-present");
+      }
+    }
+
+    return { score, signals, src, alt, dimensions: { naturalWidth: nw, naturalHeight: nh, renderedWidth: rw } };
+  }
+
+  /**
+   * Verify stability of a candidate image before returning it for download.
+   */
+  async function verifyImageStability(img, waitMs = 400) {
+    if (!img) return false;
+    const initialSrc = img.getAttribute("src") || img.src || "";
+    if (!initialSrc) return false;
+    await sleep(waitMs);
+    const finalSrc = img.getAttribute("src") || img.src || "";
+    if (initialSrc !== finalSrc) return false;
+    // Ensure dimensions are non-trivial if available
+    const nw = img.naturalWidth || 0;
+    const rw = img.clientWidth || img.offsetWidth || 0;
+    if (nw === 0 && rw === 0 && (img.complete === false)) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Non-destructive one-shot result discovery for [ Retry Detection ].
+   */
+  function findNewGeneratedResult(baseline) {
+    const responses = Array.from(
+      document.querySelectorAll("model-response, .model-response, [data-test-id='model-response']"),
+    );
+    if (responses.length === 0) {
+      return { ok: false, error: "No model responses present." };
+    }
+    const newestResponse = responses[responses.length - 1];
+    const imgs = Array.from(document.querySelectorAll("img"));
+
+    const scored = imgs
+      .map((img) => ({ img, result: scoreGeneratedImageCandidate(img, baseline, newestResponse) }))
+      .filter((item) => item.result.score >= 50)
+      .sort((a, b) => b.result.score - a.result.score);
+
+    if (scored.length === 0) {
+      return { ok: false, error: "No new generated image detected matching criteria." };
+    }
+
+    const top = scored[0];
+    const dlBtn = top.img
+      .closest("model-response, .model-response, [data-test-id='model-response']")
+      ?.querySelector('button[aria-label*="Download" i], button[aria-label*="Baixar" i], button[aria-label*="ダウンロード" i]');
+
+    return {
+      ok: true,
+      imageSrc: top.result.src,
+      alt: top.result.alt,
+      naturalWidth: top.result.dimensions.naturalWidth,
+      naturalHeight: top.result.dimensions.naturalHeight,
+      score: top.result.score,
+      downloadControl: dlBtn ? { ariaLabel: dlBtn.getAttribute("aria-label") } : null,
+    };
+  }
+
+  /**
+   * Poll for any newly-rendered image not in the baseline, with at least
+   * one rendered dimension >= 100px (rules out icons / placeholders /
+   * thumbnails that haven't loaded yet).
+   *
+   * v0.9.96 — radical simplification. After 4 attempts we couldn't find
+   * a robust "generation done" signal (Gemini's page contains the words
+   * "creating image" / "gerando imagem" in tooltips and footers that
+   * make any text-based detection flaky, and DOM heuristics like
+   * spinner / stop-button / new-model-response change shape across
+   * Gemini updates). The user has Mark as Redo for wrong images, so
+   * the only thing this function needs to do is:
+   *
+   *   1. Poll every 200ms.
+   *   2. Find any <img> whose src is not in the baseline, is not an
+   *      inline SVG placeholder, and has rendered dimensions >= 100px
+   *      on at least one axis.
+   *   3. Return immediately on first hit.
+   *
+   * That's it. No generation-done signals, no scoring, no stability
+   * check, no container class. The user verifies visually.
+   */
+  async function waitForNewGeneratedImage(baseline, timeoutMs = 90000) {
+    const start = Date.now();
+    const POLL_MS = 200;
+    const baselineSrcs = new Set(baseline?.generatedImageSrcs || []);
+
+    while (Date.now() - start < timeoutMs) {
+      const candidate = findNewRenderedImage(baselineSrcs);
+      if (candidate) {
+        return {
+          ok: true,
+          imageSrc: candidate.src,
+          alt: candidate.alt,
+          naturalWidth: candidate.naturalWidth || 0,
+          naturalHeight: candidate.naturalHeight || 0,
+          score: 0,
+          downloadControl: candidate.downloadControl,
+          generationVisualCompletionAt: Date.now(),
+          elapsedMs: Date.now() - start,
+          allSignalsClear: true,
+          detectionTier: 1,
+          stabilityPath: "first-rendered-image",
         };
       }
       await sleep(POLL_MS);
     }
+
     return {
       ok: false,
-      error: "No new generated image detected within the timeout.",
+      error: "Generation timed out before any new rendered image appeared.",
+      stage: "wait-for-image",
       timeoutMs,
+      elapsedMs: Date.now() - start,
     };
   }
 
-  // ---- v0.6.2: Attachment Step Trace + Layered Menu/Input Probes ------
+  /**
+   * Find the first <img> on the page whose src is not in the baseline
+   * (i.e. not a pre-existing image) and whose rendered dimensions are
+   * >= 100px on at least one axis (i.e. not a placeholder / icon).
+   * Returns { src, alt, naturalWidth, naturalHeight, downloadControl }
+   * or null.
+   *
+   * Extracted from waitForNewGeneratedImage so the same probe can be
+   * reused by retry-detection paths and tested in isolation.
+   */
+  function findNewRenderedImage(baselineSrcs) {
+    const imgs = Array.from(document.querySelectorAll("img"));
+    for (const img of imgs) {
+      const src = img.getAttribute("src") || img.src || "";
+      if (!src || src.length < 5) continue;
+      if (src.startsWith("data:image/svg")) continue;
+      if (baselineSrcs.has(src)) continue;
+
+      const w = img.naturalWidth || img.clientWidth || img.offsetWidth || 0;
+      const h = img.naturalHeight || img.clientHeight || img.offsetHeight || 0;
+      // Require at least one rendered dimension >= 100px. This rules out
+      // icons (typically <50px) and not-yet-loaded placeholders.
+      if (w < 100 && h < 100) continue;
+
+      // Try to find a download control near this image for observability.
+      const container = typeof img.closest === "function"
+        ? img.closest("model-response, .model-response, [data-test-id='model-response']")
+        : null;
+      let dlBtn = null;
+      const root = container || img.parentElement || document.body;
+      if (root && typeof root.querySelector === "function") {
+        dlBtn = root.querySelector(
+          'button[aria-label*="Download" i], button[aria-label*="Baixar" i], button[aria-label*="ダウンロード" i]',
+        );
+      }
+      return {
+        src,
+        alt: img.getAttribute("alt") || null,
+        naturalWidth: img.naturalWidth || 0,
+        naturalHeight: img.naturalHeight || 0,
+        downloadControl: dlBtn
+          ? { ariaLabel: dlBtn.getAttribute("aria-label") }
+          : null,
+      };
+    }
+    return null;
+  }  // ---- v0.6.2: Attachment Step Trace + Layered Menu/Input Probes ------
   //
   // The v0.6.1 attach flow was failing in real Chrome with no observable
   // failure: trigger found, click did nothing observable. We need to
@@ -1801,14 +2739,57 @@
     "attachment-ready",
   ]);
 
-  function makeTraceStep(step, ok, payload, startedAt) {
+  function makeTraceStep(step, ok, payload, startedAt, explicitStatus) {
+    let status = explicitStatus;
+    if (!status) {
+      if (payload && payload.skipped) {
+        status = "skipped";
+      } else if (ok === true) {
+        status = "success";
+      } else if (ok === false) {
+        status = "failed";
+      } else {
+        status = "not-run";
+      }
+    }
     return {
       step,
-      ok: !!ok,
+      ok: status === "success",
+      status,
       ts: new Date().toISOString(),
       durationMs: Date.now() - startedAt,
       payload: payload || null,
     };
+  }
+
+  function classifyFileInput(el) {
+    if (!el) return "UNKNOWN";
+    const accept = (el.getAttribute("accept") || "").toLowerCase().trim();
+    if (
+      accept.includes("image") ||
+      accept.includes(".png") ||
+      accept.includes(".jpg") ||
+      accept.includes(".jpeg") ||
+      accept.includes(".webp")
+    ) {
+      return "IMAGE_UPLOAD";
+    }
+    if (
+      accept.includes(".txt") ||
+      accept.includes(".pdf") ||
+      accept.includes(".doc") ||
+      accept.includes(".docx") ||
+      accept.includes(".js") ||
+      accept.includes(".json") ||
+      accept.includes(".zip") ||
+      accept.includes(".py")
+    ) {
+      return "DOCUMENT_UPLOAD";
+    }
+    if (!accept || accept === "*/*") {
+      return "GENERIC_OR_UNKNOWN";
+    }
+    return "UNKNOWN";
   }
 
   function describeDomNode(el) {
@@ -1818,7 +2799,7 @@
     let parentClass = null;
     if (parent) {
       parentTag = parent.tagName?.toLowerCase() ?? null;
-      parentClass = (parent.className || "").toString().slice(0, 80);
+      parentClass = getElementClassText(parent).slice(0, 80);
     }
     return {
       tag: el.tagName?.toLowerCase() ?? null,
@@ -1826,6 +2807,7 @@
       type: el.getAttribute("type") ?? null,
       accept: el.getAttribute("accept") ?? null,
       multiple: el.multiple ?? null,
+      classification: classifyFileInput(el),
       display: el.style?.display ?? null,
       visibility: el.style?.visibility ?? null,
       width: el.getBoundingClientRect().width,
@@ -1873,7 +2855,7 @@
             source: sel,
             tag: el.tagName?.toLowerCase() ?? null,
             role: el.getAttribute("role") ?? null,
-            classHint: (el.className || "").toString().slice(0, 80),
+            classHint: getElementClassText(el).slice(0, 80),
             rect: { x: r.x, y: r.y, w: r.width, h: r.height },
             itemCount: el.querySelectorAll(
               '[role="menuitem"], [role="menuitemcheckbox"], button, a',
@@ -1906,7 +2888,7 @@
       ariaLabel: aria,
       textSample: text.slice(0, 80),
       textLength: text.length,
-      classHint: (el.className || "").toString().slice(0, 120),
+      classHint: getElementClassText(el).slice(0, 120),
       iconAlt,
       dataAttrs: collectUsefulDataAttrs(el),
     };
@@ -1976,6 +2958,7 @@
       ok: true,
       item: best.desc,
       tier: best.tier,
+      el: best.el,
       candidates: candidates.slice(0, 8).map((c) => c.desc),
     };
   }
@@ -2127,89 +3110,110 @@
   }
 
   /**
-   * Wait for a real DOM signal that the chat composer recognized the
-   * attachment. We do NOT trust file injection alone; we verify a
-   * concrete UI delta.
+   * Wait until an attachment chip or thumbnail appears in the composer,
+   * AND active uploading progress settles.
    *
-   *   signals: attachment chip count delta, thumbnail under input-area-v2,
-   *            gem-media-attachment appearance, or preview img with
-   *            data: / blob: source.
-   *
-   * Returns { ok, evidence, signalsAfter }. Never throws.
+   * Returns { ok, chipVisibleAt, uploadCompleteAt, evidence, signalsAfter }. Never throws.
    */
   async function waitForAttachmentEvidence(chipsBefore, timeoutMs) {
     const start = Date.now();
     const deadline = start + (timeoutMs || ATTACH_FILE_TIMEOUT_MS);
-    const area = document.querySelector("input-area-v2");
+    const area = findPromptInputArea() || document.querySelector("input-area-v2") || document.body;
 
     const computeState = () => {
-      const chips = area ? area.querySelectorAll("gem-media-attachment") : [];
-      const thumbs = area ? area.querySelectorAll('[class*="thumbnail" i], img[src^="data:"], img[src^="blob:"]') : [];
+      const root = area || document;
+      const chips = root.querySelectorAll
+        ? root.querySelectorAll("gem-media-attachment, [class*='attachment' i]:not(.attachment-container), [data-test-id*='attachment']")
+        : [];
+      const thumbs = root.querySelectorAll
+        ? root.querySelectorAll('[class*="thumbnail" i], img[src^="data:"], img[src^="blob:"]')
+        : [];
+      const pendingUploads = countActiveUploads(area);
       return {
         chips: chips.length,
         thumbnails: thumbs.length,
+        pendingUploads,
       };
     };
 
     return new Promise((resolve) => {
       let resolved = false;
-      const finalize = (r) => {
+      let chipVisibleAt = null;
+
+      const checkSettledAndFinalize = async (state) => {
+        if (resolved) return;
+        if (!chipVisibleAt) chipVisibleAt = Date.now();
+
+        // Wait for upload progress indicators to settle to 0
+        const settleDeadline = Date.now() + 8000;
+        let finalState = computeState();
+        while (finalState.pendingUploads > 0 && Date.now() < settleDeadline) {
+          await sleep(150);
+          finalState = computeState();
+        }
+        const uploadCompleteAt = Date.now();
+
         if (resolved) return;
         resolved = true;
-        try {
-          obs.disconnect();
-        } catch (_) {
-          /* ignore */
-        }
-        resolve(r);
+        try { obs.disconnect(); } catch (_) {}
+        resolve({
+          ok: true,
+          chipVisibleAt,
+          uploadCompleteAt,
+          signalsAfter: { ...finalState, atMs: Date.now() - start },
+          evidence: {
+            chipsDelta: finalState.chips - chipsBefore,
+            thumbnails: finalState.thumbnails,
+            pendingUploads: finalState.pendingUploads,
+            areaTag: area?.tagName?.toLowerCase() ?? null,
+          },
+        });
+      };
+
+      const finalizeFailure = (state) => {
+        if (resolved) return;
+        resolved = true;
+        try { obs.disconnect(); } catch (_) {}
+        resolve({
+          ok: false,
+          chipVisibleAt: null,
+          uploadCompleteAt: null,
+          signalsAfter: { ...state, atMs: Date.now() - start },
+          evidence: {
+            chipsDelta: state.chips - chipsBefore,
+            thumbnails: state.thumbnails,
+            pendingUploads: state.pendingUploads,
+            areaTag: area?.tagName?.toLowerCase() ?? null,
+          },
+        });
       };
 
       const obs = new MutationObserver(() => {
         const state = computeState();
-        if (state.chips > chipsBefore || state.thumbnails > 0) {
-          finalize({
-            ok: true,
-            signalsAfter: { ...state, atMs: Date.now() - start },
-            evidence: {
-              chipsDelta: state.chips - chipsBefore,
-              thumbnails: state.thumbnails,
-              areaTag: area?.tagName?.toLowerCase() ?? null,
-            },
-          });
+        // Treat active uploads as success evidence even before the chip
+        // renders. Gemini accepts a file (paste/drop/input) and starts
+        // uploading without immediately rendering the chip; if we time
+        // out waiting for the chip alone, attachFileWithMenu would fall
+        // through to the next strategy and dispatch the SAME file again,
+        // producing duplicate uploads. (Regression test: pendingUploads
+        // is in both this branch and tick() below.)
+        if (state.chips > chipsBefore || state.thumbnails > 0 || state.pendingUploads > 0) {
+          checkSettledAndFinalize(state);
         }
       });
       try {
         obs.observe(document.body, { childList: true, subtree: true });
-      } catch (_) {
-        /* ignore */
-      }
+      } catch (_) {}
 
       const tick = () => {
         if (resolved) return;
         const state = computeState();
-        if (state.chips > chipsBefore || state.thumbnails > 0) {
-          finalize({
-            ok: true,
-            signalsAfter: { ...state, atMs: Date.now() - start },
-            evidence: {
-              chipsDelta: state.chips - chipsBefore,
-              thumbnails: state.thumbnails,
-              areaTag: area?.tagName?.toLowerCase() ?? null,
-            },
-          });
+        if (state.chips > chipsBefore || state.thumbnails > 0 || state.pendingUploads > 0) {
+          checkSettledAndFinalize(state);
           return;
         }
         if (Date.now() >= deadline) {
-          const state = computeState();
-          finalize({
-            ok: false,
-            signalsAfter: { ...state, atMs: Date.now() - start },
-            evidence: {
-              chipsDelta: state.chips - chipsBefore,
-              thumbnails: state.thumbnails,
-              areaTag: area?.tagName?.toLowerCase() ?? null,
-            },
-          });
+          finalizeFailure(state);
           return;
         }
         setTimeout(tick, 100);
@@ -2613,7 +3617,7 @@
       evidence: evidenceResult.evidence,
     });
 
-    // Filename presence in chip area. This is the strong final signal.
+    // Filename presence in chip area OR visual evidence confirmation.
     let matched = false;
     if (area) {
       const chips = area.querySelectorAll("gem-media-attachment");
@@ -2625,9 +3629,14 @@
         }
       }
     }
+    // Positive visual evidence (chip delta or thumbnail) is the primary ground truth
+    if (evidenceResult.ok && evidenceResult.evidence && (evidenceResult.evidence.chipsDelta > 0 || evidenceResult.evidence.thumbnails > 0)) {
+      matched = true;
+    }
+
     if (!matched) {
       pushStep("attachment-ready", false, {
-        reason: "no chip text includes file.name",
+        reason: "no visual attachment chip or thumbnail was acknowledged by Gemini",
       });
       trace.failedAt = "attachment-ready";
       return trace;
@@ -2642,6 +3651,126 @@
       totalDurationMs: Date.now() - startedAt,
     };
     return trace;
+  }
+
+  /**
+   * Enumerate and classify all upload mechanisms and candidate elements.
+   */
+  function discoverUploadMechanisms() {
+    const trigger = findPlusButton();
+    const existingInputs = Array.from(document.querySelectorAll('input[type="file"]')).map((el) => ({
+      classification: classifyFileInput(el),
+      accept: el.getAttribute("accept") ?? null,
+      multiple: el.multiple ?? null,
+      disabled: el.disabled ?? false,
+      visible: el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().height > 0,
+      connected: el.isConnected ?? true,
+      boundingRect: {
+        width: el.getBoundingClientRect().width,
+        height: el.getBoundingClientRect().height,
+      },
+    }));
+
+    const menuCandidates = findMenuCandidates();
+    const menuItems = Array.from(
+      document.querySelectorAll('[role="menuitem"], [role="menuitemcheckbox"], button.mat-mdc-menu-item, .cdk-overlay-container button'),
+    ).filter((el) => {
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    }).map((el) => describeMenuItem(el)).filter(Boolean);
+
+    const imageInputs = existingInputs.filter((i) => i.classification === "IMAGE_UPLOAD" || i.classification === "GENERIC_OR_UNKNOWN");
+    const documentInputs = existingInputs.filter((i) => i.classification === "DOCUMENT_UPLOAD");
+
+    return {
+      triggerFound: !!trigger,
+      triggerAria: trigger?.getAttribute("aria-label") ?? null,
+      menuCount: menuCandidates.length,
+      menuItemCount: menuItems.length,
+      menuItems: menuItems.slice(0, 10),
+      fileInputsTotal: existingInputs.length,
+      imageInputsCount: imageInputs.length,
+      documentInputsCount: documentInputs.length,
+      fileInputs: existingInputs,
+      primaryStrategyRecommended: imageInputs.length > 0 ? "input-injection" : "drag-and-drop-or-input-probe",
+    };
+  }
+
+  /**
+   * Diagnostic execution for single image attachment with granular stages.
+   */
+  async function testSingleImageAttachment(file, opts) {
+    const startedAt = Date.now();
+    const report = {
+      test: "single-image-attachment",
+      fileName: file?.name ?? null,
+      fileSize: file?.size ?? 0,
+      fileType: file?.type ?? null,
+      stages: {},
+      summary: {},
+    };
+
+    // Stage 1: File transport verification
+    if (!file || typeof file !== "object" || typeof file.name !== "string") {
+      report.stages.file = { ok: false, error: "Invalid file object" };
+      report.result = { ok: false, failedStage: "FILE_VERIFICATION", reason: "Invalid file object" };
+      return report;
+    }
+    if (file.size === 0) {
+      report.stages.file = { ok: false, error: "File is empty (0 bytes)" };
+      report.result = { ok: false, failedStage: "FILE_VERIFICATION", reason: "File is empty (0 bytes)" };
+      return report;
+    }
+    report.stages.file = {
+      ok: true,
+      name: file.name,
+      size: file.size,
+      type: file.type,
+    };
+
+    // Stage 2: Gemini DOM discovery & trigger
+    const area = document.querySelector("input-area-v2") || findPromptInputArea();
+    const chipsBefore = countComposerAttachments(area);
+    const trigger = findPlusButton();
+    const discovery = discoverUploadMechanisms();
+    report.stages.discovery = {
+      ok: !!trigger,
+      triggerAria: trigger?.getAttribute("aria-label") ?? null,
+      chipsBefore,
+      discovery,
+    };
+
+    // Stage 3: Perform attachment via attachFileWithMenu
+    const attachRes = await attachFileWithMenu(file, { timeoutMs: opts?.timeoutMs || ATTACH_FILE_TIMEOUT_MS });
+    report.stages.attachment = attachRes;
+
+    // Stage 4: Visual evidence validation
+    const chipsAfter = countComposerAttachments(area);
+    const delta = chipsAfter - chipsBefore;
+    report.stages.evidence = {
+      chipsBefore,
+      chipsAfter,
+      delta,
+      ok: delta > 0 || (attachRes && attachRes.ok),
+    };
+
+    if (report.stages.evidence.ok) {
+      report.result = {
+        ok: true,
+        method: attachRes.method || "datatransfer",
+        elapsedMs: Date.now() - startedAt,
+        message: `${file.name} attached successfully with visual evidence (+${Math.max(1, delta)}).`,
+      };
+    } else {
+      report.result = {
+        ok: false,
+        failedStage: attachRes.phase || "WAIT_FOR_EVIDENCE",
+        reason: attachRes.error || "No visual attachment chip or thumbnail appeared in the composer.",
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    return report;
   }
 
   /**
@@ -2660,22 +3789,25 @@
 
     const selected = findPromptInput();
     const selectedQuill = selected ? locateQuill(selected) : null;
-    const contentLength = selected ? textboxTextLength(selected) : null;
+    const composerText = getComposerText();
+    const contentLength = selected ? composerText.length : null;
     const attachment = attachmentProbe();
     const imageMode = imageModeProbe();
     const baseline = captureConversationBaseline();
     const sendBtn = findSendButtonDiagnostic();
 
     return {
-      url: location.href,
-      htmlLang: document.documentElement.getAttribute("lang") || null,
-      qlEditorCount: document.querySelectorAll(".ql-editor").length,
-      richTextareaCount: document.querySelectorAll("rich-textarea").length,
-      textboxRoleCount: document.querySelectorAll('[role="textbox"]').length,
-      quillGlobalAvailable: typeof window.Quill !== "undefined",
-      inputAreaCount:
-        document.querySelectorAll("input-area-v2").length +
-        document.querySelectorAll("input-container").length,
+      url: typeof location !== "undefined" ? location.href : "",
+      htmlLang: typeof document !== "undefined" && document.documentElement && typeof document.documentElement.getAttribute === "function"
+        ? document.documentElement.getAttribute("lang")
+        : null,
+      qlEditorCount: typeof document !== "undefined" ? document.querySelectorAll(".ql-editor").length : 0,
+      richTextareaCount: typeof document !== "undefined" ? document.querySelectorAll("rich-textarea").length : 0,
+      textboxRoleCount: typeof document !== "undefined" ? document.querySelectorAll('[role="textbox"]').length : 0,
+      quillGlobalAvailable: typeof window !== "undefined" && typeof window.Quill !== "undefined",
+      inputAreaCount: typeof document !== "undefined"
+        ? document.querySelectorAll("input-area-v2").length + document.querySelectorAll("input-container").length
+        : 0,
       sendButtonFound: !!findSendButton(),
       sendButtonLocalized: sendBtn,
       selected: selected ? describeEl(selected) : null,
@@ -2689,7 +3821,17 @@
   }
 
   globalThis.RedSunDomAdapter = Object.freeze({
+    // Canonical Composer API (v0.8.1)
+    readComposerText,
+    setComposerText,
+    clearComposer,
+    verifyComposerText,
+    // Aliases for backwards compatibility
     insertPromptIntoGemini,
+    getComposerText,
+    inspectComposerContent,
+    clearComposerContent,
+    verifyPromptContent,
     attachFileToGemini,
     selfTest,
     describeEl,
@@ -2709,13 +3851,24 @@
     attachFileWithMenu,
     openAttachmentMenu,
     findUploadFilesMenuitem,
+    getElementClassText,
     countComposerAttachments,
+    countActiveUploads,
+    classifyFileInput,
+    discoverUploadMechanisms,
+    testSingleImageAttachment,
     ATTACH_FILE_TIMEOUT_MS,
-    // v0.6: send + preflight + generation detection
+    // v0.6 / v0.9: send + preflight + generation detection
     sendCurrentComposer,
+    sendComposerPrompt,
+    clickSendButton,
+    detectGenerationStart,
     findSendButtonLocalized,
     findSendButtonDiagnostic,
     captureConversationBaseline,
+    scoreGeneratedImageCandidate,
+    verifyImageStability,
+    findNewGeneratedResult,
     waitForNewGeneratedImage,
     // v0.6.2: attachment step trace + layered menu/input probes
     runAttachTrace,

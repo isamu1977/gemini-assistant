@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.6.2",
-  "description": "Generic project and task manager for gemini.google.com. v0.6.2: attachment instrumentation — structured step trace, layered 'Enviar arquivos' detector (Tier 1 icon-based / Tier 2 accessible-name / Tier 3 localized text), file-input lifecycle probe (0/50/150/300/750/1500/2500 ms checkpoints), Strategy A opt-in (native input + DataTransfer), and a manual gate so Prepare/Generate Task only run after the user verifies attach in real Gemini. v0.6.1: stabilizes Side Panel ↔ Gemini content script messaging. v0.6: end-to-end single-task image generation.",
+  "version": "0.8.0",
+  "description": "Generic project and task manager for gemini.google.com. v0.8.0: full single-task workflow (Prepare Task -> User Review -> Generate Task -> Detect Result -> Download -> Rename -> Complete).",
   "minimum_chrome_version": "116",
 
   "permissions": ["storage", "sidePanel", "downloads"],
@@ -41,6 +41,13 @@
       "js": ["src/dom/geminiDomAdapter.js", "src/content/content.js"],
       "run_at": "document_idle",
       "all_frames": false
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/*", "icons/*"],
+      "matches": ["https://gemini.google.com/*"]
     }
   ]
 }

@@ -47,6 +47,12 @@
     ATTACH_ACTIVATE: "GEMINI_ASSISTANT_ATTACH_ACTIVATE",
     ATTACH_TRACE: "GEMINI_ASSISTANT_ATTACH_TRACE",
     ATTACH_STRATEGY_A: "GEMINI_ASSISTANT_ATTACH_STRATEGY_A",
+    TEST_SINGLE_ATTACH: "GEMINI_ASSISTANT_TEST_SINGLE_ATTACH",
+    TEST_A_BUNDLED: "GEMINI_ASSISTANT_TEST_A_BUNDLED",
+    TEST_B_SYNTHETIC: "GEMINI_ASSISTANT_TEST_B_SYNTHETIC",
+    TEST_C_PROJECT: "GEMINI_ASSISTANT_TEST_C_PROJECT",
+    DISCOVER_UPLOADS: "GEMINI_ASSISTANT_DISCOVER_UPLOADS",
+    TRANSPORT_TEST: "GEMINI_ASSISTANT_TRANSPORT_TEST",
     COMPOSER_STATE: "GEMINI_ASSISTANT_COMPOSER_STATE",
     IMAGE_MODE_PROBE: "GEMINI_ASSISTANT_IMAGE_MODE_PROBE",
     ENSURE_IMAGE_MODE: "GEMINI_ASSISTANT_ENSURE_IMAGE_MODE",
@@ -54,7 +60,10 @@
     FIND_SEND_BUTTON: "GEMINI_ASSISTANT_FIND_SEND_BUTTON",
     CAPTURE_BASELINE: "GEMINI_ASSISTANT_CAPTURE_BASELINE",
     WAIT_FOR_GENERATED_IMAGE: "GEMINI_ASSISTANT_WAIT_FOR_GENERATED_IMAGE",
+    FIND_NEW_RESULT: "GEMINI_ASSISTANT_FIND_NEW_RESULT",
     FETCH_IMAGE: "GEMINI_ASSISTANT_FETCH_IMAGE",
+    INSPECT_COMPOSER: "GEMINI_ASSISTANT_INSPECT_COMPOSER",
+    CLEAR_COMPOSER: "GEMINI_ASSISTANT_CLEAR_COMPOSER",
   });
 
   function isGeminiUrl(url) {
@@ -97,7 +106,18 @@
     if (typeof AbortController !== "undefined" && payload instanceof AbortController) {
       return { ok: false, reason: "AbortController in payload" };
     }
-    // File / Blob are structured-cloneable in modern browsers. We allow them.
+    // ArrayBuffer, TypedArray, Blob, File are structured-cloneable binary representations.
+    if (
+      (typeof ArrayBuffer !== "undefined" && payload instanceof ArrayBuffer) ||
+      (typeof ArrayBuffer !== "undefined" && ArrayBuffer.isView && ArrayBuffer.isView(payload)) ||
+      (typeof Blob !== "undefined" && payload instanceof Blob) ||
+      tag === "[object ArrayBuffer]" ||
+      tag === "[object Uint8Array]" ||
+      tag === "[object Blob]" ||
+      tag === "[object File]"
+    ) {
+      return { ok: true };
+    }
     if (typeof payload === "object") {
       for (const k of Object.keys(payload)) {
         const v = payload[k];
@@ -141,13 +161,48 @@
    * Resolve the Gemini tab the side panel should talk to.
    *
    * Strategy:
+   *   0. Pinned override (optional): if opts.pinnedTabId is a positive
+   *      integer, look up that tab by id and return it if it is still a
+   *      Gemini tab. This prevents the side panel from re-resolving to
+   *      a different tab when the user shifts focus mid-workflow.
    *   1. active + currentWindow (the page the user is currently looking at).
    *   2. Fallback: any window, any tab whose URL is on gemini.google.com.
    *
    * Returns the tab object. Throws with a clear message if no Gemini tab
    * is found or if the resolved tab has no integer id.
    */
-  async function getTargetGeminiTab(chromeRef) {
+  async function getTargetGeminiTab(chromeRef, opts) {
+    opts = opts || {};
+
+    // 0. Pinned override.
+    if (isPositiveInteger(opts.pinnedTabId)) {
+      try {
+        const pinned = await new Promise((resolve, reject) => {
+          if (!chromeRef || !chromeRef.tabs || typeof chromeRef.tabs.get !== "function") {
+            reject(new Error("chrome.tabs.get unavailable"));
+            return;
+          }
+          try {
+            chromeRef.tabs.get(opts.pinnedTabId, (tab) => {
+              if (chromeRef.runtime && chromeRef.runtime.lastError) {
+                reject(new Error(chromeRef.runtime.lastError.message || "tabs.get failed"));
+                return;
+              }
+              resolve(tab || null);
+            });
+          } catch (e) {
+            reject(e instanceof Error ? e : new Error(String(e)));
+          }
+        });
+        if (pinned && isGeminiUrl(pinned.url) && isPositiveInteger(pinned.id)) {
+          return pinned;
+        }
+        // Pinned tab is gone or no longer Gemini. Fall through to discovery.
+      } catch (_) {
+        // ignore; fall through to next strategy
+      }
+    }
+
     // 1. Active + currentWindow.
     try {
       const tabs = await queryTabs(chromeRef, { active: true, currentWindow: true });
@@ -186,7 +241,7 @@
    * Returns the response from the content script, or throws on failure.
    * The thrown Error is always a real Error with a useful `.message`.
    */
-  function sendTabMessage(chromeRef, tabId, message) {
+  function sendTabMessage(chromeRef, tabId, message, opts) {
     if (!isPositiveInteger(tabId)) {
       return Promise.reject(
         new Error(
@@ -211,9 +266,33 @@
       return Promise.reject(new Error("chrome.tabs.sendMessage unavailable"));
     }
 
+    const timeoutMs =
+      opts && typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
+        ? opts.timeoutMs
+        : null;
+
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let timer = null;
+
+      if (timeoutMs) {
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          reject(
+            new Error(
+              `sendTabMessage: timed out after ${timeoutMs}ms (tabId=${tabId}, type=${message.type})`,
+            ),
+          );
+        }, timeoutMs);
+      }
+
       try {
         chromeRef.tabs.sendMessage(tabId, message, (response) => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+
           // lastError is set when the receiving end does not have a listener
           // (e.g. content script not injected into the target tab).
           if (chromeRef.runtime && chromeRef.runtime.lastError) {
@@ -228,6 +307,9 @@
           resolve(response);
         });
       } catch (e) {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
         reject(e instanceof Error ? e : new Error(String(e)));
       }
     });
@@ -241,19 +323,20 @@
    * @param {object} chromeRef  global `chrome` (or a stub in tests).
    * @param {string} type       one of MESSAGE_TYPES.
    * @param {object} [payload]  additional fields merged into the message.
+   * @param {object} [opts]     optional options (e.g. timeoutMs).
    * @returns {Promise<*>}      resolves with the content-script response,
    *                            or rejects with an Error explaining why.
    */
-  async function sendToGemini(chromeRef, type, payload) {
+  async function sendToGemini(chromeRef, type, payload, opts) {
     if (typeof type !== "string" || type.length === 0) {
       throw new Error("sendToGemini: type required");
     }
     if (payload !== undefined && (payload === null || typeof payload !== "object")) {
       throw new Error("sendToGemini: payload must be an object when provided");
     }
-    const tab = await getTargetGeminiTab(chromeRef);
+    const tab = await getTargetGeminiTab(chromeRef, opts);
     const message = Object.assign({ type }, payload || {});
-    return await sendTabMessage(chromeRef, tab.id, message);
+    return await sendTabMessage(chromeRef, tab.id, message, opts);
   }
 
   /**

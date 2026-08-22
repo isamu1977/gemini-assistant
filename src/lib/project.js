@@ -11,6 +11,19 @@
  *     "tasks": [{ "id": string, "title"?: string, "prompt": string }]
  *   }
  *
+ * Version 3 (additive):
+ *   {
+ *     "schemaVersion": 3,
+ *     "project": { ... },
+ *     "generation": {                                  // required in v3
+ *       "masterPrompt": string,                       // non-empty
+ *       "aspectRatio": string,                        // e.g. "16:9", "3:4"
+ *       "sceneSeparator": string                      // e.g. "\n\nSCENE:\n"
+ *     },
+ *     "assets": { ... },                              // same as v2
+ *     "tasks": [ ... ]                                // same as v2
+ *   }
+ *
  * Version 2 (additive):
  *   {
  *     "schemaVersion": 2,
@@ -42,8 +55,8 @@
 (function (globalScope) {
   "use strict";
 
-  const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([1, 2]);
-  const CURRENT_SCHEMA_VERSION = 2;
+  const SUPPORTED_SCHEMA_VERSIONS = Object.freeze([1, 2, 3]);
+  const CURRENT_SCHEMA_VERSION = 3;
 
   // Optional output block on tasks (added in v0.6, additive).
   // Lazily required so project.js can still be loaded standalone in tests
@@ -142,9 +155,43 @@
       };
     }
 
-    // assets (v2 only; v1 has none)
+    // generation block (v2+; v1 has none)
+    let normalizedGeneration = null;
+    if (schemaVersion >= 2) {
+      if (obj.generation !== undefined) {
+        if (!isPlainObject(obj.generation)) {
+          return {
+            ok: false,
+            error: "generation must be an object when present",
+            field: "generation",
+          };
+        }
+        const gen = obj.generation;
+        if (!isNonEmptyString(gen.masterPrompt)) {
+          return {
+            ok: false,
+            error: "generation.masterPrompt must be a non-empty string",
+            field: "generation.masterPrompt",
+          };
+        }
+        if (gen.aspectRatio !== undefined && !isString(gen.aspectRatio)) {
+          return {
+            ok: false,
+            error: "generation.aspectRatio must be a string when present",
+            field: "generation.aspectRatio",
+          };
+        }
+        normalizedGeneration = {
+          masterPrompt: gen.masterPrompt,
+          aspectRatio: isNonEmptyString(gen.aspectRatio) ? gen.aspectRatio : "",
+          sceneSeparator: typeof gen.sceneSeparator === "string" ? gen.sceneSeparator : "\n\nSCENE:\n",
+        };
+      }
+    }
+
+    // assets (v2+; v1 has none)
     let normalizedAssets = {};
-    if (schemaVersion === 2) {
+    if (schemaVersion >= 2) {
       if (obj.assets !== undefined) {
         if (!isPlainObject(obj.assets)) {
           return {
@@ -269,9 +316,9 @@
         };
       }
 
-      // references (v2 only; v1 has none)
+      // references (v2+; v1 has none)
       let normalizedRefs = [];
-      if (schemaVersion === 2 && t.references !== undefined) {
+      if (schemaVersion >= 2 && t.references !== undefined) {
         if (!Array.isArray(t.references)) {
           return {
             ok: false,
@@ -353,6 +400,7 @@
           name: proj.name,
           description: proj.description ?? "",
         },
+        generation: normalizedGeneration,
         assets: normalizedAssets,
         tasks: normalizedTasks,
       },
@@ -480,6 +528,103 @@
   }
 
   /**
+   * Natural-language image format instruction based on generation.aspectRatio.
+   *
+   * @param {string|null|undefined} aspectRatio e.g. "16:9", "9:16", "1:1"
+   * @returns {string}
+   */
+  function buildAspectRatioInstruction(aspectRatio) {
+    if (!aspectRatio || typeof aspectRatio !== "string") return "";
+    const cleanAr = aspectRatio.trim();
+    if (!cleanAr) return "";
+
+    if (cleanAr === "16:9") {
+      return (
+        "IMAGE FORMAT:\n" +
+        "Generate the final image in a cinematic 16:9 landscape aspect ratio.\n" +
+        "Use a wide horizontal composition.\n" +
+        "Do not produce portrait, square, or near-square framing.\n" +
+        "Compose for video use, keeping key subjects and essential visual information safely inside the frame with natural breathing room near the edges."
+      );
+    }
+
+    if (cleanAr === "9:16") {
+      return (
+        "IMAGE FORMAT:\n" +
+        "Generate the final image in a vertical 9:16 portrait aspect ratio.\n" +
+        "Use a tall vertical composition optimized for mobile full-screen viewing.\n" +
+        "Do not produce landscape, square, or near-square framing.\n" +
+        "Keep key subjects and essential visual information centered and safely inside vertical boundaries."
+      );
+    }
+
+    if (cleanAr === "1:1") {
+      return (
+        "IMAGE FORMAT:\n" +
+        "Generate the final image in a 1:1 square aspect ratio.\n" +
+        "Use a balanced square composition with equal width and height.\n" +
+        "Do not produce landscape or portrait framing.\n" +
+        "Keep key subjects well-centered within the square frame."
+      );
+    }
+
+    return (
+      "IMAGE FORMAT:\n" +
+      `Generate the final image in a ${cleanAr} aspect ratio.\n` +
+      "Compose subjects clearly and safely within the specified frame dimensions."
+    );
+  }
+
+  /**
+   * Pure, centralized single source of truth for constructing the final prompt
+   * to be inserted into Gemini.
+   *
+   * If the project defines generation, combines:
+   *   `${masterPrompt}\n\n${aspectRatioInstruction}${sceneSeparator}${scenePrompt}`
+   * where sceneSeparator defaults to "\n\nSCENE:\n".
+   *
+   * If generation is absent (e.g. schemaVersion 1 or 2), returns
+   * the scene prompt verbatim.
+   *
+   * @param {object} project - Validated project object
+   * @param {object|string} task - Task object or prompt string
+   * @returns {string} The final composite prompt text
+   */
+  function buildFinalPrompt(project, task) {
+    if (!task) return "";
+    const scenePrompt = typeof task === "string" ? task : (task.prompt || "");
+    if (!project || !project.generation) {
+      return scenePrompt;
+    }
+
+    const master = isNonEmptyString(project.generation.masterPrompt)
+      ? String(project.generation.masterPrompt).trim()
+      : "";
+    const aspectInstr = isNonEmptyString(project.generation.aspectRatio)
+      ? buildAspectRatioInstruction(project.generation.aspectRatio)
+      : "";
+
+    let header = "";
+    if (master && aspectInstr) {
+      header = `${master}\n\n${aspectInstr}`;
+    } else if (master) {
+      header = master;
+    } else if (aspectInstr) {
+      header = aspectInstr;
+    }
+
+    if (!header) {
+      return scenePrompt;
+    }
+
+    const sep = project.generation.sceneSeparator !== undefined
+      ? project.generation.sceneSeparator
+      : "\n\nSCENE:\n";
+
+    return `${header}${sep}${scenePrompt}`;
+  }
+
+  /**
    * Strip any mutable-state field that does not belong in the source-of-truth
    * project object. Used defensively before saving/importing.
    */
@@ -491,6 +636,11 @@
         name: parsed.project.name,
         description: parsed.project.description ?? "",
       },
+      generation: parsed.generation ? {
+        masterPrompt: parsed.generation.masterPrompt,
+        aspectRatio: parsed.generation.aspectRatio,
+        sceneSeparator: parsed.generation.sceneSeparator,
+      } : null,
       assets: { ...(parsed.assets ?? {}) },
       tasks: parsed.tasks.map((t) => ({
         id: t.id,
@@ -499,6 +649,94 @@
         references: Array.isArray(t.references) ? [...t.references] : [],
         output: t.output && t.output.basename ? { basename: t.output.basename } : null,
       })),
+    };
+  }
+
+  function normalizeText(text) {
+    if (typeof text !== "string") return "";
+    return text
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ")
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .join("\n");
+  }
+
+  function normalizeExpectedPrompt(text) {
+    return normalizeText(text);
+  }
+
+  function normalizeGeminiComposerText(text) {
+    return normalizeText(text);
+  }
+
+  function verifyPromptContent(expectedRaw, actualRaw) {
+    const exp = typeof expectedRaw === "string" ? expectedRaw : "";
+    const act = typeof actualRaw === "string" ? actualRaw : "";
+
+    const normExp = normalizeExpectedPrompt(exp);
+    const normAct = normalizeGeminiComposerText(act);
+
+    if (normExp === normAct) {
+      return {
+        ok: true,
+        expectedRawLength: exp.length,
+        actualRawLength: act.length,
+        expectedNormLength: normExp.length,
+        actualNormLength: normAct.length,
+        normalizedMatch: true,
+      };
+    }
+
+    // Secondary tolerance: check paragraph newline runs (Quill adds extra blank paragraphs)
+    const normExpPara = normExp.replace(/\n{3,}/g, "\n\n");
+    const normActPara = normAct.replace(/\n{3,}/g, "\n\n");
+    if (normExpPara === normActPara) {
+      return {
+        ok: true,
+        expectedRawLength: exp.length,
+        actualRawLength: act.length,
+        expectedNormLength: normExp.length,
+        actualNormLength: normAct.length,
+        normalizedMatch: true,
+        slackReason: "paragraph-newlines-normalized",
+      };
+    }
+
+    // Determine first mismatch index
+    let mismatchIdx = -1;
+    const minLen = Math.min(normExp.length, normAct.length);
+    for (let i = 0; i < minLen; i++) {
+      if (normExp[i] !== normAct[i]) {
+        mismatchIdx = i;
+        break;
+      }
+    }
+    if (mismatchIdx === -1 && normExp.length !== normAct.length) {
+      mismatchIdx = minLen;
+    }
+
+    const startCtx = Math.max(0, mismatchIdx - 25);
+    const endCtxExp = Math.min(normExp.length, mismatchIdx + 25);
+    const endCtxAct = Math.min(normAct.length, mismatchIdx + 25);
+
+    const expSnippet = normExp.slice(startCtx, endCtxExp);
+    const actSnippet = normAct.slice(startCtx, endCtxAct);
+
+    return {
+      ok: false,
+      expectedRawLength: exp.length,
+      actualRawLength: act.length,
+      expectedNormLength: normExp.length,
+      actualNormLength: normAct.length,
+      normalizedMatch: false,
+      mismatchIndex: mismatchIdx,
+      expectedSnippet: expSnippet,
+      actualSnippet: actSnippet,
+      error: `Prompt verification failed at char ${mismatchIdx}: expected "...${expSnippet}..." but found "...${actSnippet}..." (expected ${normExp.length} normalized chars, found ${normAct.length})`,
     };
   }
 
@@ -511,6 +749,11 @@
     parseProjectJson,
     validateProject,
     buildInitialTaskState,
+    buildFinalPrompt,
+    buildAspectRatioInstruction,
+    normalizeExpectedPrompt,
+    normalizeGeminiComposerText,
+    verifyPromptContent,
     firstTaskId,
     indexOfTaskId,
     summarizeProgress,

@@ -71,8 +71,8 @@
         </div>
       </section>
 
-      <!-- TASK -->
-      <section class="card task-card">
+      <!-- TASK & PRIMARY WORKFLOW -->
+      <section id="primary-workflow" class="card task-card">
         <div class="card-header">
           <span class="card-title">Task</span>
           <span class="task-counter">
@@ -92,15 +92,63 @@
             <span id="task-title" class="task-title"></span>
           </div>
 
-          <div class="references-section">
-            <div class="references-header">
-              <span class="references-label">References</span>
-              <span class="references-count" id="references-count">0</span>
+          <div class="nav-row">
+            <button id="prev-btn" type="button" class="secondary">← Previous</button>
+            <button id="next-btn" type="button" class="secondary">Next →</button>
+          </div>
+
+          <!-- Compact Task Summary -->
+          <div class="task-summary-row" style="display: flex; justify-content: space-between; font-size: 11.5px; color: var(--fg-muted); margin-top: 4px; padding-top: 6px; border-top: 1px solid var(--border);">
+            <span>References: <strong id="workflow-references" class="muted">— / — resolved</strong></span>
+            <span>Aspect Ratio: <strong id="preview-aspect-ratio" class="muted">—</strong></span>
+          </div>
+
+          <!-- Primary Workflow Status & Actions (Immediate Access) -->
+          <div id="workflow-phase" class="workflow-phase" data-phase="idle">idle</div>
+
+          <!-- Live Preparation & Generation Checklist -->
+          <div id="preparation-checklist-container" class="prep-checklist-card" hidden>
+            <div class="prep-checklist-title">Workflow Progress</div>
+            <ul id="preparation-checklist" class="prep-checklist"></ul>
+          </div>
+
+          <ul id="workflow-log" class="workflow-log" hidden></ul>
+
+          <!-- Result Metadata Display (When Generated) -->
+          <div id="generation-result-box" class="prep-checklist-card" style="background: var(--bg-card); border: 1px solid var(--accent); margin-top: 8px;" hidden>
+            <div style="font-weight: 600; font-size: 12px; margin-bottom: 4px; color: var(--accent);">Generation Complete ✓</div>
+            <div style="font-size: 11px; display: flex; flex-direction: column; gap: 2px;">
+              <div><strong>Filename:</strong> <span id="result-filename" style="font-family: monospace;">—</span></div>
+              <div><strong>Status:</strong> <span id="result-status-badge" class="badge ok">Generated</span></div>
+              <div><strong>Download ID:</strong> <span id="result-download-id">—</span></div>
             </div>
-            <ul id="references-list" class="references-list"></ul>
-            <p id="references-empty" class="references-empty" hidden>
-              No references for this task.
-            </p>
+          </div>
+
+          <div class="workflow-actions">
+            <button id="prepare-task-btn" type="button" class="primary full-width">
+              Prepare Task
+            </button>
+            <button id="generate-task-btn" type="button" class="primary full-width" disabled hidden>
+              Generate Task
+            </button>
+            <button id="retry-detection-btn" type="button" class="secondary full-width" hidden>
+              Retry Detection
+            </button>
+            <button id="retry-download-btn" type="button" class="secondary full-width" hidden>
+              Retry Download
+            </button>
+            <button id="retry-generate-btn" type="button" class="secondary full-width" hidden>
+              Retry Generate
+            </button>
+            <button id="cancel-op-btn" type="button" class="ghost" hidden>
+              Cancel
+            </button>
+            <button id="reset-prep-btn" type="button" class="secondary" hidden>
+              Reset Preparation
+            </button>
+            <button id="retry-prep-btn" type="button" class="secondary" hidden>
+              Retry Failed Step
+            </button>
           </div>
         </div>
       </section>
@@ -109,68 +157,74 @@
       <section class="card prompt-card">
         <div class="card-header">
           <span class="card-title">Prompt</span>
+          <button id="preview-prompt-btn" type="button" class="ghost" style="font-size: 11px;">
+            Preview Final Prompt
+          </button>
         </div>
         <div class="card-body">
+          <div class="prompt-meta-row">
+            <span class="meta-item">Master Style: <strong id="preview-master-style" class="muted">—</strong></span>
+            <span class="meta-item">Scene Prompt: <strong id="preview-scene-prompt" class="ok">✓</strong></span>
+          </div>
           <textarea
             id="prompt"
             placeholder="Prompt of the current task…"
-            rows="6"
+            rows="5"
             spellcheck="false"
             autocomplete="off"
           ></textarea>
-          <div class="prompt-actions">
-            <button id="insert-btn" type="button" class="primary">Insert Prompt</button>
-          </div>
-          <div class="nav-row">
-            <button id="prev-btn" type="button" class="secondary">← Previous</button>
-            <button id="next-btn" type="button" class="secondary">Next →</button>
+          <div class="prompt-actions" style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px;">
+            <button id="insert-btn" type="button" class="ghost" style="font-size: 11px;">
+              Insert Prompt (Manual)
+            </button>
           </div>
         </div>
       </section>
 
-      <!-- GENERATION WORKFLOW (v0.6) -->
-      <section class="card workflow-card">
+      <!-- REFERENCES -->
+      <section class="card references-card">
         <div class="card-header">
-          <span class="card-title">Generation</span>
-          <button id="ping-gemini-btn" type="button" class="ghost" title="Round-trip PING to the Gemini content script">
+          <span class="card-title">References</span>
+          <span class="references-count" id="references-count">0</span>
+        </div>
+        <div class="card-body">
+          <ul id="references-list" class="references-list"></ul>
+          <p id="references-empty" class="references-empty" hidden>
+            No references for this task.
+          </p>
+        </div>
+      </section>
+
+      <!-- GENERATION & DIAGNOSTICS -->
+      <details class="card collapsible workflow-card">
+        <summary class="card-header">
+          <span class="card-title">Generation Diagnostics</span>
+          <button id="ping-gemini-btn" type="button" class="ghost" title="Round-trip PING to the Gemini content script" onclick="event.stopPropagation()">
             Ping Gemini
           </button>
-        </div>
+        </summary>
         <div class="card-body">
           <dl class="diag-list">
             <dt>Messaging</dt>
             <dd id="workflow-messaging" class="muted">—</dd>
             <dt>Image Mode</dt>
             <dd id="workflow-image-mode" class="muted">…probing…</dd>
-            <dt>References</dt>
-            <dd id="workflow-references" class="muted">— / — resolved</dd>
             <dt>Attached</dt>
             <dd id="workflow-attached" class="muted">— / —</dd>
+            <dt>Master Style</dt>
+            <dd id="workflow-master-style" class="muted">—</dd>
+            <dt>Scene Prompt</dt>
+            <dd id="workflow-scene-prompt" class="muted">—</dd>
+            <dt>Composer</dt>
+            <dd id="workflow-composer" class="muted">—</dd>
           </dl>
-          <div id="workflow-phase" class="workflow-phase" data-phase="idle">idle</div>
-          <ul id="workflow-log" class="workflow-log" hidden></ul>
-          <div class="workflow-actions">
-            <button id="ensure-image-mode-btn" type="button" class="secondary">
+          <div class="diag-actions" style="margin-top: 6px;">
+            <button id="ensure-image-mode-btn" type="button" class="ghost" style="font-size: 11px;">
               Ensure Image Mode
-            </button>
-            <button id="prepare-task-btn" type="button" class="primary" disabled>
-              Prepare Task
-            </button>
-            <button id="generate-task-btn" type="button" class="primary" disabled>
-              Generate Task
-            </button>
-            <button id="cancel-op-btn" type="button" class="ghost" hidden>
-              Cancel
-            </button>
-            <button id="mark-approved-btn" type="button" class="secondary" hidden>
-              Mark Approved
-            </button>
-            <button id="mark-redo-btn" type="button" class="secondary" hidden>
-              Mark Redo
             </button>
           </div>
         </div>
-      </section>
+      </details>
 
       <!-- PROGRESS (collapsible) -->
       <details class="card collapsible">
@@ -193,22 +247,53 @@
         </div>
       </details>
 
-      <!-- ATTACHMENT DIAGNOSTICS (collapsible) -->
-      <details class="card collapsible">
+      <!-- DEVELOPER TOOLS & DIAGNOSTICS (collapsible, default closed) -->
+      <details class="card collapsible dev-tools-card">
         <summary class="card-header">
-          <span class="card-title">Attachment</span>
-          <span id="attachment-summary" class="card-badge"></span>
+          <span class="card-title">Advanced Diagnostics &amp; Dev Tools</span>
+          <span class="card-badge">Dev</span>
         </summary>
         <div class="card-body">
+          <!-- Production Health Check (Phase 9) -->
+          <div class="dev-section-title" style="font-weight: 600; font-size: 12px; margin-bottom: 6px;">Production Health Check</div>
+          <div class="diag-actions" style="display: flex; flex-direction: column; gap: 6px;">
+            <button id="run-health-check-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px; font-weight: 600;">
+              Run Production Health Check
+            </button>
+          </div>
+          <div id="health-check-results" class="health-check-results" style="margin-top: 8px; margin-bottom: 12px; font-size: 11.5px; line-height: 1.6; background: var(--bg-muted); padding: 8px 10px; border-radius: var(--radius-sm);">
+            <div style="color: var(--text-muted);">Click button to run non-destructive baseline health check.</div>
+          </div>
+
+          <!-- File Transport Diagnostics (Tests A, B, C) -->
+          <div class="dev-section-title" style="font-weight: 600; font-size: 12px; margin-bottom: 6px; border-top: 1px solid var(--border); padding-top: 8px;">File Transport Diagnostics</div>
+          <div class="diag-actions" style="display: flex; flex-direction: column; gap: 6px;">
+            <button id="run-test-a-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px;">
+              Run Test A (Bundled PNG → Gemini)
+            </button>
+            <button id="run-test-b-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px;">
+              Run Test B (Synthetic File Messaging)
+            </button>
+            <button id="run-test-c-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px;">
+              Run Test C (Real Project Asset Transport)
+            </button>
+          </div>
+          <div id="diag-results-box" class="diag-results-box" style="margin-top: 8px; margin-bottom: 12px; font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 11px; line-height: 1.4; background: var(--bg-muted); padding: 8px; border-radius: var(--radius-sm); white-space: pre-wrap; word-break: break-word;">Click a test button above to run diagnostic.</div>
+
+          <!-- Attachment Diagnostics & Strategy A -->
+          <div class="dev-section-title" style="font-weight: 600; font-size: 12px; margin-bottom: 6px; border-top: 1px solid var(--border); padding-top: 8px;">Attachment Probes &amp; Trace</div>
           <dl id="attachment-diagnostics" class="diag-list"></dl>
-          <div class="diag-actions">
-            <button id="probe-attachment-btn" type="button" class="secondary">
+          <div class="diag-actions" style="display: flex; flex-direction: column; gap: 6px;">
+            <button id="test-single-attach-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px;">
+              Test Single Image Attachment
+            </button>
+            <button id="probe-attachment-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px;">
               Probe attachment
             </button>
-            <button id="trace-attachment-btn" type="button" class="secondary">
+            <button id="trace-attachment-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px;">
               Trace attachment
             </button>
-            <button id="strategy-a-btn" type="button" class="secondary" disabled>
+            <button id="strategy-a-btn" type="button" class="secondary" style="font-size: 11.5px; padding: 6px 10px;" disabled>
               Try Strategy A
             </button>
           </div>
@@ -256,7 +341,35 @@
       </div>
     </div>
 
-<script src="../lib/project.js"></script>
+    <!-- Confirm modal for clearing dirty composer -->
+    <div id="composer-confirm-overlay" class="overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="composer-confirm-title">
+        <h3 id="composer-confirm-title">Composer contains existing content</h3>
+        <p id="composer-confirm-body">
+          The Gemini composer already contains text or attachments. Preparing this task will clear the current composer and prepare the task references and prompt.
+        </p>
+        <div class="modal-actions">
+          <button id="composer-confirm-cancel" type="button" class="secondary">Cancel</button>
+          <button id="composer-confirm-ok" type="button" class="primary">Clear and Prepare</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Modal for Preview Final Prompt -->
+    <div id="prompt-preview-overlay" class="overlay" hidden>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="prompt-preview-title" style="max-width: 480px; width: 92%;">
+        <h3 id="prompt-preview-title">Final Prompt Preview</h3>
+        <p style="font-size: 11.5px; color: var(--color-muted, #71717a); margin-bottom: 8px;">
+          Exact text that will be inserted into the Gemini composer:
+        </p>
+        <pre id="prompt-preview-text" style="white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow-y: auto; background: var(--color-bg, #09090b); border: 1px solid var(--color-border, #27272a); border-radius: 6px; padding: 8px 10px; font-size: 12px; line-height: 1.4;"></pre>
+        <div class="modal-actions" style="margin-top: 12px;">
+          <button id="prompt-preview-close" type="button" class="primary">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="../lib/project.js"></script>
       <script src="../lib/storage.js"></script>
       <script src="../lib/assets.js"></script>
       <script src="../lib/output.js"></script>

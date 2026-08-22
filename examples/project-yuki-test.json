@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 3,
+  "project": {
+    "id": "gemini-assistant-fixture-v1",
+    "name": "Gemini Assistant Fixture (Yuki-onna) v1",
+    "description": "Schema v3 smoke-test. Theme: Yuki-onna. Five scenes exercising the Prepare Task workflow with separated masterPrompt + scene-specific prompts. References are real ukiyo-e / sumi-e / woodblock prints from the Red Sun Japan channel assets library."
+  },
+  "generation": {
+    "masterPrompt": "Cinematic semi-realistic historical dark fantasy digital painting, grounded painterly realism, realistic human anatomy and natural facial proportions, believable skin and fabric textures, highly detailed historically authentic Japanese environment.\n\nSophisticated hand-painted digital artwork with subtle visible brushwork and organic texture, realistic dimensionality without photorealism.\n\nMoody cinematic lighting, deep natural shadows, atmospheric depth, soft volumetric mist, restrained highlights, realistic reflections and physically believable light sources.\n\nMuted desaturated color palette dominated by charcoal black, weathered brown, dark indigo, slate gray and aged earth tones, with restrained warm amber light from candles and lanterns.\n\nDark, melancholic, mysterious and haunting atmosphere. Elegant supernatural horror rather than grotesque horror.\n\nComposition and lighting inspired by prestige historical cinema, combined with high-end narrative book illustration and dark historical concept art.\n\nCharacters must look like believable real human beings interpreted through a sophisticated digital painting — NOT anime characters.\n\nTraditional Japanese architecture, clothing, objects and landscapes must appear historically grounded, aged, weathered and lived-in.\n\nSTYLE EXCLUSIONS:\nno anime, no manga, no cel shading, no comic-book outlines, no graphic novel linework, no cartoon proportions, no exaggerated facial features, no glossy fantasy illustration, no neon colors, no oversaturated colors, no cute aesthetic, no modern objects, no 3D-render appearance, no photographic or hyper-photorealistic look.",
+    "aspectRatio": "16:9",
+    "sceneSeparator": "\n\nSCENE:\n"
+  },
+  "assets": {
+    "character-main": {
+      "label": "Yuki-onna — suushi sumi-e yokai portrait (Edo period, 雪女 kanji inscription)",
+      "type": "character",
+      "file": "references/character-main.jpeg"
+    },
+    "character-secondary": {
+      "label": "Minokichi — young woodcutter, Muromachi period",
+      "type": "character",
+      "file": "references/character-secondary.jpeg"
+    },
+    "environment-snow-village": {
+      "label": "Snowy forest path at nightfall — Yuki-onna gliding through heavy snowfall (intro reel reference)",
+      "type": "environment",
+      "file": "references/environment-village.jpeg"
+    },
+    "style-master": {
+      "label": "Yuki-onna style master — Minamoto no Yoritomo & Yuki Onna in the snow (Rijksmuseum ukiyo-e)",
+      "type": "style",
+      "file": "references/style-master.png"
+    }
+  },
+  "tasks": [
+    {
+      "id": "scene-001",
+      "title": "Opening shot — first snowfall",
+      "prompt": "Wide establishing shot of a remote snowed-in mountain village in northern Japan at dusk. Heavy snow falling, cedar trees bowed under white weight, slanted wooden rooftops already dusted. Paper lanterns beginning to glow amber behind frosted shoji screens. Faint blue sky over the Inland Sea in the background. No figures, no footprints, no smoke from chimneys. Contemplative solitary atmosphere.",
+      "references": ["environment-snow-village", "style-master"],
+      "output": { "basename": "scene-001" }
+    },
+    {
+      "id": "scene-002",
+      "title": "Yuki-onna crossing the footbridge",
+      "prompt": "Medium shot of Yuki-onna: a tall, slender Japanese woman in her early twenties, beautiful androgynous features, pale luminous skin with the faintest icy translucence at the edges of her face, very long straight black hair falling past her shoulders, calm steady dark eyes, gentle neutral expression, wearing a simple snow-white kimono with a thin pale-blue obi, single white camellia flower tucked behind the right ear, no jewelry. Barefoot on a weathered wooden footbridge over a frozen mountain stream in the failing light of dusk. Her hand grazing the snow-covered railing. Snowflakes drifting sideways through her translucent figure. Atmospheric cold aura surrounding her.",
+      "references": ["character-main", "style-master"],
+      "output": { "basename": "scene-002" }
+    },
+    {
+      "id": "scene-003",
+      "title": "Two figures on a moonlit mountain road",
+      "prompt": "Wide cinematic frame of two figures meeting on a snowed-in mountain road under a low winter moon. Foreground left: Yuki-onna — tall, slender, beautiful young Japanese woman, snow-white kimono with faint icy translucence, long straight black hair moving in a still wind, pale skin with no visible breath, faint supernatural cold aura, face carrying terrifying gentleness. Foreground right: Minokichi — young Japanese woodcutter in his late teens, lean and weather-hardened, square-jawed, sun-roughened skin, short-cropped dark hair, rough dark indigo cotton kimono with worn brown wool haori jacket patched at both elbows, straw raincoat folded over his left shoulder, alert watchful eyes carrying quiet sadness. Environment: moonlit mountain road in late winter, deep snow against black cedar trunks, paper lanterns torn and extinguished, frozen mountain stream at the foot of the slope, willow branches heavy with snow. Composition: two figures three feet apart in profile, midground recedes into dark cedar grove, deep background shows snow-laden village at valley bottom with pale lights behind shoji screens. Moon as dominant cool key from upper left, magical bioluminescent snow-glow as fill from Yuki-onna's aura, deep natural shadows.",
+      "references": [
+        "character-main",
+        "character-secondary",
+        "environment-snow-village",
+        "style-master"
+      ],
+      "output": { "basename": "scene-003" }
+    },
+    {
+      "id": "scene-004",
+      "title": "The mountain road, abandoned",
+      "prompt": "A single abandoned iron-and-paper ground lantern stands crooked at the edge of a snowed-in mountain path.\nFrost climbs its base; the paper sleeve is torn and collapses inward, still faintly lit from within by a dying ember.\nCedar trees press close on either side; heavy snow is falling on shoulder-high bamboo grass.\nAhead the path slopes down toward a grey smear of sea and a distant village lost in snow.\nNo figures anywhere.",
+      "references": ["environment-snow-village"],
+      "output": { "basename": "scene-004" }
+    },
+    {
+      "id": "scene-005",
+      "title": "Prompt-only test — Unicode / encoding check",
+      "prompt": "An ancient stone monument at a remote mountain cemetery in the deep of winter. Moss-eaten granite engraved with the names of those lost in the snow country: 「雪女」「安達原」「奥州」. Pale winter moonlight falls obliquely across the weathered rock face. Wisps of cold mist crawl between leaning stone lanterns. Surrounding cedars are black and silent under a heavy snowfall. No figures. Hiragana: ひらがな. Katakana: カタカナ. Kanji: 碑銘.",
+      "references": [],
+      "output": { "basename": "scene-005" }
+    }
+  ]
+}

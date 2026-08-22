@@ -71,8 +71,9 @@ const FILENAME_PATTERN = /^[a-zA-Z0-9 ._\-()\[\]']{1,200}\.[a-z0-9]{2,5}$/;
 
 function isAcceptableFilename(filename) {
   if (typeof filename !== "string") return false;
-  if (filename.length === 0 || filename.length > 220) return false;
-  if (filename.includes("/") || filename.includes("\\")) return false;
+  if (filename.length === 0 || filename.length > 260) return false;
+  if (filename.startsWith("/") || filename.startsWith("\\")) return false;
+  if (filename.includes("\\")) return false;
   if (filename.includes("..")) return false;
   return true;
 }
@@ -138,7 +139,9 @@ async function handleDownloadBlob(msg, sender) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return false;
   if (msg.type === "GEMINI_ASSISTANT_DOWNLOAD_BLOB") {
-    handleDownloadBlob(msg, sender).then(sendResponse);
+    handleDownloadBlob(msg, sender)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
     return true;
   }
   return false;
