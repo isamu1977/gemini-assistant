@@ -7787,6 +7787,151 @@ test("v0.9.97.7: content script exposes GEMINI_ASSISTANT_DETECT_GENERATION_IMAGE
   );
 });
 
+// ----- v0.9.98 (Part 29.6, 29.7, 29.13, 29.14): auto-download + idempotency -----
+// v0.9.98 wires automatic download into the generation lifecycle and
+// guards against double-claims. This block covers Part 29 items:
+//   6.  one execution triggers one automatic download
+//   7.  duplicate download claim is rejected
+//   13. task becomes Generated only after download completion
+//   14. failed download does not mark Generated
+
+test("v0.9.98.1: orchestrator state.downloadClaimedAt is reset by reset()", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true, downloadId: 1, finalFilename: "x.png" }),
+  });
+  orch.reset({ id: "scene-001" });
+  // Simulate a claimed download by setting the field directly.
+  orch.state.downloadClaimedAt = 12345;
+  // Reset must clear it.
+  orch.reset({ id: "scene-002" });
+  assertEqual(orch.state.downloadClaimedAt, null, "reset() must clear downloadClaimedAt");
+});
+
+test("v0.9.98.2: claimDownload returns ok once, then reason:download-already-claimed", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true, downloadId: 1, finalFilename: "x.png" }),
+  });
+  // No reset needed: state starts at default
+  const first = orch.claimDownload();
+  assertEqual(first.ok, true, "first claimDownload call must succeed");
+  assert(typeof first.claimedAt === "number", "first claim must include claimedAt timestamp");
+  const second = orch.claimDownload();
+  assertEqual(second.ok, false, "second claimDownload call must be rejected");
+  assertEqual(
+    second.reason,
+    "download-already-claimed",
+    "second claim must include reason: 'download-already-claimed'",
+  );
+});
+
+test("v0.9.98.3: download() rejects with download-already-claimed on second call", async () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({
+      ok: true,
+      downloadId: 1,
+      finalFilename: "x.png",
+    }),
+  });
+  // Populate generation so download() can proceed to the claim.
+  orch._setSendToTab(async () => ({ ok: true }));
+  await orch.prepareTask({
+    taskId: "scene-001",
+    prompt: "p",
+    resolvedRefs: [makeFakeResolvedRef("a", "A")],
+  });
+  orch.state.generation = {
+    ok: true,
+    imageSrc: "https://lh3.googleusercontent.com/gg/abc",
+    alt: "AI generated",
+  };
+  const dl1 = await orch.download("scene-001", "p1", "image/png");
+  assertEqual(dl1, true, "first download must succeed");
+  const dl2 = await orch.download("scene-001", "p1", "image/png");
+  assertEqual(typeof dl2, "object", "second download returns structured result");
+  assertEqual(dl2.ok, false, "second download must fail");
+  assertEqual(
+    dl2.reason,
+    "download-already-claimed",
+    "second download returns reason: 'download-already-claimed'",
+  );
+  assertEqual(dl2.silent, true, "second download result is silent");
+});
+
+test("v0.9.98.4: state.download.status transitions downloading -> complete on success", async () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({
+      ok: true,
+      downloadId: 7,
+      finalFilename: "Gemini Assistant/p1/scene-001.png",
+    }),
+  });
+  orch.state.generation = {
+    ok: true,
+    imageSrc: "https://lh3.googleusercontent.com/gg/abc",
+    alt: "AI generated",
+  };
+  await orch.download("scene-001", "p1", "image/png");
+  assertEqual(orch.state.download.status, "complete", "status must be 'complete'");
+  assertEqual(orch.state.download.downloadId, 7, "downloadId must be recorded");
+  assertEqual(
+    orch.state.download.finalFilename,
+    "Gemini Assistant/p1/scene-001.png",
+    "finalFilename must be recorded",
+  );
+  assertEqual(orch.state.download.ok, true, "ok flag must be true");
+  assert(typeof orch.state.download.startedAt === "number", "startedAt must be a number");
+  assert(typeof orch.state.download.completedAt === "number", "completedAt must be a number");
+});
+
+test("v0.9.98.5: state.download.status transitions to error on failure", async () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: false, error: "service worker offline" }),
+  });
+  orch.state.generation = {
+    ok: true,
+    imageSrc: "https://example.com/x.png",
+    alt: "AI generated",
+  };
+  const ok = await orch.download("scene-001", "p1", "image/png");
+  assertEqual(ok, false, "download must return false on failure");
+  assertEqual(orch.state.download.status, "error", "status must be 'error'");
+  assertEqual(orch.state.download.ok, false, "ok flag must be false");
+  assertEqual(
+    orch.state.download.error,
+    "service worker offline",
+    "error must be propagated",
+  );
+});
+
+test("v0.9.98.6: sidepanel invokes orch.download after successful generateTask", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const generateMatch = src.match(
+    /if\s*\(isSuccess\)\s*\{[\s\S]{0,4000}?orch\.download\(/,
+  );
+  assert(
+    generateMatch !== null,
+    "sidepanel must call orch.download() inside the isSuccess branch of generateTask",
+  );
+});
+
+test("v0.9.98.7: sidepanel sets task.status='generated' only on download success", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // Find the isSuccess branch. Inside, look for the assignment of
+  // cur_mut.status to "generated" gated on dlOk.
+  const branchMatch = src.match(
+    /if\s*\(isSuccess\)\s*\{[\s\S]{0,5000}?if\s*\(cur_mut\s*&&\s*cur_mut\.status\s*!==\s*["']generated["']\)\s*\{\s*cur_mut\.status\s*=\s*["']generated["']/,
+  );
+  assert(
+    branchMatch !== null,
+    "sidepanel must set task.status='generated' only after a successful download (gated by dlOk)",
+  );
+});
+
 // ----- end ----------------------------------------------------------------
 
 

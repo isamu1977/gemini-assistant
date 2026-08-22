@@ -3124,6 +3124,48 @@
         "ok",
         "Generation completed ✓ Image ready.",
       );
+      // v0.9.98: auto-download the generated image for the current
+      // execution. We do this after the orchestrator transitions to
+      // "complete". The orchestrator's idempotency guard
+      // (downloadClaimedAt) ensures a second invocation is a no-op.
+      try {
+        const basename =
+          (outputLib &&
+            projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
+          cur.id;
+        setStatusLine("info", "Downloading image…");
+        renderWorkflowState();
+        const dlOk = await orch.download(
+          basename,
+          state.source.project.project.id,
+          "image/png",
+        );
+        if (dlOk) {
+          const cur_mut = currentMutable();
+          if (cur_mut && cur_mut.status !== "generated") {
+            cur_mut.status = "generated";
+            await persistState();
+            renderProgress();
+          }
+          setStatusLine(
+            "ok",
+            `Generation complete — ${orch.state.download?.finalFilename || basename + ".png"}`,
+          );
+        } else {
+          // Silent claim rejection (zombie / re-entry) does not show error.
+          const reason = orch.state.download?.error;
+          const silent =
+            orch.state.download === null && (reason === undefined || reason === null);
+          if (!silent) {
+            setStatusLine(
+              "error",
+              `Auto-download failed: ${reason || "unknown"}. Use Download Image to retry.`,
+            );
+          }
+        }
+      } catch (e) {
+        setStatusLine("error", `Auto-download error: ${e?.message ?? String(e)}`);
+      }
     } else if (isSilentBail) {
       // Zombie / already-claimed: do nothing. The active session handles its own UI.
       console.log(

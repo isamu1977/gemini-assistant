@@ -131,7 +131,10 @@
       preflight: null, // { ok, checks: [...] }
       send: null, // { ok, error? }
       generation: null, // { ok, imageSrc, alt, error? }
-      download: null, // { ok, downloadId, finalFilename, error? }
+      download: null, // { status, startedAt, completedAt, filename,
+                      //   relativePath, downloadId, sourceType, error,
+                      //   ok, downloadId, finalFilename, error? }
+      downloadClaimedAt: null, // idempotency guard for auto-download
       error: null,
       executionId: null,
       preparationSessionId: null,
@@ -219,6 +222,7 @@
       state.send = null;
       state.generation = null;
       state.download = null;
+      state.downloadClaimedAt = null;
       state.error = null;
       state.executionId = null;
       state.preparationSessionId = "prep-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
@@ -738,12 +742,62 @@
      * We use chrome.downloads via the background bridge. The orchestrator
      * does not import chrome.*.
      */
+    /**
+     * Synchronously claim a download slot for the current execution.
+     * Returns true if this caller is the first to claim (and may proceed
+     * with the download). Returns false if a download was already claimed.
+     *
+     * Implements Part 18: "One execution may trigger only ONE automatic
+     * download. downloadClaimedAt is set BEFORE any await."
+     */
+    function claimDownload() {
+      if (state.downloadClaimedAt) {
+        return { ok: false, reason: "download-already-claimed" };
+      }
+      state.downloadClaimedAt = Date.now();
+      return { ok: true, claimedAt: state.downloadClaimedAt };
+    }
+
+    /**
+     * Download the current generation's image.
+     *
+     * v0.9.98: extends the original flow with:
+     *   - idempotency via claimDownload (Part 18)
+     *   - lifecycle `status` field on state.download (Part 12)
+     *   - returns a structured result object so callers can branch on
+     *     outcome (e.g. surface "multiple-generated-candidates")
+     */
     async function download(basename, projectId, mimeOrExt) {
       transition("downloading");
       if (!state.generation || !state.generation.imageSrc) {
         failWith("downloading", "No generated image available to download.");
         return false;
       }
+
+      const claim = claimDownload();
+      if (!claim.ok) {
+        recordGenerateTrace("download-skipped", {
+          reason: claim.reason,
+          downloadClaimedAt: state.downloadClaimedAt,
+        });
+        log("warn", "download: claim rejected", { reason: claim.reason });
+        return { ok: false, reason: claim.reason, silent: true };
+      }
+
+      const startedAt = Date.now();
+      state.download = {
+        status: "downloading",
+        startedAt,
+        filename: null,
+        relativePath: null,
+        downloadId: null,
+        sourceType: "image-src",
+        error: null,
+        // Legacy fields preserved for callers that read these:
+        ok: false,
+        finalFilename: null,
+      };
+
       try {
         const res = await deps.downloadImage({
           imageSrc: state.generation.imageSrc,
@@ -752,13 +806,19 @@
           mimeOrExt,
           alt: state.generation.alt,
         });
+        const ok = !!(res && res.ok);
         state.download = {
-          ok: !!(res && res.ok),
+          ...state.download,
+          ok,
           downloadId: res?.downloadId ?? null,
           finalFilename: res?.finalFilename ?? null,
+          filename: res?.finalFilename ?? null,
+          relativePath: res?.finalFilename ?? null,
           error: res?.error ?? null,
+          status: ok ? "complete" : "error",
+          completedAt: Date.now(),
         };
-        if (!state.download.ok) {
+        if (!ok) {
           failWith(
             "downloading",
             state.download.error || "Download failed.",
@@ -769,10 +829,15 @@
         return true;
       } catch (e) {
         state.download = {
+          ...state.download,
           ok: false,
           downloadId: null,
           finalFilename: null,
+          filename: null,
+          relativePath: null,
           error: e?.message ?? String(e),
+          status: "error",
+          completedAt: Date.now(),
         };
         failWith("downloading", state.download.error);
         return false;
@@ -1303,6 +1368,8 @@
       captureBaseline,
       waitForGeneratedImage,
       download,
+      // v0.9.98: idempotency guard for auto-download
+      claimDownload,
       inspectComposer,
       clearComposer,
       resetPreparation,
