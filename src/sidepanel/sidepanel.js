@@ -3379,7 +3379,13 @@
       (outputLib &&
         projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
       cur.id;
-    setStatusLine("info", "Retrying download…");
+    // v0.9.102 (Part 15): manual retry path. The auto-download claim
+    // is one-shot per execution; the user must be able to retry after
+    // a failed auto-download WITHOUT triggering a new generation.
+    orchestrator.state.downloadClaimedAt = null;
+    orchestrator.state.download = null;
+    setStatusLine("info", "⬇ Downloading image (manual retry)…");
+    renderWorkflowState();
     const orch = ensureOrchestrator();
     const dlOk = await orch.download(basename, state.source.project.project.id, "image/png");
     if (dlOk) {
@@ -3389,7 +3395,7 @@
         await persistState();
         renderProgress();
       }
-      setStatusLine("ok", `Downloaded ${orch.state.download?.finalFilename || basename + ".png"}.`);
+      setStatusLine("ok", `✓ Download complete — ${orch.state.download?.filename || orch.state.download?.finalFilename || basename + ".png"}.`);
       try { await orch.clearComposer(); } catch (_) {}
     } else {
       setStatusLine("error", `Retry download failed: ${orch.state.download?.error || "unknown"}`);

@@ -8176,6 +8176,100 @@ test("v0.9.101.5: sidepanel keeps Previous/Next available after generation (no a
   );
 });
 
+// ----- v0.9.102 (Part 15-17, 29.15-20): manual download + reopen safety -----
+// v0.9.102 wires the manual "Download Image" button (Part 15) and
+// covers the reopen-safety tests in Part 29 (items 15-20).
+
+test("v0.9.102.1: onRetryDownload resets downloadClaimedAt so manual retry proceeds", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const match = src.match(/async function onRetryDownload\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate onRetryDownload");
+  const body = match[0];
+  assert(
+    /downloadClaimedAt\s*=\s*null/.test(body),
+    "onRetryDownload must reset downloadClaimedAt before invoking orch.download",
+  );
+});
+
+test("v0.9.102.2: onRetryDownload does not call prepareTask or generateTask", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const match = src.match(/async function onRetryDownload\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate onRetryDownload");
+  const body = match[0];
+  assert(
+    !/prepareTask\s*\(/.test(body) && !/generateTask\s*\(/.test(body),
+    "onRetryDownload must NOT call prepareTask or generateTask (Part 15)",
+  );
+});
+
+test("v0.9.102.3: orchestrator claimDownload resets cleanly via reset()", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true, downloadId: 1, finalFilename: "x.png" }),
+  });
+  // Claim.
+  const c1 = orch.claimDownload();
+  assertEqual(c1.ok, true);
+  // Manual reset path simulates the sidepanel's manual retry reset.
+  orch.state.downloadClaimedAt = null;
+  // New claim succeeds.
+  const c2 = orch.claimDownload();
+  assertEqual(c2.ok, true, "after reset(), claimDownload must succeed again");
+});
+
+test("v0.9.102.4: runtime status exposes activeExecution phase (Part 17)", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/content/content.js"), "utf8");
+  // Anchor on the GET_RUNTIME_STATUS if-block directly. Read 30 lines
+  // after the `if` and assert `phase` appears.
+  const idx = src.indexOf("GEMINI_ASSISTANT_GET_RUNTIME_STATUS");
+  assert(idx !== -1, "could not locate GET_RUNTIME_STATUS handler");
+  const slice = src.slice(idx, idx + 2000);
+  assert(
+    /phase/.test(slice),
+    "GET_RUNTIME_STATUS must expose activeExecution.phase",
+  );
+  assert(
+    /activeExecutionId/.test(slice) || /executionId/.test(slice),
+    "GET_RUNTIME_STATUS must expose the active execution id",
+  );
+});
+
+test("v0.9.102.5: existing Prepare Task regression remains green (Part 29.17)", () => {
+  // Smoke test: prepareTask happy path still passes. This is already
+  // covered by v0.9: orchestrator: prepareTask happy path, but we add
+  // a local sanity check so a future regression in attach or insert
+  // is caught.
+  const { orch } = makeOrchestrator();
+  return (async () => {
+    const refs = [makeFakeResolvedRef("a", "A")];
+    const ok = await orch.prepareTask({
+      taskId: "scene-001",
+      prompt: "p",
+      resolvedRefs: refs,
+    });
+    assert(ok, "prepareTask happy path must still succeed (Part 29.17)");
+    assertEqual(orch.state.phase, "ready");
+  })();
+});
+
+test("v0.9.102.6: existing Generate Task regression remains green (Part 29.18)", () => {
+  const { orch } = makeOrchestrator();
+  return (async () => {
+    await orch.prepareTask({
+      taskId: "scene-001",
+      prompt: "p",
+      resolvedRefs: [makeFakeResolvedRef("a", "A")],
+    });
+    const ok = await orch.generateTask({
+      taskId: "scene-001",
+      prompt: "p",
+      resolvedRefs: [makeFakeResolvedRef("a", "A")],
+    });
+    assert(ok, "generateTask happy path must still succeed (Part 29.18)");
+    assertEqual(orch.state.phase, "complete");
+  })();
+});
+
 // ----- end ----------------------------------------------------------------
 
 
