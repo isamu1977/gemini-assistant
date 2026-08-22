@@ -7670,6 +7670,123 @@ test("v0.9.94: sidepanel passes generationTimeoutMs: 30000 to orchestrator", () 
   );
 });
 
+// ----- v0.9.97 (Part 29.1-29.6): rigorous current-generation-image detection -----
+// v0.9.97 introduces findCurrentGenerationImage(): a stricter detector
+// than findNewRenderedImage. It is the gate the orchestrator uses to
+// decide whether to download the generated image automatically.
+// This block covers Part 29 items 1-6:
+//   1. baseline excludes static Gemini/template images
+//   2. generated candidate must be new relative to baseline
+//   3. reference thumbnails are excluded
+//   4. template gallery images are excluded
+//   5. current response scoping works
+//   6. multiple-candidates path returns structured error
+
+// Helper for v0.9.97 tests: the detection suite is anchored on the
+// NON_RESULT_SRC_PATTERNS constant which is exported in the API and
+// not stripped by the comment remover.
+function detectionBlockSlice() {
+  const raw = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const anchor = raw.indexOf("const NON_RESULT_SRC_PATTERNS");
+  if (anchor === -1) {
+    throw new Error("could not locate NON_RESULT_SRC_PATTERNS anchor");
+  }
+  // Cover the entire detection suite: from the patterns constant to
+  // the end of findCurrentGenerationImage (about 200 lines below).
+  return raw.slice(anchor, anchor + 8000);
+}
+
+test("v0.9.97.1: findCurrentGenerationImage rejects Gemini template / avatar / icon / gstatic images", () => {
+  const slice = detectionBlockSlice();
+  // Match the literal source text the patterns array contains.
+  for (const literal of [
+    "/avatar/i",
+    "/profile[-_]?pic/i",
+    "/favicon/i",
+    "/googlelogo/i",
+    "/bot_avatar/i",
+    "/gemini[-_]?logo/i",
+    "/gstatic\\.com/",
+    "/sprite/i",
+  ]) {
+    assert(
+      slice.includes(literal),
+      `detection block must include pattern literal ${literal}`,
+    );
+  }
+});
+
+test("v0.9.97.2: findCurrentGenerationImage rejects SVG data URIs", () => {
+  const slice = detectionBlockSlice();
+  assert(
+    /data:image\/svg/.test(slice),
+    "detection block must filter out data:image/svg src",
+  );
+});
+
+test("v0.9.97.3: findCurrentGenerationImage rejects reference thumbnails inside composer / user-query / mat-chip", () => {
+  const slice = detectionBlockSlice();
+  for (const selector of [
+    "gem-media-attachment",
+    "user-query",
+    "mat-chip",
+  ]) {
+    assert(
+      slice.includes(selector),
+      `detection block must reject references inside ${selector}`,
+    );
+  }
+});
+
+test("v0.9.97.4: findCurrentGenerationImage requires rendered dimensions >= 100px", () => {
+  const slice = detectionBlockSlice();
+  assert(
+    />=\s*100/.test(slice),
+    "detection block must require >= 100px on at least one axis (in isRenderedLargeEnough)",
+  );
+  assert(
+    /isRenderedLargeEnough\s*\(/.test(slice),
+    "findCurrentGenerationImage must call isRenderedLargeEnough(img)",
+  );
+});
+
+test("v0.9.97.5: findCurrentGenerationImage scopes to responses AFTER baseline.modelResponseCount", () => {
+  const slice = detectionBlockSlice();
+  assert(
+    /modelResponseCount/.test(slice) &&
+      /\.slice\(\s*initialResponseCount\s*\)/.test(slice),
+    "findCurrentGenerationImage must slice responses[initialResponseCount..] from baseline",
+  );
+});
+
+test("v0.9.97.6: findCurrentGenerationImage returns multiple-generated-candidates when >= 2 valid candidates", () => {
+  const slice = detectionBlockSlice();
+  assert(
+    /multiple-generated-candidates/.test(slice),
+    "findCurrentGenerationImage must return reason:'multiple-generated-candidates'",
+  );
+  assert(
+    /no-candidate/.test(slice),
+    "findCurrentGenerationImage must return reason:'no-candidate'",
+  );
+  assert(
+    /no-new-response/.test(slice),
+    "findCurrentGenerationImage must return reason:'no-new-response'",
+  );
+});
+
+test("v0.9.97.7: content script exposes GEMINI_ASSISTANT_DETECT_GENERATION_IMAGE handler", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/content/content.js"), "utf8");
+  assert(
+    /GEMINI_ASSISTANT_DETECT_GENERATION_IMAGE/.test(src),
+    "content.js must handle GEMINI_ASSISTANT_DETECT_GENERATION_IMAGE",
+  );
+  assert(
+    /findCurrentGenerationImage/.test(src),
+    "content.js handler must call adapter.findCurrentGenerationImage",
+  );
+});
+
 // ----- end ----------------------------------------------------------------
 
 

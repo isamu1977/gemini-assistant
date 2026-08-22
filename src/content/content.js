@@ -891,6 +891,27 @@
         return false;
       }
 
+      case "GEMINI_ASSISTANT_DETECT_GENERATION_IMAGE": {
+        // v0.9.97: rigorous detector that returns a single candidate,
+        // no candidate, or multiple-candidates. Used by the orchestrator's
+        // automatic download step.
+        const adapter = globalThis.RedSunDomAdapter;
+        if (
+          !adapter ||
+          typeof adapter.findCurrentGenerationImage !== "function"
+        ) {
+          sendResponse({ ok: false, error: "adapter missing" });
+          return false;
+        }
+        try {
+          const res = adapter.findCurrentGenerationImage(msg.baseline || null);
+          sendResponse(res);
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        }
+        return false;
+      }
+
       case "GEMINI_ASSISTANT_FETCH_IMAGE": {
         const url = msg.url;
         if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {

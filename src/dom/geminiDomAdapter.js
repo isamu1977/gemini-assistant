@@ -2671,6 +2671,179 @@
       };
     }
     return null;
+  }
+
+  // ---- v0.9.97: rigorous current-generation-image detection for download ----
+  //
+  // findNewRenderedImage (above) is permissive — it powers the freeze-fix
+  // signal in waitForNewGeneratedImage. The download step needs a STRICTER
+  // detector that:
+  //
+  //   1. scopes the search to model-response containers that appeared
+  //      AFTER the baseline was captured (Part 2 / Part 3)
+  //   2. rejects images already present in the baseline (Part 4.2)
+  //   3. rejects avatars, gstatic.com templates, icons, and other
+  //      Gemini UI chrome (Part 5)
+  //   4. rejects reference thumbnails sitting inside the composer
+  //      chips or user-query containers (Part 5)
+  //   5. rejects small UI images (< 100px in any axis) (Part 4.6)
+  //   6. returns:
+  //        - { ok: true, image: {...} }            when exactly 1 candidate
+  //        - { ok: false, reason: "no-candidate" } when 0 candidates
+  //        - { ok: false, reason: "multiple-generated-candidates",
+  //            count: N }                          when 2+ candidates
+  //
+  // The caller (orchestrator) decides what to do for each result.
+  //
+  // This function is stateless and idempotent. The orchestrator passes
+  // the same baseline repeatedly; detection is cheap.
+
+  // src patterns we never want to auto-download. These appear in Gemini's
+  // chrome (logos, avatars, gstatic templates, gallery placeholders).
+  const NON_RESULT_SRC_PATTERNS = [
+    /avatar/i,
+    /profile[-_]?pic/i,
+    /favicon/i,
+    /googlelogo/i,
+    /bot_avatar/i,
+    /gemini[-_]?logo/i,
+    /gstatic\.com/,
+    /sprite/i,
+  ];
+
+  // Containers whose <img> children are reference attachments or
+  // user-submitted content, not the AI's generated result.
+  const REFERENCE_CONTAINER_SELECTORS = [
+    "gem-media-attachment",
+    ".user-query",
+    "user-query",
+    "[data-test-id='user-query']",
+    // Material chip wrappers used for attached-file thumbnails.
+    "mat-chip",
+    ".mat-mdc-chip",
+    "[data-test-id*='attachment' i]",
+  ];
+
+  function isInsideReferenceContainer(img) {
+    if (!img || typeof img.closest !== "function") return false;
+    for (const sel of REFERENCE_CONTAINER_SELECTORS) {
+      try {
+        if (img.closest(sel)) return true;
+      } catch (_) {
+        /* selector may not parse in some browsers; ignore */
+      }
+    }
+    return false;
+  }
+
+  function isNonResultSrc(src) {
+    if (!src || typeof src !== "string") return true;
+    if (src.startsWith("data:image/svg")) return true;
+    for (const p of NON_RESULT_SRC_PATTERNS) {
+      if (p.test(src)) return true;
+    }
+    return false;
+  }
+
+  function isRenderedLargeEnough(img) {
+    const w = img.naturalWidth || img.clientWidth || img.offsetWidth || 0;
+    const h = img.naturalHeight || img.clientHeight || img.offsetHeight || 0;
+    return w >= 100 || h >= 100;
+  }
+
+  /**
+   * Find the AI-generated image that belongs to the current execution.
+   *
+   * @param {object} baseline - the conversation baseline captured BEFORE
+   *   Gemini Send was clicked. Must contain:
+   *     - generatedImageSrcs: string[]    (existing image srcs on the page)
+   *     - modelResponseCount: number      (existing model-response containers)
+   *
+   * @returns
+   *   - { ok: true, image: { src, alt, naturalWidth, naturalHeight,
+   *                           downloadControl, responseContainer } }
+   *   - { ok: false, reason: "no-candidate" }
+   *   - { ok: false, reason: "no-new-response" }
+   *   - { ok: false, reason: "multiple-generated-candidates", count: N }
+   */
+  function findCurrentGenerationImage(baseline) {
+    if (!baseline || typeof baseline !== "object") {
+      return { ok: false, reason: "invalid-baseline" };
+    }
+    const baselineSrcs = new Set(baseline.generatedImageSrcs || []);
+    const initialResponseCount =
+      typeof baseline.modelResponseCount === "number" && baseline.modelResponseCount >= 0
+        ? baseline.modelResponseCount
+        : 0;
+
+    const allResponses = Array.from(
+      document.querySelectorAll(
+        "model-response, .model-response, [data-test-id='model-response']",
+      ),
+    );
+    const newResponses = allResponses.slice(initialResponseCount);
+    if (newResponses.length === 0) {
+      return { ok: false, reason: "no-new-response" };
+    }
+
+    const candidates = [];
+    for (const response of newResponses) {
+      const imgs = response.querySelectorAll
+        ? Array.from(response.querySelectorAll("img"))
+        : [];
+      for (const img of imgs) {
+        const src = img.getAttribute("src") || img.src || "";
+        if (!src) continue;
+        if (baselineSrcs.has(src)) continue;
+        if (isNonResultSrc(src)) continue;
+        if (isInsideReferenceContainer(img)) continue;
+        if (!isRenderedLargeEnough(img)) continue;
+
+        // Try to find an official download control inside this response.
+        let dlBtn = null;
+        try {
+          dlBtn = response.querySelector(
+            'button[aria-label*="Download" i], button[aria-label*="Baixar" i], button[aria-label*="ダウンロード" i]',
+          );
+        } catch (_) {
+          /* ignore */
+        }
+        candidates.push({
+          src,
+          alt: img.getAttribute("alt") || null,
+          naturalWidth: img.naturalWidth || 0,
+          naturalHeight: img.naturalHeight || 0,
+          downloadControl: dlBtn
+            ? { ariaLabel: dlBtn.getAttribute("aria-label") }
+            : null,
+          responseContainer: response,
+        });
+      }
+    }
+
+    if (candidates.length === 0) {
+      return { ok: false, reason: "no-candidate" };
+    }
+    if (candidates.length > 1) {
+      return {
+        ok: false,
+        reason: "multiple-generated-candidates",
+        count: candidates.length,
+      };
+    }
+    // Strip the live Element reference so the result is structured-cloneable
+    // when crossing the runtime message boundary.
+    const only = candidates[0];
+    return {
+      ok: true,
+      image: {
+        src: only.src,
+        alt: only.alt,
+        naturalWidth: only.naturalWidth,
+        naturalHeight: only.naturalHeight,
+        downloadControl: only.downloadControl,
+      },
+    };
   }  // ---- v0.6.2: Attachment Step Trace + Layered Menu/Input Probes ------
   //
   // The v0.6.1 attach flow was failing in real Chrome with no observable
@@ -3870,6 +4043,10 @@
     verifyImageStability,
     findNewGeneratedResult,
     waitForNewGeneratedImage,
+    // v0.9.97: rigorous current-generation detection for download step
+    findCurrentGenerationImage,
+    NON_RESULT_SRC_PATTERNS,
+    REFERENCE_CONTAINER_SELECTORS,
     // v0.6.2: attachment step trace + layered menu/input probes
     runAttachTrace,
     runAttachStrategyA,
