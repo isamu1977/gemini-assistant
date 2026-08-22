@@ -2522,11 +2522,33 @@
     if (generationResultBoxEl) {
       generationResultBoxEl.hidden = !isGenerated;
       if (isGenerated) {
+        const filename = s.download?.filename ||
+          s.download?.finalFilename ||
+          s.result?.filename ||
+          (cur?.output?.basename ? `${cur.output.basename}.png` : `${cur?.id}.png`);
         if (resultFilenameEl) {
-          resultFilenameEl.textContent = s.result?.filename || s.download?.finalFilename || (cur?.output?.basename ? `${cur.output.basename}.png` : `${cur?.id}.png`);
+          resultFilenameEl.textContent = filename;
         }
         if (resultDownloadIdEl) {
-          resultDownloadIdEl.textContent = s.result?.downloadId || s.download?.downloadId || "Completed";
+          resultDownloadIdEl.textContent = s.download?.downloadId || s.result?.downloadId || "—";
+        }
+        // v0.9.101: status badge reflects download lifecycle (Part 14).
+        if (resultStatusBadgeEl) {
+          const dlStatus = s.download?.status;
+          resultStatusBadgeEl.classList.remove("ok", "warn", "err");
+          if (dlStatus === "downloading") {
+            resultStatusBadgeEl.textContent = "Downloading image…";
+            resultStatusBadgeEl.classList.add("warn");
+          } else if (dlStatus === "error") {
+            resultStatusBadgeEl.textContent = "Download failed";
+            resultStatusBadgeEl.classList.add("err");
+          } else if (dlStatus === "complete" || cur?.status === "generated") {
+            resultStatusBadgeEl.textContent = "Generated";
+            resultStatusBadgeEl.classList.add("ok");
+          } else {
+            resultStatusBadgeEl.textContent = "Generated";
+            resultStatusBadgeEl.classList.add("ok");
+          }
         }
       }
     }
@@ -3167,6 +3189,12 @@
       commandId: cmdId,
     });
 
+    // v0.9.101 (Part 14): show "GENERATION COMPLETE" right after the
+    // image is detected, before the download starts.
+    if (genResult === true) {
+      setStatusLine("ok", "✓ GENERATION COMPLETE");
+    }
+
 
     // A 'silent' result means this invocation was a zombie (the session changed
     // while waiting) OR a duplicate already claimed. In either case:
@@ -3180,20 +3208,15 @@
       genResult.silent === true;
 
     if (isSuccess) {
-      setStatusLine(
-        "ok",
-        "Generation completed ✓ Image ready.",
-      );
-      // v0.9.98: auto-download the generated image for the current
-      // execution. We do this after the orchestrator transitions to
-      // "complete". The orchestrator's idempotency guard
-      // (downloadClaimedAt) ensures a second invocation is a no-op.
+      // v0.9.101 (Part 14): explicit lifecycle in the status line.
+      // "GENERATION COMPLETE" was set right after generateTask; now
+      // move to "DOWNLOADING IMAGE..." and then "DOWNLOAD COMPLETE".
       try {
         const basename =
           (outputLib &&
             projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
           cur.id;
-        setStatusLine("info", "Downloading image…");
+        setStatusLine("info", "⬇ Downloading image…");
         renderWorkflowState();
         const dlOk = await orch.download(
           basename,
@@ -3207,9 +3230,13 @@
             await persistState();
             renderProgress();
           }
+          const finalFilename =
+            orch.state.download?.filename ||
+            orch.state.download?.finalFilename ||
+            basename + ".png";
           setStatusLine(
             "ok",
-            `Generation complete — ${orch.state.download?.finalFilename || basename + ".png"}`,
+            `✓ Download complete — ${finalFilename}`,
           );
         } else {
           // Silent claim rejection (zombie / re-entry) does not show error.

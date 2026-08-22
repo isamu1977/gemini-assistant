@@ -8109,6 +8109,73 @@ test("v0.9.100.7: buildDownloadFilename joins basename and detected MIME extensi
   assertEqual(outputLib.buildDownloadFilename("scene-001", "image/svg"), null);
 });
 
+// ----- v0.9.101 (Part 14, Part 29.14): sidepanel download status UI -----
+// v0.9.101 surfaces the download lifecycle in the side panel UI:
+//   - "GENERATION COMPLETE" right after the image is detected
+//   - "DOWNLOADING IMAGE…" while chrome.downloads is writing
+//   - "DOWNLOAD COMPLETE — " when the file is on disk
+//   - status badge in the result box reflects download status
+
+test("v0.9.101.1: sidepanel status line shows GENERATION COMPLETE after successful generateTask", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(
+    /GENERATION COMPLETE/.test(src),
+    "sidepanel must surface 'GENERATION COMPLETE' status right after generateTask success",
+  );
+});
+
+test("v0.9.101.2: sidepanel status line shows 'Downloading image' between generation and download completion", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(
+    /Downloading image/.test(src),
+    "sidepanel must surface 'Downloading image' status before download completes",
+  );
+});
+
+test("v0.9.101.3: sidepanel status line shows 'Download complete' with filename on success", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(
+    /Download complete\s*—\s*\$\{/.test(src),
+    "sidepanel must surface 'Download complete — {filename}' status on successful download",
+  );
+});
+
+test("v0.9.101.4: result-status-badge reflects download status lifecycle", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // Locate the result-status-badge assignment in renderWorkflowState.
+  const match = src.match(
+    /resultStatusBadgeEl\.textContent\s*=[\s\S]{0,800}?\}\s*\n/,
+  );
+  assert(match !== null, "could not locate resultStatusBadgeEl.textContent block");
+  const body = match[0];
+  assert(
+    /Downloading image/.test(body),
+    "badge must reflect 'Downloading image…' state",
+  );
+  assert(
+    /Download failed/.test(body),
+    "badge must reflect 'Download failed' state",
+  );
+  assert(
+    /Generated/.test(body),
+    "badge must reflect 'Generated' state on completion",
+  );
+});
+
+test("v0.9.101.5: sidepanel keeps Previous/Next available after generation (no auto-next)", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // The _onGenerateTaskImpl branch must NOT call goNext or auto-advance.
+  const branchMatch = src.match(
+    /if\s*\(isSuccess\)\s*\{[\s\S]{0,5000}?\}\s*else\s+if\s*\(isSilentBail\)/,
+  );
+  assert(branchMatch !== null, "could not locate isSuccess branch in _onGenerateTaskImpl");
+  const body = branchMatch[0];
+  assert(
+    !/goNext\s*\(/.test(body) && !/nextTaskId\s*\(/.test(body) && !/cur\.id\s*=\s*nextTask/.test(body),
+    "_onGenerateTaskImpl isSuccess branch must NOT auto-advance to the next task",
+  );
+});
+
 // ----- end ----------------------------------------------------------------
 
 
