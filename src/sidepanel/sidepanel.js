@@ -2114,6 +2114,66 @@
 
   // ----- init -------------------------------------------------------------
 
+  // v0.9.99: handle download-completion messages from the service worker
+  // (Part 19). The service worker uses chrome.downloads.onChanged to
+  // detect when a download we initiated reaches 'complete' or
+  // 'interrupted'. We update state.download and refresh the UI.
+  function handleRuntimeMessage(msg, _sender, sendResponse) {
+    if (!msg || typeof msg !== "object") return false;
+    if (msg.type === "GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED") {
+      try {
+        applyDownloadStateChange(msg);
+      } catch (e) {
+        console.warn("[Gemini Assistant:sp] applyDownloadStateChange error", e);
+      }
+      sendResponse && sendResponse({ ok: true });
+      return true;
+    }
+    return false;
+  }
+  function applyDownloadStateChange(msg) {
+    if (!orchestrator) return;
+    const cur = orchestrator.state.download;
+    if (!cur) return;
+    if (msg.downloadId !== null && cur.downloadId !== null &&
+        msg.downloadId !== cur.downloadId) {
+      // Not the download we are tracking. Ignore.
+      return;
+    }
+    if (msg.state === "complete") {
+      orchestrator.state.download = {
+        ...cur,
+        status: "complete",
+        ok: true,
+        completedAt: msg.completedAt || Date.now(),
+        finalFilename: msg.filename || cur.finalFilename,
+        filename: msg.filename || cur.filename,
+        relativePath: msg.filename || cur.relativePath,
+        error: null,
+      };
+      setStatusLine(
+        "ok",
+        `Download complete — ${orchestrator.state.download.filename || "image"}`,
+      );
+    } else if (msg.state === "interrupted") {
+      orchestrator.state.download = {
+        ...cur,
+        status: "error",
+        ok: false,
+        completedAt: msg.completedAt || Date.now(),
+        error: msg.error || "download-interrupted",
+      };
+      setStatusLine(
+        "error",
+        `Download interrupted: ${orchestrator.state.download.error}. Use Download Image to retry.`,
+      );
+    }
+    renderWorkflowState();
+  }
+  if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage) {
+    chrome.runtime.onMessage.addListener(handleRuntimeMessage);
+  }
+
   async function init() {
     try {
       state = await storageLib.loadState();

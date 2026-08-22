@@ -7932,6 +7932,85 @@ test("v0.9.98.7: sidepanel sets task.status='generated' only on download success
   );
 });
 
+// ----- v0.9.99 (Part 29.19): download completion tracking via service worker -----
+// v0.9.99 wires chrome.downloads.onChanged in the service worker and
+// routes terminal state changes (complete / interrupted) back to the
+// side panel via GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED. The side
+// panel updates state.download.status accordingly and re-renders.
+
+test("v0.9.99.1: service worker listens to chrome.downloads.onChanged", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  assert(
+    /chrome\.downloads\.onChanged\.addListener/.test(src),
+    "service-worker.js must register chrome.downloads.onChanged.addListener (Part 19 download completion tracking)",
+  );
+});
+
+test("v0.9.99.2: service worker maintains trackedDownloads Map", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  assert(
+    /const\s+trackedDownloads\s*=\s*new\s+Map\s*\(\s*\)/.test(src),
+    "service-worker.js must maintain a trackedDownloads Map of initiated downloads",
+  );
+});
+
+test("v0.9.99.3: service worker posts state changed for complete AND interrupted", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  assert(
+    /cur\s*===\s*["']complete["']/.test(src) && /cur\s*===\s*["']interrupted["']/.test(src),
+    "service-worker.js must post state changes for both 'complete' and 'interrupted' transitions",
+  );
+  assert(
+    /GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED/.test(src),
+    "service-worker.js must use the GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED message type",
+  );
+});
+
+test("v0.9.99.4: sidepanel handles GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(
+    /GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED/.test(src),
+    "sidepanel.js must handle GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED",
+  );
+  assert(
+    /chrome\.runtime\.onMessage\.addListener/.test(src),
+    "sidepanel.js must register chrome.runtime.onMessage listener",
+  );
+});
+
+test("v0.9.99.5: sidepanel updates state.download.status to complete on completion", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // Look for the applyDownloadStateChange function and assert its
+  // body contains the expected status strings.
+  const match = src.match(/function applyDownloadStateChange\([\s\S]*?\n\s{2}\}/);
+  assert(match !== null, "could not locate applyDownloadStateChange in sidepanel.js");
+  const body = match[0];
+  assert(
+    /status:\s*["']complete["']/.test(body),
+    "applyDownloadStateChange must set status:'complete' on 'complete' transitions",
+  );
+  assert(
+    /status:\s*["']error["']/.test(body),
+    "applyDownloadStateChange must set status:'error' on 'interrupted' transitions",
+  );
+});
+
+test("v0.9.99.6: sidepanel ignores state changes for downloads it did not initiate", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // applyDownloadStateChange must compare msg.downloadId to
+  // orchestrator.state.download.downloadId and bail if they differ.
+  const match = src.match(
+    /function applyDownloadStateChange[\s\S]{0,3000}?\}\s*\n/,
+  );
+  assert(match !== null, "could not locate applyDownloadStateChange");
+  const body = match[0];
+  assert(
+    /msg\.downloadId\s*!==\s*cur\.downloadId/.test(body) ||
+      /downloadId\s*!==\s*cur/.test(body),
+    "applyDownloadStateChange must guard against state changes for unrelated downloadIds",
+  );
+});
+
 // ----- end ----------------------------------------------------------------
 
 

@@ -159,3 +159,88 @@ chrome.runtime.onStartup.addListener(() => {
   registerSidePanelBehavior();
   setDefaultSidePanelOptions();
 });
+
+// ---- v0.9.99: download completion tracking (Part 19) ------------------
+//
+// chrome.downloads.download returns a downloadId IMMEDIATELY without
+// waiting for the file to actually finish writing to disk. To know
+// whether the file is on disk and what its final filename is (after
+// Chrome applied conflictAction:'uniquify'), we hook chrome.downloads
+// .onChanged and post state transitions back to the side panel.
+//
+// We track only downloadIds WE created (startedBy === 'user' or the
+// filename pattern we used). Other downloads in the user's browser are
+// ignored.
+
+const GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED =
+  "GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED";
+
+const trackedDownloads = new Map(); // downloadId -> { requestedFilename, startedAt }
+
+// Mark downloads we initiated so onChanged can recognise them.
+function trackDownload(downloadId, requestedFilename) {
+  trackedDownloads.set(downloadId, {
+    requestedFilename,
+    startedAt: Date.now(),
+  });
+}
+
+// Forget the tracking entry after the terminal state has been delivered.
+function forgetDownload(downloadId) {
+  trackedDownloads.delete(downloadId);
+}
+
+function postDownloadState(payload) {
+  try {
+    chrome.runtime.sendMessage(payload).catch(() => {
+      // Side panel may not be open; the message is best-effort. Ignore
+      // any "Receiving end does not exist" errors.
+    });
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+if (chrome?.downloads?.onChanged && typeof chrome.downloads.onChanged.addListener === "function") {
+  chrome.downloads.onChanged.addListener((delta) => {
+    if (!delta || typeof delta.id !== "number") return;
+    const tracked = trackedDownloads.get(delta.id);
+    if (!tracked) return; // Not ours.
+
+    // chrome.downloads.DownloadDelta exposes:
+    //   state?: { current: 'in_progress'|'complete'|'interrupted', previous? }
+    //   filename?: { current }
+    //   error?: { current }
+    if (!delta.state) return;
+    const cur = delta.state.current;
+    const filenameDelta = delta.filename && delta.filename.current
+      ? delta.filename.current
+      : null;
+    const errorDelta = delta.error && delta.error.current
+      ? delta.error.current
+      : null;
+
+    if (cur === "complete" || cur === "interrupted") {
+      postDownloadState({
+        type: GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
+        downloadId: delta.id,
+        state: cur,
+        filename: filenameDelta,
+        requestedFilename: tracked.requestedFilename,
+        error: errorDelta,
+        completedAt: Date.now(),
+      });
+      forgetDownload(delta.id);
+    }
+    // 'in_progress' transitions are ignored — the side panel does not
+    // need per-progress pings.
+  });
+}
+
+// Expose for tests that import the service-worker source as text only.
+if (typeof globalThis !== "undefined") {
+  globalThis.__GEMINI_ASSISTANT_SW__ = {
+    GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
+    trackedDownloads,
+  };
+}
