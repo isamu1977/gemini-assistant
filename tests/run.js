@@ -8011,6 +8011,104 @@ test("v0.9.99.6: sidepanel ignores state changes for downloads it did not initia
   );
 });
 
+// ----- v0.9.100 (Part 29.8, 29.9, 29.10): filename slugification + fallback -----
+// v0.9.100 implements Part 9:
+//   - task.output.fileName is the preferred field (Part 22); output.basename
+//     remains a backward-compatible alias.
+//   - when neither is present, resolveTaskBasename returns
+//     "<task-id>-<slugified-title>" if a title is available.
+//   - when no title, falls back to task.id alone.
+
+test("v0.9.100.1: slugifyTitle lowercases, hyphenates spaces, removes illegal chars", () => {
+  const outputLib = require(path.join(ROOT, "src/lib/output.js"));
+  const cases = [
+    ["Opening Shot", "opening-shot"],
+    ["Yuki-onna Footbridge", "yuki-onna-footbridge"],
+    ["  Moonlit   Mountain  ", "moonlit-mountain"],
+    ["A/B\\C", "a-b-c"],
+    ["", null],
+    [null, null],
+  ];
+  for (const [input, expected] of cases) {
+    assertEqual(
+      outputLib.slugifyTitle(input),
+      expected,
+      `slugifyTitle(${JSON.stringify(input)}) must be ${JSON.stringify(expected)}`,
+    );
+  }
+});
+
+test("v0.9.100.2: resolveTaskBasename prefers output.fileName over output.basename", () => {
+  const outputLib = require(path.join(ROOT, "src/lib/output.js"));
+  const r = outputLib.resolveTaskBasename({
+    id: "scene-001",
+    title: "Opening Shot",
+    output: { fileName: "explicit.png-stem", basename: "legacy-stem" },
+  });
+  assertEqual(r.ok, true);
+  assertEqual(r.basename, "explicit.png-stem", "fileName wins over basename");
+  assertEqual(r.source, "output");
+});
+
+test("v0.9.100.3: resolveTaskBasename falls back to <id>-<slugified-title> when no output.fileName", () => {
+  const outputLib = require(path.join(ROOT, "src/lib/output.js"));
+  const r = outputLib.resolveTaskBasename({
+    id: "scene-002",
+    title: "Yuki-onna Footbridge",
+  });
+  assertEqual(r.ok, true);
+  assertEqual(r.basename, "scene-002-yuki-onna-footbridge");
+  assertEqual(r.source, "id-plus-title");
+});
+
+test("v0.9.100.4: resolveTaskBasename falls back to id alone when no title and no output", () => {
+  const outputLib = require(path.join(ROOT, "src/lib/output.js"));
+  const r = outputLib.resolveTaskBasename({ id: "scene-003" });
+  assertEqual(r.ok, true);
+  assertEqual(r.basename, "scene-003");
+  assertEqual(r.source, "task.id");
+});
+
+test("v0.9.100.5: validateTaskOutput accepts both fileName and basename (back-compat)", () => {
+  const outputLib = require(path.join(ROOT, "src/lib/output.js"));
+  const r1 = outputLib.validateTaskOutput({ fileName: "modern" });
+  assertEqual(r1.ok, true);
+  assertEqual(r1.output, { basename: "modern" });
+
+  const r2 = outputLib.validateTaskOutput({ basename: "legacy" });
+  assertEqual(r2.ok, true);
+  assertEqual(r2.output, { basename: "legacy" });
+
+  // Unknown keys still rejected (regression).
+  const r3 = outputLib.validateTaskOutput({ fileName: "x", garbage: true });
+  assertEqual(r3.ok, false);
+  assertEqual(r3.reason, "unknown-key");
+});
+
+test("v0.9.100.6: validateTaskOutput rejects empty fileName/basename", () => {
+  const outputLib = require(path.join(ROOT, "src/lib/output.js"));
+  const r = outputLib.validateTaskOutput({ fileName: "" });
+  assertEqual(r.ok, false);
+  assertEqual(r.reason, "empty");
+});
+
+test("v0.9.100.7: buildDownloadFilename joins basename and detected MIME extension", () => {
+  const outputLib = require(path.join(ROOT, "src/lib/output.js"));
+  assertEqual(
+    outputLib.buildDownloadFilename("scene-001-opening-shot", "image/png"),
+    "scene-001-opening-shot.png",
+  );
+  assertEqual(
+    outputLib.buildDownloadFilename("scene-001-opening-shot", ".jpg"),
+    "scene-001-opening-shot.jpg",
+  );
+  assertEqual(
+    outputLib.buildDownloadFilename("scene-001-opening-shot", "image/webp"),
+    "scene-001-opening-shot.webp",
+  );
+  assertEqual(outputLib.buildDownloadFilename("scene-001", "image/svg"), null);
+});
+
 // ----- end ----------------------------------------------------------------
 
 

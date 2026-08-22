@@ -140,8 +140,10 @@
       return { ok: false, error: "task.output must be an object", reason: "not-an-object" };
     }
 
-    // For now, only `basename` is recognized. Future keys land here.
-    const recognizedKeys = new Set(["basename"]);
+    // v0.9.100: `fileName` is the preferred field name per Part 22 of
+    // the spec. `basename` is preserved for backward compatibility with
+    // existing v0.6 projects. If both are present, `fileName` wins.
+    const recognizedKeys = new Set(["fileName", "basename"]);
     for (const k of Object.keys(raw)) {
       if (!recognizedKeys.has(k)) {
         return {
@@ -152,13 +154,15 @@
       }
     }
 
-    if (raw.basename === undefined) {
+    // fileName takes priority; basename is the legacy alias.
+    const explicit = raw.fileName !== undefined ? raw.fileName : raw.basename;
+    if (explicit === undefined) {
       // An empty output object is allowed and means "use task.id as fallback".
       // We normalize to `null` here so callers can treat absence uniformly.
       return { ok: true, output: null };
     }
 
-    const r = sanitizeBasename(raw.basename);
+    const r = sanitizeBasename(explicit);
     if (!r.ok) {
       return { ok: false, error: r.error, reason: r.reason };
     }
@@ -166,25 +170,86 @@
   }
 
   /**
+   * v0.9.100: slugify a task title for use in filenames.
+   *
+   * Rules (Part 9):
+   *   - lowercase
+   *   - ASCII-safe where possible
+   *   - spaces and runs of non-alphanumerics -> hyphens
+   *   - strip characters illegal in filenames
+   *   - max length is MAX_BASENAME_LENGTH (80)
+   *   - never contains `/`, `\`, `..`, or empty
+   *
+   * Examples:
+   *   "Opening Shot"          -> "opening-shot"
+   *   "Yuki-onna Footbridge"  -> "yuki-onna-footbridge"
+   *   "  Moonlit   Mountain " -> "moonlit-mountain"
+   *
+   * @param {string} title
+   * @returns {string|null}  slug, or null if title is empty / unusable
+   */
+  function slugifyTitle(title) {
+    if (!isNonEmptyString(title)) return null;
+    let s = title;
+    if (s.charCodeAt(0) === 0xfeff) s = s.slice(1);
+    s = s.trim();
+    if (s.length === 0) return null;
+
+    // Lowercase.
+    s = s.toLowerCase();
+
+    // Replace any run of non-alphanumeric-char (besides hyphens, which we
+    // collapse anyway) with a hyphen. We keep ASCII a-z, 0-9 and hyphen.
+    s = s.replace(/[^a-z0-9]+/g, "-");
+
+    // Trim leading/trailing hyphens and dots.
+    s = s.replace(/^[-.]+|[-.]+$/g, "");
+
+    if (s.length === 0) return null;
+
+    // Truncate.
+    if (s.length > MAX_BASENAME_LENGTH) {
+      s = s.slice(0, MAX_BASENAME_LENGTH);
+    }
+
+    return s;
+  }
+
+  /**
    * Resolve the effective basename for a task.
    *
-   * Priority:
-   *   1. task.output.basename (already sanitized at parse-time).
-   *   2. task.id (sanitized defensively — task ids are usually safe but
-   *      older projects may contain colons, slashes, or whitespace).
+   * Priority (Part 9):
+   *   1. task.output.fileName (preferred) — sanitized at parse-time.
+   *      task.output.basename is the legacy alias accepted as well.
+   *   2. "<task-id>-<slugified-title>" when task.title is present.
+   *   3. task.id alone.
    *
    * Never returns a string containing `/`, `\`, or `..`.
    *
-   * @param {{ id: string, output?: { basename?: string|null } | null }} task
+   * @param {{ id: string, title?: string,
+   *           output?: { basename?: string|null,
+   *                       fileName?: string|null } | null }} task
    */
   function resolveTaskBasename(task) {
     if (!task || !isNonEmptyString(task.id)) {
       return { ok: false, error: "task has no id", reason: "no-task-id" };
     }
-    const fromOutput = task?.output?.basename;
+    const fromOutput = task?.output?.fileName ?? task?.output?.basename;
     if (isNonEmptyString(fromOutput)) {
       return { ok: true, basename: fromOutput, source: "output" };
     }
+
+    const slug = slugifyTitle(task?.title);
+    if (slug) {
+      const combined = `${task.id}-${slug}`;
+      const r = sanitizeBasename(combined);
+      if (r.ok) {
+        return { ok: true, basename: r.basename, source: "id-plus-title" };
+      }
+      // If the combined id-title slug fails sanitize (e.g. resulting name
+      // is a reserved Windows device name), fall through to id alone.
+    }
+
     const r = sanitizeBasename(task.id);
     if (!r.ok) {
       // This shouldn't happen for normal v2 tasks. If the task id itself is
@@ -258,6 +323,7 @@
     sanitizeBasename,
     validateTaskOutput,
     resolveTaskBasename,
+    slugifyTitle,
     buildDownloadFilename,
     buildDownloadFolder,
     MIME_TO_EXT,
