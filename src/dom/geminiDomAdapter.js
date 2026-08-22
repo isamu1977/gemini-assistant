@@ -2844,7 +2844,279 @@
         downloadControl: only.downloadControl,
       },
     };
-  }  // ---- v0.6.2: Attachment Step Trace + Layered Menu/Input Probes ------
+  }
+
+  // ---- v0.9.103: official Gemini download-control detection for the
+  // CURRENT execution ----
+  //
+  // The spec (current milestone) replaces blob-extraction with a click
+  // on Gemini's own official download button. The button must be
+  // resolved inside the CURRENT generated response container, never via
+  // a global selector (a chat with many previous generations would
+  // surface N buttons and we must pick exactly the one belonging to
+  // this execution).
+  //
+  // Scoping:
+  //   1. baseline.modelResponseCount -> slice responses[that..]
+  //   2. Within each new response, find the button INSIDE the response.
+  //      Tier 1 prefers the stable custom-element name
+  //      'download-generated-image-button'. Tier 2 falls back to ARIA
+  //      labels (PT-BR "Baixar imagem no tamanho original", EN
+  //      "Download image in original size" / "Download original image").
+  //      We never depend on Angular generated classes (_ngcontent-*
+  //      / ng-star-inserted).
+  //   3. Return diagnostic counters so the side panel can prove
+  //      multiple-global-but-one-local safety.
+  //
+  // This helper returns the LIVE button element. It can ONLY run in
+  // the content script context — the side panel calls it via
+  // GEMINI_ASSISTANT_FIND_OFFICIAL_DOWNLOAD and clicks via
+  // GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD.
+
+  const OFFICIAL_DOWNLOAD_ARIA_LABELS = Object.freeze([
+    "Baixar imagem no tamanho original", // PT-BR
+    "Download image in original size",   // EN
+    "Download original image",           // EN alt
+    "Descargar imagen en tamaño original", // ES
+    "Télécharger l'image en taille originale", // FR
+    "画像を元のサイズでダウンロード", // JA
+    "원본 크기로 이미지 다운로드", // KO
+    "下载原始大小图片", // zh-CN
+    "下載原始大小圖片", // zh-TW
+  ]);
+
+  function findOfficialDownloadButtonInContainer(container) {
+    if (!container || typeof container.querySelector !== "function") {
+      return null;
+    }
+
+    // Tier 1: stable custom-element name.
+    const customHost = container.querySelector(
+      "download-generated-image-button",
+    );
+    let button = null;
+    let customElementFound = false;
+    if (customHost) {
+      customElementFound = true;
+      button = customHost.querySelector("button");
+    }
+
+    // Tier 2: aria-label fallback.
+    if (!button) {
+      const labels = OFFICIAL_DOWNLOAD_ARIA_LABELS;
+      // We scan all buttons inside the container. Match by exact label
+      // (case-insensitive) so we never pick up unrelated buttons that
+      // happen to contain the word "download".
+      const candidates = Array.from(container.querySelectorAll("button"));
+      for (const b of candidates) {
+        const aria = (b.getAttribute("aria-label") || "").trim();
+        if (!aria) continue;
+        for (const label of labels) {
+          if (aria.toLowerCase() === label.toLowerCase()) {
+            button = b;
+            break;
+          }
+        }
+        if (button) break;
+      }
+    }
+
+    // Tier 3 (last resort): partial aria-label match.
+    if (!button) {
+      const candidates = Array.from(container.querySelectorAll("button"));
+      for (const b of candidates) {
+        const aria = (b.getAttribute("aria-label") || "").toLowerCase();
+        if (
+          aria.includes("download original") ||
+          aria.includes("baixar imagem") ||
+          aria.includes("tamanho original") ||
+          aria.includes("imagen en tama") ||
+          aria.includes("taille originale")
+        ) {
+          button = b;
+          break;
+        }
+      }
+    }
+
+    return { button, customElementFound };
+  }
+
+  /**
+   * Find the official Gemini download control for the CURRENT execution.
+   *
+   * @param {object} baseline  same shape as captureConversationBaseline()
+   * @returns {{
+   *   ok: boolean,
+   *   reason?: string,
+   *   buttonFound?: boolean,
+   *   customElementFound?: boolean,
+   *   ariaLabel?: string|null,
+   *   candidateCountGlobal?: number,
+   *   candidateCountInsideCurrentResponse?: number,
+   *   responseContainer?: Element,
+   *   button?: Element|null,
+   * }}
+   */
+  function findCurrentGenerationDownloadButton(baseline) {
+    if (!baseline || typeof baseline !== "object") {
+      return { ok: false, reason: "invalid-baseline" };
+    }
+    const initialResponseCount =
+      typeof baseline.modelResponseCount === "number" && baseline.modelResponseCount >= 0
+        ? baseline.modelResponseCount
+        : 0;
+
+    const allResponses = Array.from(
+      document.querySelectorAll(
+        "model-response, .model-response, [data-test-id='model-response']",
+      ),
+    );
+    const newResponses = allResponses.slice(initialResponseCount);
+    if (newResponses.length === 0) {
+      return { ok: false, reason: "no-new-response" };
+    }
+
+    // Count global candidates for diagnostics. A button is "global" if
+    // it matches our ARIA labels anywhere on the page.
+    const globalCount = countGlobalDownloadButtons();
+    const currentResponse = newResponses[newResponses.length - 1];
+    const localCount = countDownloadButtonsIn(currentResponse);
+
+    const found = findOfficialDownloadButtonInContainer(currentResponse);
+    if (!found.button) {
+      return {
+        ok: false,
+        reason: "no-button-in-current-response",
+        customElementFound: found.customElementFound,
+        candidateCountGlobal: globalCount,
+        candidateCountInsideCurrentResponse: localCount,
+        responseContainer: currentResponse,
+        button: null,
+      };
+    }
+
+    return {
+      ok: true,
+      buttonFound: true,
+      customElementFound: found.customElementFound,
+      ariaLabel:
+        found.button.getAttribute("aria-label") ||
+        (found.button.querySelector && found.button.querySelector("mat-icon")
+          ? found.button.querySelector("mat-icon").textContent.trim()
+          : null),
+      candidateCountGlobal: globalCount,
+      candidateCountInsideCurrentResponse: localCount,
+      responseContainer: currentResponse,
+      button: found.button,
+    };
+  }
+
+  function countGlobalDownloadButtons() {
+    const labels = OFFICIAL_DOWNLOAD_ARIA_LABELS;
+    let n = 0;
+    const all = Array.from(document.querySelectorAll("button"));
+    for (const b of all) {
+      const aria = (b.getAttribute("aria-label") || "").trim();
+      if (!aria) continue;
+      for (const label of labels) {
+        if (aria.toLowerCase() === label.toLowerCase()) {
+          n++;
+          break;
+        }
+      }
+    }
+    return n;
+  }
+
+  function countDownloadButtonsIn(container) {
+    if (!container || typeof container.querySelectorAll !== "function") return 0;
+    const labels = OFFICIAL_DOWNLOAD_ARIA_LABELS;
+    let n = 0;
+    const all = Array.from(container.querySelectorAll("button"));
+    for (const b of all) {
+      const aria = (b.getAttribute("aria-label") || "").trim();
+      if (!aria) continue;
+      for (const label of labels) {
+        if (aria.toLowerCase() === label.toLowerCase()) {
+          n++;
+          break;
+        }
+      }
+    }
+    return n;
+  }
+
+  /**
+   * Click the official Gemini download button for the current execution.
+   * Pure DOM action. The caller (side panel) provides the baseline.
+   *
+   * @param {object} baseline
+   * @returns {{
+   *   ok: boolean,
+   *   reason?: string,
+   *   clickedAt?: number,
+   *   buttonFound?: boolean,
+   *   ariaLabel?: string|null,
+   *   customElementFound?: boolean,
+   *   candidateCountGlobal?: number,
+   *   candidateCountInsideCurrentResponse?: number,
+   *   downloadControlDetection?: object,
+   * }}
+   */
+  function clickCurrentGenerationDownloadButton(baseline) {
+    const found = findCurrentGenerationDownloadButton(baseline);
+    if (!found.ok) {
+      return {
+        ok: false,
+        reason: found.reason,
+        buttonFound: false,
+        ariaLabel: null,
+        customElementFound: found.customElementFound,
+        candidateCountGlobal: found.candidateCountGlobal,
+        candidateCountInsideCurrentResponse: found.candidateCountInsideCurrentResponse,
+        downloadControlDetection: buildDownloadControlDetection(found),
+      };
+    }
+    try {
+      found.button.click();
+    } catch (e) {
+      return {
+        ok: false,
+        reason: "click-failed",
+        error: e?.message ?? String(e),
+        buttonFound: true,
+        candidateCountGlobal: found.candidateCountGlobal,
+        candidateCountInsideCurrentResponse: found.candidateCountInsideCurrentResponse,
+        downloadControlDetection: buildDownloadControlDetection(found),
+      };
+    }
+    return {
+      ok: true,
+      clickedAt: Date.now(),
+      ariaLabel: found.ariaLabel,
+      customElementFound: found.customElementFound,
+      buttonFound: true,
+      candidateCountGlobal: found.candidateCountGlobal,
+      candidateCountInsideCurrentResponse: found.candidateCountInsideCurrentResponse,
+      downloadControlDetection: buildDownloadControlDetection(found),
+    };
+  }
+
+  function buildDownloadControlDetection(found) {
+    return {
+      resultContainerFound: !!found.responseContainer,
+      customElementFound: !!found.customElementFound,
+      buttonFound: !!found.buttonFound,
+      ariaLabel: found.ariaLabel ?? null,
+      candidateCountInsideCurrentResponse:
+        found.candidateCountInsideCurrentResponse ?? 0,
+      candidateCountGlobal: found.candidateCountGlobal ?? 0,
+      clickedAt: found.clickedAt ?? null,
+    };
+  }
+
+  // ---- v0.6.2: Attachment Step Trace + Layered Menu/Input Probes ------
   //
   // The v0.6.1 attach flow was failing in real Chrome with no observable
   // failure: trigger found, click did nothing observable. We need to
@@ -4047,6 +4319,10 @@
     findCurrentGenerationImage,
     NON_RESULT_SRC_PATTERNS,
     REFERENCE_CONTAINER_SELECTORS,
+    // v0.9.103: official Gemini download-control detection + click
+    findCurrentGenerationDownloadButton,
+    clickCurrentGenerationDownloadButton,
+    OFFICIAL_DOWNLOAD_ARIA_LABELS,
     // v0.6.2: attachment step trace + layered menu/input probes
     runAttachTrace,
     runAttachStrategyA,

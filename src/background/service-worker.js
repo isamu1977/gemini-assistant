@@ -237,10 +237,221 @@ if (chrome?.downloads?.onChanged && typeof chrome.downloads.onChanged.addListene
   });
 }
 
+// ---- v0.9.103: filename interception via onDeterminingFilename ----
+//
+// Per the spec, we click Gemini's own official download control and let
+// Chrome / Gemini's authenticated session perform the actual transfer.
+// To control WHERE the file lands on disk, we use the
+// chrome.downloads.onDeterminingFilename event.
+//
+// Flow:
+//   1. The side panel arms an `expectedDownloadClaim` via
+//      GEMINI_ASSISTANT_ARM_DOWNLOAD (with executionId, taskId,
+//      desiredFilename, expiresAt).
+//   2. The side panel calls the content script to click Gemini's
+//      download button inside the current result container.
+//   3. Chrome starts the download; Gemini's download URL is on the
+//      same Google CDN (lh3.googleusercontent.com / gemini.google.com).
+//   4. chrome.downloads.onCreated fires; we capture the downloadId and
+//      bind it to the active claim.
+//   5. chrome.downloads.onDeterminingFilename fires for the new
+//      download; we call suggest({ filename, conflictAction:'uniquify' }).
+//   6. chrome.downloads.onChanged fires for state transitions
+//      (complete / interrupted); we post to the side panel.
+//   7. After the expected download is delivered, the claim is cleared.
+//
+// Crucially, we ONLY intercept downloads while an active claim is
+// present AND the download URL is Gemini-Google-originated. Other
+// downloads in the user's browser are NOT touched.
+
+const GEMINI_ASSISTANT_ARM_DOWNLOAD = "GEMINI_ASSISTANT_ARM_DOWNLOAD";
+
+// One active claim per execution. Replaces any prior claim for the same
+// executionId. Older claims expire automatically.
+const expectedDownloadClaims = new Map();
+// executionId -> {
+//   taskId,
+//   desiredFilename,    // e.g. "Gemini Assistant/<project-id>/scene-001...png"
+//   expiresAt,
+//   downloadId?: number,
+//   createdAt,
+// }
+
+const CLAIM_WINDOW_MS = 25_000; // 15-30s per spec; pick the upper-middle.
+
+function nowMs() {
+  return Date.now();
+}
+
+function pruneExpiredClaims() {
+  const cutoff = nowMs();
+  for (const [k, v] of expectedDownloadClaims) {
+    if (v.expiresAt <= cutoff) {
+      expectedDownloadClaims.delete(k);
+    }
+  }
+}
+
+function setExpectedClaim({ executionId, taskId, desiredFilename }) {
+  pruneExpiredClaims();
+  const claim = {
+    taskId,
+    desiredFilename,
+    createdAt: nowMs(),
+    expiresAt: nowMs() + CLAIM_WINDOW_MS,
+    downloadId: null,
+  };
+  expectedDownloadClaims.set(executionId, claim);
+  return claim;
+}
+
+function findActiveClaimForDownload(download) {
+  pruneExpiredClaims();
+  // First pass: match by executionId if the side panel pre-bound a
+  // downloadId to a claim (defensive — currently we don't pre-bind).
+  for (const [execId, claim] of expectedDownloadClaims) {
+    if (claim.downloadId === download.id) {
+      return { execId, claim };
+    }
+  }
+  // Second pass: any active claim, preferring one whose desiredFilename
+  // matches the download's existing filename (Chrome fills `suggestedFilename`
+  // for some sources).
+  for (const [execId, claim] of expectedDownloadClaims) {
+    if (
+      download.filename &&
+      download.filename.endsWith(claim.desiredFilename.split("/").pop())
+    ) {
+      claim.downloadId = download.id;
+      return { execId, claim };
+    }
+  }
+  // Third pass: just the first active claim.
+  for (const [execId, claim] of expectedDownloadClaims) {
+    claim.downloadId = download.id;
+    return { execId, claim };
+  }
+  return null;
+}
+
+function clearClaim(executionId, reason) {
+  const claim = expectedDownloadClaims.get(executionId);
+  if (!claim) return null;
+  expectedDownloadClaims.delete(executionId);
+  return { executionId, ...claim, clearedReason: reason };
+}
+
+// Gemini-Google-originated URL detector. Matches gemini.google.com and
+// the common Google CDN hosts Gemini uses for generated images.
+function isGeminiOriginatedDownload(download) {
+  if (!download) return false;
+  const url = download.url || "";
+  const referrer = download.referrer || "";
+  const combined = `${url}\n${referrer}`;
+  return /gemini\.google\.com|lh[0-9]*\.googleusercontent\.com|gstatic\.com/.test(
+    combined,
+  );
+}
+
+// chrome.downloads.onCreated: bind the new download to the active claim
+// (if any). This gives us a stable handle for filename interception.
+if (
+  chrome?.downloads?.onCreated &&
+  typeof chrome.downloads.onCreated.addListener === "function"
+) {
+  chrome.downloads.onCreated.addListener((download) => {
+    if (!download || typeof download.id !== "number") return;
+    const matched = findActiveClaimForDownload(download);
+    if (matched) {
+      // Record in trackedDownloads so the onChanged listener can post
+      // terminal-state events back to the side panel.
+      trackedDownloads.set(download.id, {
+        requestedFilename: matched.claim.desiredFilename,
+        startedAt: nowMs(),
+        executionId: matched.execId,
+      });
+    }
+  });
+}
+
+// chrome.downloads.onDeterminingFilename: ONLY act if the active claim
+// is present AND the download is Gemini-originated. We MUST call suggest()
+// synchronously or Chrome proceeds with its own default filename.
+if (
+  chrome?.downloads?.onDeterminingFilename &&
+  typeof chrome.downloads.onDeterminingFilename.addListener === "function"
+) {
+  chrome.downloads.onDeterminingFilename.addListener((download, suggest) => {
+    if (!download || typeof suggest !== "function") return;
+    pruneExpiredClaims();
+
+    // Find a claim bound to this downloadId, or pick the first active
+    // claim and bind it now (the click in the content script and this
+    // event are usually separated by <100ms; we don't want to miss).
+    let matched = null;
+    for (const [execId, claim] of expectedDownloadClaims) {
+      if (claim.downloadId === download.id) {
+        matched = { execId, claim };
+        break;
+      }
+    }
+    if (!matched) {
+      // No pre-bound claim for this downloadId. We can only intercept
+      // downloads we initiated; for an unrelated download (e.g. user
+      // clicking elsewhere in Chrome), let Chrome pick the default.
+      if (!isGeminiOriginatedDownload(download)) return;
+      matched = findActiveClaimForDownload(download);
+      if (!matched) return;
+    }
+
+    if (!isGeminiOriginatedDownload(download)) return;
+
+    suggest({
+      filename: matched.claim.desiredFilename,
+      conflictAction: "uniquify",
+    });
+  });
+}
+
+function handleArmDownload(msg) {
+  const executionId = msg.executionId;
+  const taskId = msg.taskId;
+  const desiredFilename = msg.desiredFilename;
+  if (
+    typeof executionId !== "string" ||
+    typeof taskId !== "string" ||
+    typeof desiredFilename !== "string" ||
+    desiredFilename.length === 0
+  ) {
+    return { ok: false, error: "missing executionId/taskId/desiredFilename" };
+  }
+  const claim = setExpectedClaim({ executionId, taskId, desiredFilename });
+  return { ok: true, claim };
+}
+
+// Extend onMessage to handle the arm-download message.
+const __geminiAssistantOriginalOnMessage =
+  chrome.runtime.onMessage && chrome.runtime.onMessage.hasListeners && null;
+if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage) {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!msg || typeof msg !== "object") return false;
+    if (msg.type === GEMINI_ASSISTANT_ARM_DOWNLOAD) {
+      const r = handleArmDownload(msg);
+      sendResponse(r);
+      return true;
+    }
+    return false;
+  });
+}
+
 // Expose for tests that import the service-worker source as text only.
 if (typeof globalThis !== "undefined") {
   globalThis.__GEMINI_ASSISTANT_SW__ = {
     GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
+    GEMINI_ASSISTANT_ARM_DOWNLOAD,
     trackedDownloads,
+    expectedDownloadClaims,
+    CLAIM_WINDOW_MS,
+    isGeminiOriginatedDownload,
   };
 }

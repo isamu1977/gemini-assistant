@@ -912,6 +912,29 @@
         return false;
       }
 
+      case "GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD": {
+        // v0.9.103: click Gemini's official download control for the
+        // CURRENT execution. The button is resolved INSIDE the current
+        // generated response container — never via a global selector.
+        const adapter = globalThis.RedSunDomAdapter;
+        if (
+          !adapter ||
+          typeof adapter.clickCurrentGenerationDownloadButton !== "function"
+        ) {
+          sendResponse({ ok: false, error: "adapter missing" });
+          return false;
+        }
+        try {
+          const res = adapter.clickCurrentGenerationDownloadButton(
+            msg.baseline || null,
+          );
+          sendResponse(res);
+        } catch (e) {
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        }
+        return false;
+      }
+
       case "GEMINI_ASSISTANT_FETCH_IMAGE": {
         const url = msg.url;
         if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {

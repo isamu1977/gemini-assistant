@@ -2149,11 +2149,20 @@
         finalFilename: msg.filename || cur.finalFilename,
         filename: msg.filename || cur.filename,
         relativePath: msg.filename || cur.relativePath,
+        downloadId: msg.downloadId || cur.downloadId,
         error: null,
       };
+      // v0.9.103: mark task Generated only after the browser confirms
+      // the file is on disk. This satisfies Part 13.
+      const cur_mut = currentMutable();
+      if (cur_mut && cur_mut.status !== "generated") {
+        cur_mut.status = "generated";
+        persistState();
+        renderProgress();
+      }
       setStatusLine(
         "ok",
-        `Download complete — ${orchestrator.state.download.filename || "image"}`,
+        `✓ Download complete — ${orchestrator.state.download.filename || "image"}`,
       );
     } else if (msg.state === "interrupted") {
       orchestrator.state.download = {
@@ -2165,8 +2174,14 @@
       };
       setStatusLine(
         "error",
-        `Download interrupted: ${orchestrator.state.download.error}. Use Download Image to retry.`,
+        `DOWNLOAD FAILED — ${orchestrator.state.download.error}. Use Download Image to retry.`,
       );
+    } else if (msg.state === "in_progress") {
+      orchestrator.state.download = {
+        ...cur,
+        status: "downloading",
+        downloadId: msg.downloadId || cur.downloadId,
+      };
     }
     renderWorkflowState();
   }
@@ -2999,6 +3014,140 @@
     } catch (_) {}
   }
 
+  // v0.9.103: official-download-control flow (Part 15 / current
+  // milestone). Steps:
+  //   1. Claim the download slot synchronously (Part 18).
+  //   2. Compute desiredFilename = "<folder>/<basename>.<ext>".
+  //   3. Arm the service worker's expectedDownloadClaim via
+  //      GEMINI_ASSISTANT_ARM_DOWNLOAD. The SW uses this to filter
+  //      onDeterminingFilename events and suggest our filename.
+  //   4. Send GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD to the content
+  //      script. The CS resolves the download button INSIDE the current
+  //      generated response container and clicks it.
+  //   5. Wait for GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED from the SW
+  //      (chrome.downloads.onChanged) with state 'complete'.
+  //   6. Mark task Generated.
+  async function triggerAutoDownloadViaOfficialControl(cur) {
+    // 1. Idempotency claim.
+    const claim = orchestrator.claimDownload();
+    if (!claim.ok) {
+      console.log(
+        "[Gemini Assistant:sp] triggerAutoDownload: skipped",
+        { reason: claim.reason },
+      );
+      return false;
+    }
+
+    // 2. Desired filename under project folder.
+    const basename =
+      (outputLib &&
+        projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
+      cur.id;
+    const folder = outputLib.buildDownloadFolder(
+      state.source.project.project.id,
+    );
+    const desiredFilename = folder
+      ? `${folder}/${basename}.png`
+      : `${basename}.png`;
+
+    orchestrator.state.download = {
+      status: "arming",
+      startedAt: Date.now(),
+      taskId: cur.id,
+      executionId: orchestrator.state.executionId,
+      downloadClaimedAt: Date.now(),
+      desiredFilename,
+      actualFilename: null,
+      downloadId: null,
+      completedAt: null,
+      error: null,
+    };
+    setStatusLine("info", "⬇ Downloading image…");
+    renderWorkflowState();
+
+    // 3. Arm SW claim.
+    try {
+      const armRes = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
+          {
+            type: "GEMINI_ASSISTANT_ARM_DOWNLOAD",
+            executionId: orchestrator.state.executionId,
+            taskId: cur.id,
+            desiredFilename,
+          },
+          (resp) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            resolve(resp);
+          },
+        );
+      });
+      if (!armRes || !armRes.ok) {
+        orchestrator.state.download = {
+          ...orchestrator.state.download,
+          status: "error",
+          error: (armRes && armRes.error) || "arm-failed",
+        };
+        renderWorkflowState();
+        return false;
+      }
+    } catch (e) {
+      orchestrator.state.download = {
+        ...orchestrator.state.download,
+        status: "error",
+        error: `arm-failed: ${e?.message ?? String(e)}`,
+      };
+      renderWorkflowState();
+      return false;
+    }
+
+    // 4. Click official button via content script.
+    orchestrator.state.download.status = "clicking";
+    renderWorkflowState();
+    const baseline = orchestrator.state.baseline || {};
+    const clickRes = await sendToGemini(
+      "GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD",
+      { baseline },
+    );
+    if (!clickRes || !clickRes.ok) {
+      orchestrator.state.download = {
+        ...orchestrator.state.download,
+        status: "error",
+        error:
+          (clickRes && (clickRes.reason || clickRes.error)) || "click-failed",
+        downloadControlDetection:
+          (clickRes && clickRes.downloadControlDetection) || null,
+      };
+      renderWorkflowState();
+      return false;
+    }
+    orchestrator.state.download = {
+      ...orchestrator.state.download,
+      officialButtonClickedAt: clickRes.clickedAt || Date.now(),
+      downloadControlDetection:
+        clickRes.downloadControlDetection || null,
+    };
+    renderWorkflowState();
+
+    // 5. Wait for the SW to post GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED.
+    // The applyDownloadStateChange handler (registered below) updates
+    // orchestrator.state.download and marks the task Generated when the
+    // download reaches 'complete'.
+    //
+    // We rely on the SW post back. applyDownloadStateChange runs the
+    // task-marking logic. To avoid a race where the user clicks Manual
+    // Retry before the SW fires, we leave state.download.status at
+    // 'waiting-browser-download' / 'downloading' until the SW speaks.
+    orchestrator.state.download.status = "waiting-browser-download";
+
+    // The SW updates state.download and fires setStatusLine on completion.
+    // We return true optimistically; the task will be marked Generated
+    // when the SW's completion event lands.
+    return true;
+  }
+
   async function onGenerateTask(ev) {
     // PART 4 — Synchronous reentrancy lock. MUST be set before first await.
     // This prevents two handler invocations racing on the same microtask tick.
@@ -3208,47 +3357,17 @@
       genResult.silent === true;
 
     if (isSuccess) {
-      // v0.9.101 (Part 14): explicit lifecycle in the status line.
-      // "GENERATION COMPLETE" was set right after generateTask; now
-      // move to "DOWNLOADING IMAGE..." and then "DOWNLOAD COMPLETE".
+      // v0.9.103: switch the auto-download path from blob extraction
+      // to clicking Gemini's official download control. The button is
+      // resolved INSIDE the current result container — never via a
+      // global selector.
       try {
-        const basename =
-          (outputLib &&
-            projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
-          cur.id;
-        setStatusLine("info", "⬇ Downloading image…");
-        renderWorkflowState();
-        const dlOk = await orch.download(
-          basename,
-          state.source.project.project.id,
-          "image/png",
-        );
-        if (dlOk) {
-          const cur_mut = currentMutable();
-          if (cur_mut && cur_mut.status !== "generated") {
-            cur_mut.status = "generated";
-            await persistState();
-            renderProgress();
-          }
-          const finalFilename =
-            orch.state.download?.filename ||
-            orch.state.download?.finalFilename ||
-            basename + ".png";
+        const dlOk = await triggerAutoDownloadViaOfficialControl(cur);
+        if (!dlOk) {
           setStatusLine(
-            "ok",
-            `✓ Download complete — ${finalFilename}`,
+            "error",
+            "DOWNLOAD FAILED — Use Download Image to retry.",
           );
-        } else {
-          // Silent claim rejection (zombie / re-entry) does not show error.
-          const reason = orch.state.download?.error;
-          const silent =
-            orch.state.download === null && (reason === undefined || reason === null);
-          if (!silent) {
-            setStatusLine(
-              "error",
-              `Auto-download failed: ${reason || "unknown"}. Use Download Image to retry.`,
-            );
-          }
         }
       } catch (e) {
         setStatusLine("error", `Auto-download error: ${e?.message ?? String(e)}`);
@@ -3370,35 +3489,33 @@
   }
 
   async function onRetryDownload() {
-    if (!orchestrator || !orchestrator.state.generation?.imageSrc) {
-      setStatusLine("error", "No generated image detected to download. Run Retry Detection first.");
+    // v0.9.103: manual retry reuses the official-control flow. We do
+    // NOT regenerate, re-attach, or re-submit the prompt. We only:
+    //   - clear a FAILED download claim so a fresh attempt is allowed
+    //   - re-click the existing Gemini download control
+    //   - let the SW intercept the resulting browser download
+    if (!orchestrator) {
+      setStatusLine("error", "Orchestrator not initialized.");
       return;
     }
     const cur = currentTask();
-    const basename =
-      (outputLib &&
-        projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
-      cur.id;
-    // v0.9.102 (Part 15): manual retry path. The auto-download claim
-    // is one-shot per execution; the user must be able to retry after
-    // a failed auto-download WITHOUT triggering a new generation.
-    orchestrator.state.downloadClaimedAt = null;
-    orchestrator.state.download = null;
-    setStatusLine("info", "⬇ Downloading image (manual retry)…");
-    renderWorkflowState();
-    const orch = ensureOrchestrator();
-    const dlOk = await orch.download(basename, state.source.project.project.id, "image/png");
-    if (dlOk) {
-      const cur_mut = currentMutable();
-      if (cur_mut && cur_mut.status !== "generated") {
-        cur_mut.status = "generated";
-        await persistState();
-        renderProgress();
+    if (!cur) {
+      setStatusLine("error", "No task selected.");
+      return;
+    }
+    // Clear FAILED claim only. Successful downloads keep their claim so
+    // we don't double-download; the user should use Mark as Redo to
+    // re-run generation.
+    if (orchestrator.state.download?.status === "error") {
+      orchestrator.state.downloadClaimedAt = null;
+    }
+    try {
+      const ok = await triggerAutoDownloadViaOfficialControl(cur);
+      if (!ok) {
+        setStatusLine("error", "Retry download failed. See diagnostics.");
       }
-      setStatusLine("ok", `✓ Download complete — ${orch.state.download?.filename || orch.state.download?.finalFilename || basename + ".png"}.`);
-      try { await orch.clearComposer(); } catch (_) {}
-    } else {
-      setStatusLine("error", `Retry download failed: ${orch.state.download?.error || "unknown"}`);
+    } catch (e) {
+      setStatusLine("error", `Retry download error: ${e?.message ?? String(e)}`);
     }
     renderWorkflowState();
   }

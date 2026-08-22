@@ -8270,6 +8270,211 @@ test("v0.9.102.6: existing Generate Task regression remains green (Part 29.18)",
   })();
 });
 
+// ----- v0.9.103 (Part 29 tests 1-13): official-control download strategy -----
+// v0.9.103 replaces blob extraction with clicking Gemini's own
+// official download button inside the current result container.
+
+test("v0.9.103.1: DOM adapter exposes findCurrentGenerationDownloadButton + clickCurrentGenerationDownloadButton", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const noBlockComments = raw.replace(/\/\*[\s\S]*?\*\//g, "");
+  const src = noBlockComments.replace(/^\s*\/\/.*$/gm, "");
+  assert(
+    /function findCurrentGenerationDownloadButton\s*\(/.test(src),
+    "DOM adapter must export findCurrentGenerationDownloadButton",
+  );
+  assert(
+    /function clickCurrentGenerationDownloadButton\s*\(/.test(src),
+    "DOM adapter must export clickCurrentGenerationDownloadButton",
+  );
+});
+
+test("v0.9.103.2: official download detector prefers 'download-generated-image-button' custom element (Tier 1)", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const src = raw.replace(/^\s*\/\/.*$/gm, "");
+  const match = src.match(/function findOfficialDownloadButtonInContainer\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate findOfficialDownloadButtonInContainer");
+  const body = match[0];
+  assert(
+    /download-generated-image-button/.test(body),
+    "Tier 1 must use the 'download-generated-image-button' custom element",
+  );
+});
+
+test("v0.9.103.3: official download detector falls back to ARIA labels (PT-BR + EN)", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const src = raw.replace(/^\s*\/\/.*$/gm, "");
+  assert(
+    /Baixar imagem no tamanho original/.test(src),
+    "PT-BR aria-label 'Baixar imagem no tamanho original' must be in detector",
+  );
+  assert(
+    /Download image in original size|Download original image/.test(src),
+    "EN aria-label fallbacks must be in detector",
+  );
+});
+
+test("v0.9.103.4: detector scopes to current response (not global)", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const noBlockComments = raw.replace(/\/\*[\s\S]*?\*\//g, "");
+  const src = noBlockComments.replace(/^\s*\/\/.*$/gm, "");
+  const match = src.match(/function findCurrentGenerationDownloadButton\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate findCurrentGenerationDownloadButton");
+  const body = match[0];
+  assert(
+    /modelResponseCount/.test(body) && /\.slice\(\s*initialResponseCount\s*\)/.test(body),
+    "detector must scope to responses[initialResponseCount..] from baseline",
+  );
+});
+
+test("v0.9.103.5: detector returns diagnostic counters (global vs local)", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const src = raw.replace(/^\s*\/\/.*$/gm, "");
+  const match = src.match(/function buildDownloadControlDetection\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate buildDownloadControlDetection");
+  const body = match[0];
+  for (const field of [
+    "resultContainerFound",
+    "customElementFound",
+    "buttonFound",
+    "ariaLabel",
+    "candidateCountInsideCurrentResponse",
+    "candidateCountGlobal",
+    "clickedAt",
+  ]) {
+    assert(
+      body.includes(field),
+      `downloadControlDetection must expose field '${field}'`,
+    );
+  }
+});
+
+test("v0.9.103.6: content script exposes GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD handler", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/content/content.js"), "utf8");
+  assert(
+    /GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD/.test(src),
+    "content.js must handle GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD",
+  );
+  assert(
+    /clickCurrentGenerationDownloadButton/.test(src),
+    "handler must call adapter.clickCurrentGenerationDownloadButton",
+  );
+});
+
+test("v0.9.103.7: service worker arms expectedDownloadClaim on ARM_DOWNLOAD message", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  assert(
+    /GEMINI_ASSISTANT_ARM_DOWNLOAD/.test(src),
+    "service worker must define GEMINI_ASSISTANT_ARM_DOWNLOAD message type",
+  );
+  assert(
+    /expectedDownloadClaims/.test(src),
+    "service worker must maintain expectedDownloadClaims map",
+  );
+});
+
+test("v0.9.103.8: service worker hooks chrome.downloads.onDeterminingFilename", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  assert(
+    /chrome\.downloads\.onDeterminingFilename\.addListener/.test(src),
+    "service worker must register chrome.downloads.onDeterminingFilename listener",
+  );
+  assert(
+    /suggest\s*\(\s*\{[\s\S]{0,200}?conflictAction:\s*["']uniquify["']/.test(src),
+    "onDeterminingFilename must call suggest({ filename, conflictAction: 'uniquify' })",
+  );
+});
+
+test("v0.9.103.9: service worker only intercepts Gemini-originated downloads", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  assert(
+    /isGeminiOriginatedDownload/.test(src),
+    "service worker must define isGeminiOriginatedDownload helper",
+  );
+  assert(
+    /gemini\.google\.com|lh[0-9]*\.googleusercontent\.com/.test(src),
+    "isGeminiOriginatedDownload must match Gemini + Google CDN hosts",
+  );
+});
+
+test("v0.9.103.10: sidepanel auto-download uses official-control path, not blob extraction", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const match = src.match(
+    /if\s*\(isSuccess\)\s*\{[\s\S]{0,2500}?\}\s*else\s+if\s*\(isSilentBail\)/,
+  );
+  assert(match !== null, "could not locate isSuccess branch");
+  const body = match[0];
+  assert(
+    /triggerAutoDownloadViaOfficialControl/.test(body),
+    "isSuccess branch must call triggerAutoDownloadViaOfficialControl",
+  );
+  // Old blob-extraction primary path must NOT be in this branch.
+  assert(
+    !/GEMINI_ASSISTANT_FETCH_IMAGE/.test(body),
+    "isSuccess branch must NOT call GEMINI_ASSISTANT_FETCH_IMAGE (blob extraction no longer primary)",
+  );
+});
+
+test("v0.9.103.11: sidepanel arms SW with desiredFilename before clicking", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const match = src.match(/async function triggerAutoDownloadViaOfficialControl\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate triggerAutoDownloadViaOfficialControl");
+  const body = match[0];
+  assert(
+    /GEMINI_ASSISTANT_ARM_DOWNLOAD/.test(body),
+    "triggerAutoDownloadViaOfficialControl must send GEMINI_ASSISTANT_ARM_DOWNLOAD",
+  );
+  assert(
+    /desiredFilename/.test(body),
+    "triggerAutoDownloadViaOfficialControl must compute and send desiredFilename",
+  );
+});
+
+test("v0.9.103.12: state.download.status covers arming/clicking/waiting-browser-download/downloading", () => {
+  const raw = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const noBlockComments = raw.replace(/\/\*[\s\S]*?\*\//g, "");
+  const src = noBlockComments.replace(/^\s*\/\/.*$/gm, "");
+  for (const status of [
+    '"arming"',
+    '"clicking"',
+    '"waiting-browser-download"',
+  ]) {
+    // Match both `status: "x"` (object literal) and `status = "x"` (assignment).
+    const quoted = status.replace(/"/g, '\\"');
+    const re = new RegExp(`status\\s*[:=]\\s*${quoted}`);
+    assert(
+      re.test(src),
+      `state.download.status must include ${status} somewhere`,
+    );
+  }
+});
+
+test("v0.9.103.13: task is marked Generated only after SW reports 'complete'", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const match = src.match(/function applyDownloadStateChange\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate applyDownloadStateChange");
+  const body = match[0];
+  // The 'complete' branch must mark Generated.
+  assert(
+    /cur_mut\.status\s*=\s*["']generated["']/.test(body),
+    "applyDownloadStateChange must mark task Generated on 'complete'",
+  );
+});
+
+test("v0.9.103.14: onRetryDownload does NOT call prepareTask or generateTask", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const match = src.match(/async function onRetryDownload\([\s\S]*?\n\s{2}\}\s*\n/);
+  assert(match !== null, "could not locate onRetryDownload");
+  const body = match[0];
+  assert(
+    !/prepareTask\s*\(/.test(body) && !/generateTask\s*\(/.test(body),
+    "onRetryDownload must NOT regenerate (Part 15)",
+  );
+  assert(
+    /triggerAutoDownloadViaOfficialControl/.test(body),
+    "onRetryDownload must reuse the official-control flow",
+  );
+});
+
 // ----- end ----------------------------------------------------------------
 
 
