@@ -56,6 +56,13 @@
     "generating",
     "downloading",
     "complete",
+    // v0.10: clean-conversation lifecycle. After a successful download
+    // the orchestrator transitions complete -> task-complete. The
+    // side panel then runs the Gemini conversation reset and the
+    // orchestrator transitions task-complete -> resetting-conversation
+    // -> idle (or a follow-up phase chosen by the side panel).
+    "task-complete",
+    "resetting-conversation",
     "error",
     "cancelled",
   ]);
@@ -270,12 +277,38 @@
       if (state.result && state.phase === "generating") {
         return false;
       }
+      // Part 2 invariant: `task-complete` is a terminal phase. It only
+      // becomes reachable AFTER authoritative chrome.downloads completion,
+      // so once we're in it, the orchestrator is not busy and the UI must
+      // be unlocked (Next Task / Reset Conversation / etc.). Treating it
+      // as busy would deadlock the UI on every successful scene.
       return (
         state.phase !== "idle" &&
         state.phase !== "ready" &&
         state.phase !== "complete" &&
+        state.phase !== "task-complete" &&
         state.phase !== "error" &&
         state.phase !== "cancelled"
+      );
+    }
+
+    /**
+     * Returns true iff the current download state satisfies the
+     * Part 2 invariant:
+     *
+     *   state.phase === "task-complete"
+     *     IMPLIES
+     *   state.download.ok === true
+     *     && state.download.status === "complete"
+     *     && Number.isInteger(state.download.downloadId)
+     */
+    function isDownloadConfirmedForTaskComplete() {
+      const dl = state.download;
+      if (!dl) return false;
+      return (
+        dl.ok === true &&
+        dl.status === "complete" &&
+        Number.isInteger(dl.downloadId)
       );
     }
 
@@ -486,6 +519,178 @@
         promptFingerprint: state.promptInserted?.length ?? null,
       };
       transition("ready", { preparationSessionId: state.preparationSessionId });
+    }
+
+    /**
+     * v0.10 + Part 2 invariant: mark the current execution's task as COMPLETE.
+     *
+     * Called by the side panel AFTER the download lifecycle has
+     * confirmed success (chrome.downloads.onChanged state === "complete").
+     * Moves the orchestrator out of the post-generation "downloading"
+     * state into the explicit "task-complete" phase.
+     *
+     * The Part 2 invariant is enforced here:
+     *
+     *   state.phase === "task-complete"
+     *     IMPLIES
+     *   state.download.ok === true
+     *     && state.download.status === "complete"
+     *     && Number.isInteger(state.download.downloadId)
+     *
+     * If any of those checks fail, this method refuses to transition
+     * and returns false. The deadlock that motivated the fix came from
+     * the orchestrator silently moving into "task-complete" while the
+     * download was still in flight; that path is now structurally
+     * impossible.
+     *
+     * Idempotent: calling twice is a no-op.
+     *
+     * Returns true on a successful (or already-done) transition, false
+     * if the download is not yet authoritatively confirmed.
+     */
+    function markTaskComplete() {
+      // The invariant is non-negotiable. Refuse to enter the terminal
+      // "task-complete" phase unless the browser has confirmed the file
+      // is on disk. This is the single guard that prevents the deadlock.
+      if (!isDownloadConfirmedForTaskComplete()) {
+        log("warn", "markTaskComplete refused: download not yet confirmed", {
+          phase: state.phase,
+          download: state.download
+            ? {
+                ok: !!state.download.ok,
+                status: state.download.status || null,
+                downloadId:
+                  typeof state.download.downloadId === "number"
+                    ? state.download.downloadId
+                    : null,
+              }
+            : null,
+        });
+        return false;
+      }
+      if (state.phase === "task-complete") return true;
+      if (
+        state.phase === "complete" ||
+        state.phase === "downloading" ||
+        state.phase === "generating" ||
+        state.phase === "error"
+      ) {
+        const wasError = state.phase === "error";
+        state.error = null;
+        transition("task-complete", {
+          taskId: state.taskId,
+          executionId: state.executionId,
+          reconciledFromError: wasError,
+          download: {
+            downloadId: state.download.downloadId,
+            finalFilename:
+              state.download.finalFilename ||
+              state.download.filename ||
+              null,
+            status: state.download.status,
+          },
+        });
+        return true;
+      }
+      return false;
+    }
+
+    /**
+     * Part 3 / Part 5: mark the current download attempt as a
+     * recoverable failure. Used when the official Gemini download
+     * button was clicked but chrome.downloads never reported a
+     * matching downloadId within the acquisition timeout, or when
+     * chrome.downloads reported an interrupted state.
+     *
+     * Transitions the orchestrator into `error` with a `download-failed`
+     * payload. The side panel renders "Retry Download" and
+     * "Reset Preparation" buttons so the user is never locked out.
+     *
+     * Returns true on transition, false if the orchestrator is already
+     * past a terminal phase (in which case there's nothing to fail).
+     */
+    function markDownloadFailed(reason) {
+      if (state.download) {
+        state.download = {
+          ...state.download,
+          ok: false,
+          status: "error",
+          error: reason || "browser-download-not-detected",
+          completedAt: Date.now(),
+        };
+      }
+      // We do NOT clobber an already-terminal phase (task-complete / error /
+      // cancelled). The caller may invoke this defensively from a timeout
+      // and the orchestrator must not regress.
+      if (
+        state.phase === "task-complete" ||
+        state.phase === "error" ||
+        state.phase === "cancelled"
+      ) {
+        return false;
+      }
+      failWith(
+        "downloading",
+        reason || "browser-download-not-detected",
+        {
+          phase: state.phase,
+          downloadClaimedAt: state.downloadClaimedAt || null,
+          downloadStatus: state.download?.status || null,
+          downloadId:
+            typeof state.download?.downloadId === "number"
+              ? state.download.downloadId
+              : null,
+        },
+      );
+      return true;
+    }
+
+    /**
+     * v0.10: begin a Gemini conversation reset. Transitions the
+     * orchestrator from "task-complete" into "resetting-conversation".
+     * The actual DOM-side reset (click "New conversation" or navigate
+     * to /app?hl=...) happens in the side panel through the DOM
+     * adapter; this method only records the state-machine change.
+     *
+     * No-ops if the orchestrator is already in "resetting-conversation"
+     * (idempotent) or not in a state that supports the transition.
+     */
+    function beginConversationReset() {
+      if (state.phase === "resetting-conversation") return true;
+      if (
+        state.phase === "task-complete" ||
+        state.phase === "complete" ||
+        (state.phase === "error" && isDownloadConfirmedForTaskComplete())
+      ) {
+        if (state.phase === "error") {
+          state.error = null;
+        }
+        transition("resetting-conversation", {
+          taskId: state.taskId,
+          executionId: state.executionId,
+        });
+        return true;
+      }
+      return false;
+    }
+
+    /**
+     * v0.10: end the conversation reset and return to "idle". The
+     * side panel will typically call `reset(task)` afterwards to clear
+     * execution-scoped state, but those two operations are
+     * intentionally separate so the conversation reset's outcome can
+     * be observed in "idle" before any per-task state is wiped.
+     */
+    function endConversationReset() {
+      if (state.phase === "resetting-conversation") {
+        transition("idle", {
+          taskId: state.taskId,
+          executionId: state.executionId,
+          resetFinished: true,
+        });
+        return true;
+      }
+      return false;
     }
 
     /**
@@ -1290,17 +1495,19 @@
       // the side panel's `busy` flag is cleared even on this branch, then
       // return a SILENT bail object so the actively-generating new session can
       // keep its UI intact without overwriting it.
+      //
+      // Part 2 invariant: never enter "task-complete" without a confirmed
+      // download. We therefore transition to "downloading" (which is NOT a
+      // terminal phase from isActive's perspective — busy stays true), so
+      // the zombie coroutine's UI does not falsely claim completion while
+      // the live session owns the download lifecycle.
       if (state.preparationSessionId !== mySessionId) {
         log("warn", "generateTask: session changed during WAIT_FOR_GENERATED_IMAGE (zombie coroutine). Bailing.", {
           mySessionId,
           currentSessionId: state.preparationSessionId,
         });
-        // Cancel our own coroutine so the orchestrator's state machine is
-        // not stuck in `generating` forever. The active new session owns
-        // the UI from this point on; we only need to release the busy
-        // lock so the side panel does not freeze.
         state.cancelled = false;
-        transition("complete", {
+        transition("downloading", {
           zombie: true,
           zombieReason: "session-changed-during-wait",
           mySessionId,
@@ -1338,9 +1545,19 @@
         generationCompletedAt: state.generationCompletedAt,
         evidence: state.generationCompletionEvidence,
       });
-      transition("complete", {
+      // Part 2 invariant — generation visual completion does NOT imply
+      // task-complete. We transition into `downloading` and stay there
+      // until the SW reports authoritative chrome.downloads completion
+      // (via applyDownloadStateChange → markTaskComplete). Reaching
+      // "task-complete" without that confirmation is structurally
+      // impossible.
+      transition("downloading", {
         result: state.result,
         completedAt: state.generationCompletedAt,
+        // Carry the download-control DOM evidence so the side panel's
+        // download-acquisition timeout (Part 3) can correlate the
+        // timeout with the click it is timing out on.
+        downloadControl: compRes.downloadControl || null,
       });
       try {
         await sendToTab({
@@ -1370,6 +1587,14 @@
       download,
       // v0.9.98: idempotency guard for auto-download
       claimDownload,
+      // v0.10: clean-conversation lifecycle transitions
+      markTaskComplete,
+      beginConversationReset,
+      endConversationReset,
+      // Part 3 / Part 5: recoverable download failure
+      markDownloadFailed,
+      // Part 2 invariant: read-only predicate
+      isDownloadConfirmedForTaskComplete,
       inspectComposer,
       clearComposer,
       resetPreparation,

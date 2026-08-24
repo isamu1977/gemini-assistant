@@ -966,6 +966,57 @@
         return true;
       }
 
+      case "GEMINI_ASSISTANT_RESET_TO_CLEAN_CONVERSATION": {
+        // v0.10: clean-conversation lifecycle. The side panel drives
+        // this AFTER download completion. The adapter does the actual
+        // DOM work; this handler just bridges the message.
+        const adapter = globalThis.RedSunDomAdapter;
+        if (
+          !adapter ||
+          typeof adapter.resetToCleanConversation !== "function"
+        ) {
+          sendResponse({
+            ok: false,
+            error: "adapter missing resetToCleanConversation",
+          });
+          return false;
+        }
+        Promise.resolve()
+          .then(() => adapter.resetToCleanConversation(msg.options || {}))
+          .then((res) => sendResponse(res || { ok: false, error: "no-result" }))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) }),
+          );
+        return true;
+      }
+
+      case "GEMINI_ASSISTANT_WAIT_FOR_CLEAN_CONVERSATION": {
+        // v0.10: clean-conversation verification. Polls the DOM until
+        // a clean composer is observed or the timeout elapses.
+        const adapter = globalThis.RedSunDomAdapter;
+        if (
+          !adapter ||
+          typeof adapter.waitForCleanConversation !== "function"
+        ) {
+          sendResponse({
+            ok: false,
+            error: "adapter missing waitForCleanConversation",
+          });
+          return false;
+        }
+        const timeoutMs =
+          typeof msg.timeoutMs === "number" && msg.timeoutMs > 0
+            ? msg.timeoutMs
+            : 10000;
+        Promise.resolve()
+          .then(() => adapter.waitForCleanConversation(timeoutMs))
+          .then((res) => sendResponse(res || { ok: false, error: "no-result" }))
+          .catch((e) =>
+            sendResponse({ ok: false, error: e?.message ?? String(e) }),
+          );
+        return true;
+      }
+
       default:
         sendResponse({ ok: false, error: `unknown type: ${msg.type}` });
         return false;

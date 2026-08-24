@@ -106,6 +106,11 @@
   const runTestABtn = $("#run-test-a-btn");
   const runTestBBtn = $("#run-test-b-btn");
   const runTestCBtn = $("#run-test-c-btn");
+  // Part 5: Run Download Event Probe — exposes the SW's
+  // chrome.downloads listener-registration counts + last 50
+  // download-trace entries. Does NOT generate an image; the probe is
+  // a pure listener-validity check.
+  const runDownloadProbeBtn = $("#run-download-probe-btn");
   const diagSummaryEl = $("#diagnostic-summary");
   const diagResultsBoxEl = $("#diag-results-box");
   const traceResultEl = $("#trace-result");
@@ -162,6 +167,7 @@
   const cancelOpBtn = $("#cancel-op-btn");
   const resetPrepBtn = $("#reset-prep-btn");
   const retryPrepBtn = $("#retry-prep-btn");
+  const resetConversationBtn = $("#reset-conversation-btn");
   const generationResultBoxEl = $("#generation-result-box");
   const resultFilenameEl = $("#result-filename");
   const resultStatusBadgeEl = $("#result-status-badge");
@@ -211,8 +217,213 @@
   let generateCommandInFlight = false;
   let prepareCommandInFlight = false;
   // Diagnostic counters — healthy value is 1 for each.
+  // Bug C fix: split retry-generate into its own counter so the
+  // "generateHandlerRegistrationCount === 1" assertion only measures
+  // the Generate Task button, not Retry Generate.
   let generateHandlerRegistrationCount = 0;
+  let retryGenerateHandlerRegistrationCount = 0;
   let prepareHandlerRegistrationCount = 0;
+
+  // ----- Download lifecycle instrumentation --------------------------------
+  // downloadTrace is a cumulative array of structured events emitted by
+  // every per-execution download attempt. Every entry carries taskId,
+  // executionId, preparationSessionId, and timestamp. Relevant entries
+  // additionally carry downloadId, filename, candidate counters, and
+  // previous/current claim snapshots so a failure in scene-N can be
+  // diagnosed from scene-(N-1) state without rerunning the conversation.
+  //
+  // The 14 lifecycle steps are:
+  //   1. generation-complete
+  //   2. current-response-found
+  //   3. download-control-found
+  //   4. download-claim-arm-attempt
+  //   5. download-claim-armed
+  //   6. official-download-click-attempt
+  //   7. official-download-clicked
+  //   8. chrome-download-created             (SW-emitted)
+  //   9. determining-filename-fired          (SW-emitted)
+  //  10. filename-suggested                  (SW-emitted)
+  //  11. chrome-download-in-progress         (SW-emitted)
+  //  12. chrome-download-complete            (SW-emitted)
+  const DOWNLOAD_TRACE_MAX = 200;
+  const downloadTrace = [];
+
+  const NEXT_TASK_TRACE_MAX = 50;
+  const nextTaskTrace = [];
+
+  function appendNextTrace(step, data = {}) {
+    const s = (orchestrator && orchestrator.state) || {};
+    const cur = currentTask();
+    const entry = {
+      step,
+      timestamp: new Date().toISOString(),
+      taskId: cur?.id || s.taskId || null,
+      executionId: s.executionId || null,
+      preparationSessionId: s.preparationSessionId || null,
+      phase: s.phase || null,
+      taskStatus: cur?.status || null,
+      downloadStatus: s.download?.status || null,
+      downloadOk: s.download?.ok || null,
+      downloadId: s.download?.downloadId ?? null,
+      ...data,
+    };
+    nextTaskTrace.push(entry);
+    if (nextTaskTrace.length > NEXT_TASK_TRACE_MAX) {
+      nextTaskTrace.splice(0, nextTaskTrace.length - NEXT_TASK_TRACE_MAX);
+    }
+    try {
+      console.log(`[next-task-trace] ${step}`, entry);
+    } catch (_) {}
+  }
+
+  function appendDownloadTrace(step, data = {}) {
+    const s = (orchestrator && orchestrator.state) || {};
+    const dl = s.download || {};
+    const execId =
+      s.executionId ||
+      data.executionId ||
+      null;
+    const taskId =
+      s.taskId ||
+      data.taskId ||
+      null;
+    const prepSession =
+      s.preparationSessionId ||
+      data.preparationSessionId ||
+      null;
+    const phase = s.phase || data.phase || null;
+    const downloadStatus = dl.status || data.downloadStatus || null;
+    const downloadId = dl.downloadId ?? data.downloadId ?? null;
+    const desiredFilename = dl.desiredFilename || data.desiredFilename || null;
+    const filename = dl.finalFilename || dl.filename || data.filename || null;
+    const url = data.url || s.result?.imageSrc || null;
+    const claimState = data.claim || data.currentClaim || snapshotDownloadClaimState().activeDownloadClaim;
+
+    const entry = {
+      step,
+      timestamp: new Date().toISOString(),
+      taskId,
+      executionId: execId,
+      preparationSessionId: prepSession,
+      phase,
+      downloadStatus,
+      downloadId,
+      desiredFilename,
+      url,
+      filename,
+      claim: claimState,
+      ...data,
+    };
+    downloadTrace.push(entry);
+    if (downloadTrace.length > DOWNLOAD_TRACE_MAX) {
+      downloadTrace.splice(0, downloadTrace.length - DOWNLOAD_TRACE_MAX);
+    }
+    try {
+      console.log(`[download-trace] ${step}`, entry);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  // Snapshot the current orchestrator-side download claim so a trace
+  // entry can record what was the "previous" claim at the moment a new
+  // claim is armed. Used to answer "is scene-001 state blocking
+  // scene-003?" without rerunning the conversation.
+  function snapshotDownloadClaimState() {
+    if (!orchestrator) {
+      return {
+        activeDownloadClaim: null,
+        downloadClaimedAt: null,
+        downloadStatus: null,
+        downloadId: null,
+        executionId: null,
+      };
+    }
+    const s = orchestrator.state || {};
+    const dl = s.download || null;
+    return {
+      activeDownloadClaim: dl
+        ? {
+            taskId: dl.taskId || s.taskId || null,
+            executionId: dl.executionId || s.executionId || null,
+            downloadClaimedAt: dl.downloadClaimedAt || null,
+            downloadId: dl.downloadId || null,
+            status: dl.status || null,
+            desiredFilename: dl.desiredFilename || null,
+          }
+        : null,
+      downloadClaimedAt: s.downloadClaimedAt || null,
+      downloadStatus: dl ? dl.status : null,
+      downloadId: dl ? dl.downloadId : null,
+      executionId: s.executionId || null,
+    };
+  }
+
+  function snapshotRuntimeStatusSummary() {
+    return {
+      activeExecution: orchestrator
+        ? orchestrator.state.phase || "idle"
+        : "no-orchestrator",
+      downloadStatus: orchestrator && orchestrator.state.download
+        ? orchestrator.state.download.status || null
+        : null,
+      downloadClaimedAt:
+        orchestrator && orchestrator.state.downloadClaimedAt
+          ? orchestrator.state.downloadClaimedAt
+          : null,
+      downloadTraceLength: downloadTrace.length,
+      lastTraceStep:
+        downloadTrace.length > 0
+          ? downloadTrace[downloadTrace.length - 1].step
+          : null,
+      resetTraceLength: conversationResetTrace.length,
+      lastResetTraceStep:
+        conversationResetTrace.length > 0
+          ? conversationResetTrace[conversationResetTrace.length - 1].step
+          : null,
+    };
+  }
+
+  // v0.10: clean-conversation lifecycle instrumentation.
+  //
+  // conversationResetTrace is a cumulative array of structured events
+  // emitted by the one-task-one-clean-conversation reset lifecycle.
+  // Every entry carries taskId, executionId, and timestamp. The trace
+  // covers both the auto-reset triggered by Next Task AND the manual
+  // Reset Conversation button — they share the same implementation, so
+  // they share the trace.
+  const RESET_TRACE_MAX = 100;
+  const conversationResetTrace = [];
+
+  function appendResetTrace(step, data = {}) {
+    const execId =
+      (orchestrator && orchestrator.state && orchestrator.state.executionId) ||
+      data.executionId ||
+      null;
+    const taskId =
+      (orchestrator && orchestrator.state && orchestrator.state.taskId) ||
+      data.taskId ||
+      null;
+    const entry = {
+      step,
+      timestamp: new Date().toISOString(),
+      taskId,
+      executionId: execId,
+      ...data,
+    };
+    conversationResetTrace.push(entry);
+    if (conversationResetTrace.length > RESET_TRACE_MAX) {
+      conversationResetTrace.splice(
+        0,
+        conversationResetTrace.length - RESET_TRACE_MAX,
+      );
+    }
+    try {
+      console.log(`[reset-trace] ${step}`, entry);
+    } catch (_) {
+      /* ignore */
+    }
+  }
 
   // ----- helpers ----------------------------------------------------------
 
@@ -988,13 +1199,319 @@
   }
 
   function goNext() {
-    const id = projectLib.nextTaskId(state.source.project, state.currentTaskId);
-    if (id) navigate(id);
+    appendNextTrace("next-button-clicked");
+    appendNextTrace("next-handler-entered");
+    const cur = currentMutable();
+    const s = (orchestrator && orchestrator.state) || {};
+    const dl = s.download || {};
+
+    appendNextTrace("next-current-task", { taskId: state.currentTaskId, title: cur?.title });
+    appendNextTrace("next-current-phase", { phase: s.phase });
+    appendNextTrace("next-download-state", { status: dl.status, ok: dl.ok, downloadId: dl.downloadId });
+    appendNextTrace("next-task-status", { status: cur?.status });
+
+    const isGenerated = cur && cur.status === "generated";
+    const isDownloadComplete = dl.status === "complete" && dl.ok === true;
+    const isEligibleForReset = isGenerated || isDownloadComplete;
+
+    appendNextTrace("next-reset-eligibility", {
+      isGenerated,
+      isDownloadComplete,
+      isEligibleForReset,
+    });
+
+    if (isEligibleForReset) {
+      resetConversationAndAdvance({ advanceToNext: true, source: "next-task" })
+        .then((ok) => {
+          if (!ok) {
+            appendNextTrace("next-blocked", { reason: "reset-returned-false" });
+            warn("resetConversationAndAdvance failed from goNext");
+          } else {
+            appendNextTrace("next-complete", { success: true });
+          }
+        })
+        .catch((e) => {
+          const err = e?.message ?? String(e);
+          appendNextTrace("next-blocked", { reason: "reset-exception", error: err });
+          setStatusLine("error", `Next task error: ${err}`);
+          warn("resetConversationAndAdvance threw:", err);
+        });
+      return;
+    }
+
+    const nextId = projectLib.nextTaskId(state.source?.project, state.currentTaskId);
+    if (!nextId) {
+      appendNextTrace("next-blocked", { reason: "no-next-task" });
+      setStatusLine("info", "All tasks completed in project.");
+      return;
+    }
+
+    appendNextTrace("navigation-started", { targetTaskId: nextId, directNavigate: true });
+    navigate(nextId).then(() => {
+      appendNextTrace("next-task-selected", { taskId: nextId });
+      appendNextTrace("next-complete", { success: true });
+    }).catch((e) => {
+      appendNextTrace("next-blocked", { reason: "navigate-exception", error: e?.message ?? String(e) });
+    });
   }
 
   function goPrev() {
     const id = projectLib.prevTaskId(state.source.project, state.currentTaskId);
     if (id) navigate(id);
+  }
+
+  /**
+   * v0.10: One task = one clean Gemini conversation.
+   *
+   * Full lifecycle:
+   *   1. Verify the current execution's download is truly complete.
+   *      (chrome.downloads.onChanged state === "complete")
+   *   2. Persist task.status = "generated" if not already (defensive).
+   *   3. Mark the orchestrator as "task-complete".
+   *   4. Send GEMINI_ASSISTANT_RESET_TO_CLEAN_CONVERSATION to the
+   *      content script. The DOM adapter prefers Gemini's own "Nova
+   *      conversa" control; if not reliably detectable, it navigates
+   *      the same tab to /app?hl=<locale>.
+   *   5. Send GEMINI_ASSISTANT_WAIT_FOR_CLEAN_CONVERSATION to verify
+   *      a clean composer.
+   *   6. If `advanceToNext` is true, navigate to the next task via
+   *      the existing `navigate(taskId)` which already calls
+   *      `orchestrator.reset()` to wipe per-execution state.
+   *   7. If we are at the last task, end the reset lifecycle in
+   *      "idle" so the user can see "All tasks complete".
+   *
+   * Returns true on full success, false on any failure.
+   */
+  async function resetConversationAndAdvance(opts) {
+    const options = opts && typeof opts === "object" ? opts : {};
+    const advanceToNext = options.advanceToNext !== false;
+    const source = options.source || "manual";
+
+    if (!orchestrator) {
+      appendResetTrace("blocked", { reason: "no-orchestrator", source });
+      appendNextTrace("next-blocked", { reason: "no-orchestrator", source });
+      setStatusLine("error", "Reset failed: orchestrator not ready.");
+      return false;
+    }
+
+    // 1. Download-completeness gate.
+    const dl = orchestrator.state.download;
+    const cur = currentMutable();
+    const downloadIsComplete = (dl && dl.status === "complete" && dl.ok === true) || (cur && cur.status === "generated");
+    if (!downloadIsComplete) {
+      appendResetTrace("blocked", {
+        reason: "download-not-complete",
+        source,
+        downloadStatus: dl ? dl.status : null,
+        downloadOk: dl ? dl.ok : null,
+      });
+      appendNextTrace("next-blocked", {
+        reason: "download-not-complete",
+        source,
+        downloadStatus: dl ? dl.status : null,
+        downloadOk: dl ? dl.ok : null,
+      });
+      setStatusLine(
+        "error",
+        `Reset blocked: download not complete (status=${dl ? dl.status : "none"}). Use Retry Download first.`,
+      );
+      renderWorkflowState();
+      return false;
+    }
+
+    // Refuse if an active non-terminal execution is in flight.
+    if (orchestrator.isActive && orchestrator.isActive()) {
+      appendResetTrace("blocked", {
+        reason: "execution-active",
+        source,
+        phase: orchestrator.state.phase,
+      });
+      appendNextTrace("next-blocked", {
+        reason: "execution-active",
+        source,
+        phase: orchestrator.state.phase,
+      });
+      setStatusLine(
+        "error",
+        `Reset blocked: orchestrator is busy (phase=${orchestrator.state.phase}).`,
+      );
+      return false;
+    }
+
+    // 2. Persist task.status = "generated" before reset (defensive).
+    if (cur && cur.status !== "generated") {
+      cur.status = "generated";
+      try {
+        await persistState();
+        renderProgress();
+      } catch (_) {
+        /* ignore — status will be re-set on retry */
+      }
+    }
+
+    // 3. Mark task-complete.
+    orchestrator.markTaskComplete();
+
+    appendResetTrace("reset-requested", {
+      taskId: cur?.id ?? null,
+      executionId: orchestrator.state.executionId,
+      advanceToNext,
+      source,
+      downloadId: dl?.downloadId ?? null,
+      finalFilename: dl?.finalFilename || dl?.filename || null,
+    });
+    appendNextTrace("reset-requested", {
+      taskId: cur?.id ?? null,
+      executionId: orchestrator.state.executionId,
+      advanceToNext,
+    });
+
+    // 4. Reset conversation via DOM adapter.
+    orchestrator.beginConversationReset();
+    setStatusLine("info", "Resetting Gemini conversation…");
+    renderWorkflowState();
+
+    let resetRes;
+    try {
+      resetRes = await sendToGemini(
+        "GEMINI_ASSISTANT_RESET_TO_CLEAN_CONVERSATION",
+        { options: {} },
+      );
+    } catch (e) {
+      resetRes = { ok: false, error: e?.message ?? String(e) };
+    }
+
+    appendResetTrace("navigation-started", {
+      previousUrl: resetRes?.previousUrl,
+      strategy: resetRes?.strategy,
+      ok: !!resetRes?.ok,
+      error: resetRes?.error,
+    });
+    appendNextTrace("navigation-started", {
+      strategy: resetRes?.strategy,
+      ok: !!resetRes?.ok,
+    });
+
+    if (!resetRes || !resetRes.ok) {
+      appendResetTrace("reset-failed", {
+        error: (resetRes && resetRes.error) || "no-result",
+        strategy: resetRes?.strategy,
+      });
+      appendNextTrace("next-blocked", {
+        reason: "reset-failed",
+        error: resetRes?.error || "no-result",
+      });
+      orchestrator.endConversationReset();
+      setStatusLine(
+        "error",
+        `Reset failed: ${(resetRes && resetRes.error) || "unknown"}. Conversation preserved.`,
+      );
+      renderWorkflowState();
+      return false;
+    }
+
+    // 5. Verify clean composer.
+    let verifyRes;
+    try {
+      verifyRes = await sendToGemini(
+        "GEMINI_ASSISTANT_WAIT_FOR_CLEAN_CONVERSATION",
+        { timeoutMs: 10000 },
+      );
+    } catch (e) {
+      verifyRes = { ok: false, error: e?.message ?? String(e) };
+    }
+
+    appendResetTrace("clean-page-loaded", {
+      ok: !!verifyRes?.ok,
+      currentUrl: verifyRes?.currentUrl,
+      currentConversationId: verifyRes?.currentConversationId,
+      urlChanged: verifyRes?.urlChanged,
+      composerFound: verifyRes?.composerFound,
+      composerTextLength: verifyRes?.composerTextLength,
+      attachmentCount: verifyRes?.attachmentCount,
+      generationActive: verifyRes?.generationActive,
+      attempts: verifyRes?.attempts,
+      elapsedMs: verifyRes?.elapsedMs,
+      reason: verifyRes?.reason,
+      error: verifyRes?.error,
+    });
+    appendNextTrace("clean-conversation-loaded", {
+      ok: !!verifyRes?.ok,
+      currentUrl: verifyRes?.currentUrl,
+    });
+
+    if (!verifyRes || !verifyRes.ok) {
+      appendResetTrace("verification-failed", {
+        reason: verifyRes?.reason || verifyRes?.error || "unknown",
+      });
+      appendNextTrace("next-blocked", {
+        reason: "clean-verification-failed",
+        error: verifyRes?.reason || verifyRes?.error,
+      });
+      orchestrator.endConversationReset();
+      setStatusLine(
+        "error",
+        `Clean verification failed: ${verifyRes?.reason || verifyRes?.error || "unknown"}. Conversation preserved.`,
+      );
+      renderWorkflowState();
+      return false;
+    }
+
+    // 6. Clear execution-scoped state on the orchestrator.
+    appendResetTrace("execution-state-cleared", {
+      previousExecutionId: orchestrator.state.executionId,
+      previousTaskId: orchestrator.state.taskId,
+    });
+    appendNextTrace("execution-state-cleared", {
+      previousExecutionId: orchestrator.state.executionId,
+    });
+
+    // 7. End the orchestrator reset phase.
+    orchestrator.endConversationReset();
+
+    // 8. Decide whether to advance to the next task.
+    let nextTaskId = null;
+    if (advanceToNext) {
+      nextTaskId = projectLib.nextTaskId(
+        state.source.project,
+        state.currentTaskId,
+      );
+      if (nextTaskId) {
+        appendResetTrace("next-task-selected", { taskId: nextTaskId });
+        appendNextTrace("next-task-selected", { taskId: nextTaskId });
+      } else {
+        appendResetTrace("last-task-reached", {});
+        appendNextTrace("last-task-reached", {});
+      }
+    }
+
+    setStatusLine(
+      "ok",
+      nextTaskId
+        ? `Clean conversation ready ✓ — ${nextTaskId} selected. Click Prepare Task.`
+        : "Clean conversation ready ✓ — all tasks complete.",
+    );
+
+    // 9. Navigate to the next task (or refresh UI for the last task).
+    if (nextTaskId) {
+      await navigate(nextTaskId);
+    } else {
+      resetWorkflowUI();
+      render();
+    }
+
+    appendResetTrace("complete", {
+      nextTaskId,
+      advanceToNext,
+      source,
+    });
+    appendNextTrace("next-complete", {
+      nextTaskId,
+      advanceToNext,
+      source,
+    });
+    renderWorkflowState();
+    return true;
   }
 
 
@@ -1204,71 +1721,180 @@
   }
 
   async function refreshSelfTest() {
-    try {
-      const tab = await getActiveTab();
-      if (!isGeminiUrl(tab.url)) return;
-      const res = await sendMessage(tab.id, { type: "GEMINI_ASSISTANT_PING" });
-      if (res && res.ok) {
-        messagingHealth = { ok: true };
-        if (res.selfTest) {
-          // v0.6.2: append the last attach trace so the Debug card
-          // doubles as "View attachment trace". The selfTest JSON is
-          // prefixed; the trace JSON is appended under a marker.
-          const blocks = [JSON.stringify(res.selfTest, null, 2)];
-          let runtimeStatus = null;
-          try {
-            runtimeStatus = await sendMessage(tab.id, { type: "GEMINI_ASSISTANT_GET_RUNTIME_STATUS" });
-          } catch (_) {}
+    let selfTestResult = null;
+    let runtimeStatus = null;
+    let probeResponse = null;
 
-          if (orchestrator && orchestrator.state) {
-            const os = orchestrator.state;
-            const workflowDiag = {
-              runtimeId: runtimeStatus?.runtimeId || null,
-              runtimeInitializedCount: runtimeStatus?.runtimeInitializedCount || 1,
-              messageHandlerRegistrationCount: runtimeStatus?.messageHandlerRegistrationCount || 1,
-              activeMutationObserverCount: runtimeStatus?.activeMutationObserverCount || 0,
-              activeTimerCount: runtimeStatus?.activeTimerCount || 0,
-              activeExecutionId: runtimeStatus?.activeExecutionId || os.executionId || null,
-              activeTaskId: runtimeStatus?.activeTaskId || os.taskId || null,
-              taskId: os.taskId,
-              executionId: os.executionId,
-              preparationSessionId: os.preparationSessionId,
-              allAttachmentsSettledAt: os.allAttachmentsSettledAt ? new Date(os.allAttachmentsSettledAt).toISOString() : null,
-              readyAt: os.readyAt ? new Date(os.readyAt).toISOString() : null,
-              generateClickedAt: os.generateClickedAt ? new Date(os.generateClickedAt).toISOString() : null,
-              baselineCapturedAt: os.baselineCapturedAt ? new Date(os.baselineCapturedAt).toISOString() : null,
-              sendCommandDispatchedAt: os.sendCommandDispatchedAt ? new Date(os.sendCommandDispatchedAt).toISOString() : null,
-              sendClickedAt: os.sendClickedAt ? new Date(os.sendClickedAt).toISOString() : null,
-              sendButton: os.sendButton || null,
-              submissionEvidence: os.submissionEvidence,
-              submissionAcknowledgedAt: os.submissionAcknowledgedAt ? new Date(os.submissionAcknowledgedAt).toISOString() : null,
-              generationStartEvidence: os.generationStartEvidence,
-              generationStartedAt: os.generationStartedAt ? new Date(os.generationStartedAt).toISOString() : null,
-              generationCompletedAt: os.generationCompletedAt ? new Date(os.generationCompletedAt).toISOString() : null,
-              generationCompletionEvidence: os.generationCompletionEvidence,
-              baseline: os.baseline,
-            };
-            blocks.push("");
-            blocks.push("--- workflow generation diagnostics ---");
-            blocks.push(JSON.stringify(workflowDiag, null, 2));
-          }
-          if (generateTrace.length > 0) {
-            blocks.push("");
-            blocks.push("--- generate trace ---");
-            blocks.push(JSON.stringify(generateTrace, null, 2));
-          }
-          if (lastTrace) {
-            blocks.push(""); // separator
-            blocks.push("--- last attach trace ---");
-            blocks.push(JSON.stringify(lastTrace, null, 2));
-          }
-          selfTestEl.textContent = blocks.join("\n");
-          renderAttachmentDiagnostics(res.selfTest.attachment);
+    try {
+      // Pull SW download trace and listener probe asynchronously
+      try {
+        const probeRes = await runDownloadEventProbe();
+        probeResponse = probeRes?.response || null;
+      } catch (_) {}
+      try {
+        await fetchSwDownloadTrace();
+      } catch (_) {}
+
+      const tab = await getActiveTab();
+      if (isGeminiUrl(tab?.url)) {
+        const res = await sendMessage(tab.id, { type: "GEMINI_ASSISTANT_PING" });
+        if (res && res.ok) {
+          messagingHealth = { ok: true };
+          selfTestResult = res.selfTest || null;
+          try {
+            runtimeStatus = await sendMessage(tab.id, {
+              type: "GEMINI_ASSISTANT_GET_RUNTIME_STATUS",
+            });
+          } catch (_) {}
         }
       }
     } catch (e) {
       messagingHealth = { ok: false, error: e?.message ?? String(e) };
     } finally {
+      // ALWAYS render diagnostic dump so Debug panel is never empty
+      try {
+        const blocks = [];
+        if (selfTestResult) {
+          blocks.push(JSON.stringify(selfTestResult, null, 2));
+          renderAttachmentDiagnostics(selfTestResult.attachment);
+        } else if (messagingHealth.error) {
+          blocks.push(JSON.stringify({ error: messagingHealth.error }, null, 2));
+        }
+
+        const spEntries = downloadTrace.filter((e) => e && e._source !== "sw");
+        const swEntries = downloadTrace.filter((e) => e && e._source === "sw");
+        const lastSpStep = spEntries.length > 0 ? spEntries[spEntries.length - 1].step : null;
+        const lastSwStep = swEntries.length > 0 ? swEntries[swEntries.length - 1].step : (probeResponse?.lastStep || null);
+        const swRuntimeId = probeResponse?.serviceWorkerRuntimeId || (swEntries.length > 0 ? swEntries[swEntries.length - 1].serviceWorkerRuntimeId : null);
+
+        function safeIso(val) {
+          if (!val) return null;
+          if (typeof val === "string" && val.includes("T")) return val;
+          try {
+            const num = Number(val);
+            const d = isNaN(num) ? new Date(val) : new Date(num);
+            return isNaN(d.getTime()) ? String(val) : d.toISOString();
+          } catch (_) {
+            return String(val);
+          }
+        }
+
+        if (orchestrator && orchestrator.state) {
+          const os = orchestrator.state;
+          const workflowDiag = {
+            phase: os.phase,
+            taskId: os.taskId,
+            executionId: os.executionId,
+            preparationSessionId: os.preparationSessionId,
+            download: {
+              status: os.download ? os.download.status : null,
+              downloadId: os.download ? os.download.downloadId : null,
+              claimedAt: safeIso(os.downloadClaimedAt),
+              startedAt: safeIso(os.download?.startedAt),
+              timeoutDeadline: safeIso(os.download?.timeoutDeadline),
+              ok: os.download ? os.download.ok : null,
+              error: os.download ? os.download.error : null,
+              desiredFilename: os.download ? os.download.desiredFilename : null,
+              finalFilename: os.download ? os.download.finalFilename : null,
+            },
+            lastSidePanelDownloadTraceStep: lastSpStep,
+            lastServiceWorkerDownloadTraceStep: lastSwStep,
+            serviceWorkerRuntimeId: swRuntimeId,
+            runtimeId: runtimeStatus?.runtimeId || null,
+            runtimeInitializedCount: runtimeStatus?.runtimeInitializedCount || 1,
+            messageHandlerRegistrationCount: runtimeStatus?.messageHandlerRegistrationCount || 1,
+            activeMutationObserverCount: runtimeStatus?.activeMutationObserverCount || 0,
+            activeTimerCount: runtimeStatus?.activeTimerCount || 0,
+            activeExecutionId: runtimeStatus?.activeExecutionId || os.executionId || null,
+            activeTaskId: runtimeStatus?.activeTaskId || os.taskId || null,
+            allAttachmentsSettledAt: safeIso(os.allAttachmentsSettledAt),
+            readyAt: safeIso(os.readyAt),
+            generateClickedAt: safeIso(os.generateClickedAt),
+            baselineCapturedAt: safeIso(os.baselineCapturedAt),
+            sendCommandDispatchedAt: safeIso(os.sendCommandDispatchedAt),
+            sendClickedAt: safeIso(os.sendClickedAt),
+            sendButton: os.sendButton || null,
+            submissionEvidence: os.submissionEvidence,
+            submissionAcknowledgedAt: safeIso(os.submissionAcknowledgedAt),
+            generationStartEvidence: os.generationStartEvidence,
+            generationStartedAt: safeIso(os.generationStartedAt),
+            generationCompletedAt: safeIso(os.generationCompletedAt),
+            generationCompletionEvidence: os.generationCompletionEvidence,
+            baseline: os.baseline,
+            downloadClaim: {
+              downloadClaimedAt: os.downloadClaimedAt || null,
+              downloadStatus: os.download ? os.download.status : null,
+              downloadId: os.download ? os.download.downloadId : null,
+              desiredFilename: os.download ? os.download.desiredFilename : null,
+              filename: os.download ? os.download.filename : null,
+              finalFilename: os.download ? os.download.finalFilename : null,
+            },
+            handlerRegistrationCounters: {
+              generateTaskBtn: generateHandlerRegistrationCount,
+              retryGenerateBtn: retryGenerateHandlerRegistrationCount,
+              prepareTaskBtn: prepareHandlerRegistrationCount,
+            },
+            downloadTraceSummary: snapshotRuntimeStatusSummary(),
+          };
+          blocks.push("");
+          blocks.push("--- workflow generation diagnostics ---");
+          blocks.push(JSON.stringify(workflowDiag, null, 2));
+        }
+
+        if (spEntries.length > 0) {
+          blocks.push("");
+          blocks.push("--- SIDE PANEL DOWNLOAD TRACE ---");
+          blocks.push(JSON.stringify(spEntries.slice(-30), null, 2));
+        }
+
+        if (swEntries.length > 0) {
+          blocks.push("");
+          blocks.push("--- SERVICE WORKER DOWNLOAD TRACE ---");
+          blocks.push(JSON.stringify(swEntries.slice(-30), null, 2));
+        }
+
+        if (generateTrace.length > 0) {
+          blocks.push("");
+          blocks.push("--- generate trace ---");
+          blocks.push(JSON.stringify(generateTrace, null, 2));
+        }
+
+        if (nextTaskTrace.length > 0) {
+          blocks.push("");
+          blocks.push("--- NEXT TASK FORENSIC TRACE ---");
+          blocks.push(JSON.stringify(nextTaskTrace.slice(-20), null, 2));
+        }
+
+        if (conversationResetTrace.length > 0) {
+          blocks.push("");
+          blocks.push("--- conversation reset trace (last 20) ---");
+          blocks.push(JSON.stringify(conversationResetTrace.slice(-20), null, 2));
+        }
+
+        if (lastTrace) {
+          blocks.push("");
+          blocks.push("--- last attach trace ---");
+          blocks.push(JSON.stringify(lastTrace, null, 2));
+        }
+
+        if (blocks.length === 0) {
+          blocks.push(JSON.stringify({
+            status: "ready",
+            orchestratorPhase: orchestrator?.state?.phase || "idle",
+            currentTaskId: state?.currentTaskId || null,
+            timestamp: new Date().toISOString(),
+          }, null, 2));
+        }
+
+        if (selfTestEl) {
+          selfTestEl.textContent = blocks.join("\n");
+        }
+      } catch (err) {
+        if (selfTestEl) {
+          selfTestEl.textContent = `[Debug render error: ${err?.message ?? String(err)}]`;
+        }
+      }
+
       renderWorkflowState();
     }
   }
@@ -1894,6 +2520,58 @@
     }
   }
 
+  // Part 5: Run Download Event Probe — proves the SW's chrome.downloads
+  // event listeners are alive and delivering. Does NOT generate an
+  // image; the probe is a pure listener-validity check that also pulls
+  // the SW's last 50 trace entries into the local diagnostic buffer.
+  async function onRunDownloadProbe() {
+    if (runDownloadProbeBtn) runDownloadProbeBtn.disabled = true;
+    if (diagResultsBoxEl) {
+      diagResultsBoxEl.textContent = "Pinging service worker for download-event probe…";
+    }
+    try {
+      // Two requests: probe (registration counts + last step) and
+      // trace pull (last 50 entries).
+      const probe = await runDownloadEventProbe();
+      const tracePull = await fetchSwDownloadTrace();
+      const reg = probe?.response?.registrationCounts || {};
+      const summary = {
+        ok: !!probe?.ok,
+        swAlive: !!probe?.ok,
+        registrationCounts: {
+          downloadsOnCreatedRegistrationCount:
+            reg.downloadsOnCreatedRegistrationCount ?? null,
+          downloadsOnChangedRegistrationCount:
+            reg.downloadsOnChangedRegistrationCount ?? null,
+          downloadsOnDeterminingFilenameRegistrationCount:
+            reg.downloadsOnDeterminingFilenameRegistrationCount ?? null,
+        },
+        swTraceLength: probe?.response?.traceLength ?? null,
+        swLastStep: probe?.response?.lastStep ?? null,
+        serviceWorkerRuntimeId: probe?.response?.serviceWorkerRuntimeId ?? null,
+        tracePullOk: !!tracePull?.ok,
+        allRegistrationCountsOne:
+          reg.downloadsOnCreatedRegistrationCount === 1 &&
+          reg.downloadsOnChangedRegistrationCount === 1 &&
+          reg.downloadsOnDeterminingFilenameRegistrationCount === 1,
+      };
+      appendDownloadTrace("download-event-probe-summary", summary);
+      if (diagResultsBoxEl) {
+        diagResultsBoxEl.textContent = JSON.stringify(summary, null, 2);
+      }
+    } catch (e) {
+      appendDownloadTrace("download-event-probe", {
+        result: "exception",
+        error: e?.message ?? String(e),
+      });
+      if (diagResultsBoxEl) {
+        diagResultsBoxEl.textContent = `Probe failed: ${e?.message ?? String(e)}`;
+      }
+    } finally {
+      if (runDownloadProbeBtn) runDownloadProbeBtn.disabled = false;
+    }
+  }
+
   async function onRunProductionHealthCheck() {
     if (runHealthCheckBtn) runHealthCheckBtn.disabled = true;
     if (healthCheckResultsEl) {
@@ -2057,11 +2735,20 @@
   }
 
   if (resetPrepBtn) resetPrepBtn.addEventListener("click", onResetPreparation);
-  // prepareTaskBtn and retryPrepBtn: SINGLE registration each — do NOT add
-  // document-level delegation for these. prepareHandlerRegistrationCount must be 1.
+  // Part 6 invariant: prepareTaskBtn registration count must be exactly 1
+  // across the full lifecycle (extension load, side panel close/reopen,
+  // project re-import, task change, conversation reset).
+  //
+  // The previous code incremented prepareHandlerRegistrationCount for
+  // BOTH retryPrepBtn and prepareTaskBtn, producing a count of 2. This
+  // counter is meant to be a 1:1 check for #prepare-task-btn click
+  // dispatching; retryPrepBtn is a separate UI element with its own
+  // listener. We keep prepareHandlerRegistrationCount for prepareTaskBtn
+  // only and let retryPrepBtn's registration be a no-op for the counter.
   if (retryPrepBtn) {
     retryPrepBtn.addEventListener("click", () => onPrepareTask(false));
-    prepareHandlerRegistrationCount++;
+    // retryPrepBtn is a separate button; do NOT count it under
+    // prepareTaskBtn's registration invariant.
   }
   if (ensureImageModeBtn) ensureImageModeBtn.addEventListener("click", onEnsureImageMode);
   if (prepareTaskBtn) {
@@ -2076,9 +2763,13 @@
   }
   if (retryDetectionBtn) retryDetectionBtn.addEventListener("click", onRetryDetection);
   if (retryDownloadBtn) retryDownloadBtn.addEventListener("click", onRetryDownload);
+  // Bug C fix: Retry Generate uses its OWN counter
+  // (retryGenerateHandlerRegistrationCount) so the regression assertion
+  // `generateHandlerRegistrationCount === 1` measures only the Generate
+  // Task button, not the two logical entry points together.
   if (retryGenerateBtn) {
     retryGenerateBtn.addEventListener("click", onGenerateTask);
-    generateHandlerRegistrationCount++;
+    retryGenerateHandlerRegistrationCount++;
   }
   if (cancelOpBtn) cancelOpBtn.addEventListener("click", onCancel);
   if (markApprovedBtn) markApprovedBtn.addEventListener("click", onMarkApproved);
@@ -2092,7 +2783,20 @@
   if (runTestABtn) runTestABtn.addEventListener("click", onRunTestA);
   if (runTestBBtn) runTestBBtn.addEventListener("click", onRunTestB);
   if (runTestCBtn) runTestCBtn.addEventListener("click", onRunTestC);
+  if (runDownloadProbeBtn) {
+    runDownloadProbeBtn.addEventListener("click", onRunDownloadProbe);
+  }
   if (markAttachVerifiedBtn) markAttachVerifiedBtn.addEventListener("click", onMarkAttachWorking);
+  // v0.10: Reset Conversation button. Uses the SAME implementation
+  // as the auto-reset triggered by Next Task, just without advancing
+  // to the next task (advanceToNext = false).
+  if (resetConversationBtn) {
+    resetConversationBtn.addEventListener("click", () => {
+      onResetConversation().catch((e) => {
+        warn("onResetConversation threw:", e?.message ?? String(e));
+      });
+    });
+  }
   // REMOVED: document-level delegation for #generate-task-btn / #retry-generate-btn.
   // That delegation was the root cause of "button-clicked x2 / handler-entered x2":
   // one physical click fired both the direct addEventListener and the delegation,
@@ -2118,6 +2822,19 @@
   // (Part 19). The service worker uses chrome.downloads.onChanged to
   // detect when a download we initiated reaches 'complete' or
   // 'interrupted'. We update state.download and refresh the UI.
+  //
+  // Also handles Part 1 + Part 5 diagnostic messages:
+  //   GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE
+  //     Returns the SW's last 50 download-trace entries along with the
+  //     listener-registration counters so a stalled side panel can
+  //     distinguish CASE A (onCreated never fires) from CASE B (no claim
+  //     matches) from CASE C (onChanged complete never reconciled) from
+  //     CASE D (SW completes but side panel never receives).
+  //   GEMINI_ASSISTANT_DOWNLOAD_PROBE
+  //     Tells the SW to synthesise a synthetic download event so the
+  //     diagnostics page can prove the listeners are alive and
+  //     delivering. The probe does NOT generate an image — it is a pure
+  //     listener-validity check (Part 5).
   function handleRuntimeMessage(msg, _sender, sendResponse) {
     if (!msg || typeof msg !== "object") return false;
     if (msg.type === "GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED") {
@@ -2129,7 +2846,98 @@
       sendResponse && sendResponse({ ok: true });
       return true;
     }
+    if (msg.type === "GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE") {
+      // The SW pushes its trace to the side panel on demand. We just
+      // re-broadcast it through the local downloadTrace as a passive
+      // snapshot, and surface it in advanced diagnostics.
+      try {
+        const last = Array.isArray(msg.trace) ? msg.trace.slice(-50) : [];
+        for (const entry of last) {
+          downloadTrace.push(Object.assign({ _source: "sw" }, entry));
+        }
+        if (downloadTrace.length > DOWNLOAD_TRACE_MAX) {
+          downloadTrace.splice(0, downloadTrace.length - DOWNLOAD_TRACE_MAX);
+        }
+        appendDownloadTrace("sw-trace-snapshot", {
+          swTraceLength: typeof msg.traceLength === "number" ? msg.traceLength : null,
+          registrationCounts: msg.registrationCounts || null,
+          serviceWorkerRuntimeId: msg.serviceWorkerRuntimeId || null,
+        });
+      } catch (e) {
+        console.warn("[Gemini Assistant:sp] trace snapshot error", e);
+      }
+      sendResponse && sendResponse({ ok: true });
+      return true;
+    }
     return false;
+  }
+
+  /**
+   * Part 5: ping the SW for its recent chrome.downloads trace and
+   * listener-registration counts. Does NOT generate an image; the
+   * probe exists purely to prove the SW's event listeners are alive
+   * and delivering so we can distinguish CASE A/B/C/D in the real
+   * browser.
+   */
+  async function runDownloadEventProbe() {
+    if (!chrome?.runtime?.sendMessage) {
+      appendDownloadTrace("download-event-probe", {
+        result: "no-runtime-sendMessage",
+      });
+      return { ok: false, error: "chrome.runtime.sendMessage unavailable" };
+    }
+    return await new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: "GEMINI_ASSISTANT_DOWNLOAD_PROBE" },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            appendDownloadTrace("download-event-probe", {
+              result: "last-error",
+              error: chrome.runtime.lastError.message,
+            });
+            resolve({ ok: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          appendDownloadTrace("download-event-probe", {
+            result: "ok",
+            swRegistrationCounts: resp?.registrationCounts || null,
+            swTraceLength: typeof resp?.traceLength === "number"
+              ? resp.traceLength
+              : null,
+            swLastStep: resp?.lastStep || null,
+            serviceWorkerRuntimeId: resp?.serviceWorkerRuntimeId || null,
+          });
+          resolve({ ok: true, response: resp });
+        },
+      );
+    });
+  }
+
+  /**
+   * Part 1: ask the SW for the last 50 download-trace entries. The SW
+   * responds with GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE which is
+   * captured by handleRuntimeMessage above and appended to the local
+   * downloadTrace as a snapshot. Callers can then read
+   * `downloadTrace.filter(e => e._source === "sw")` to inspect.
+   */
+  async function fetchSwDownloadTrace() {
+    if (!chrome?.runtime?.sendMessage) return { ok: false };
+    return await new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: "GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE" },
+        (resp) => {
+          if (chrome.runtime.lastError) {
+            appendDownloadTrace("sw-trace-request", {
+              result: "last-error",
+              error: chrome.runtime.lastError.message,
+            });
+            resolve({ ok: false, error: chrome.runtime.lastError.message });
+            return;
+          }
+          resolve({ ok: !!resp?.ok, response: resp });
+        },
+      );
+    });
   }
   function applyDownloadStateChange(msg) {
     if (!orchestrator) return;
@@ -2137,10 +2945,41 @@
     if (!cur) return;
     if (msg.downloadId !== null && cur.downloadId !== null &&
         msg.downloadId !== cur.downloadId) {
-      // Not the download we are tracking. Ignore.
+      try {
+        if (cur.__acquisitionTimer) clearTimeout(cur.__acquisitionTimer);
+        if (cur.__completionTimer) clearTimeout(cur.__completionTimer);
+      } catch (_) {}
+      orchestrator.state.download.__acquisitionTimer = null;
+      orchestrator.state.download.__completionTimer = null;
+      appendDownloadTrace("chrome-download-ignored", {
+        reason: "downloadId-mismatch",
+        state: msg.state || null,
+        msgDownloadId: msg.downloadId ?? null,
+        curDownloadId: cur.downloadId ?? null,
+      });
       return;
     }
+
     if (msg.state === "complete") {
+      try {
+        if (cur.__acquisitionTimer) clearTimeout(cur.__acquisitionTimer);
+        if (cur.__completionTimer) clearTimeout(cur.__completionTimer);
+      } catch (_) {}
+      orchestrator.state.download.__acquisitionTimer = null;
+      orchestrator.state.download.__completionTimer = null;
+
+      const wasError = orchestrator.state.phase === "error" || !!orchestrator.state.error;
+
+      appendDownloadTrace("side-panel-download-complete-received", {
+        downloadId: msg.downloadId ?? cur.downloadId ?? null,
+        filename: msg.filename || null,
+        requestedFilename: msg.requestedFilename || null,
+        completedAt: msg.completedAt || Date.now(),
+        executionId: orchestrator.state.executionId ?? null,
+        taskId: orchestrator.state.taskId ?? null,
+        reconciledFromError: wasError,
+      });
+
       orchestrator.state.download = {
         ...cur,
         status: "complete",
@@ -2152,19 +2991,80 @@
         downloadId: msg.downloadId || cur.downloadId,
         error: null,
       };
-      // v0.9.103: mark task Generated only after the browser confirms
-      // the file is on disk. This satisfies Part 13.
+
+      if (wasError) {
+        orchestrator.state.error = null;
+        appendDownloadTrace("late-success-reconciled", {
+          downloadId: msg.downloadId ?? cur.downloadId ?? null,
+          executionId: orchestrator.state.executionId ?? null,
+          taskId: orchestrator.state.taskId ?? null,
+          previousError: cur.error || null,
+        });
+      }
+
+      appendDownloadTrace("workflow-download-state-reconciled", {
+        downloadId: msg.downloadId ?? cur.downloadId ?? null,
+        filename: msg.filename || null,
+        requestedFilename: msg.requestedFilename || null,
+        status: "complete",
+        ok: true,
+        executionId: orchestrator.state.executionId ?? null,
+        taskId: orchestrator.state.taskId ?? null,
+      });
+
+      const prevClaimedAt = orchestrator.state.downloadClaimedAt;
+      orchestrator.state.downloadClaimedAt = null;
+      appendDownloadTrace("claim-cleared", {
+        reason: "complete",
+        previousDownloadClaimedAt: prevClaimedAt,
+        archiveEntry: {
+          executionId: orchestrator.state.executionId ?? null,
+          taskId: orchestrator.state.taskId ?? null,
+          downloadId: msg.downloadId ?? null,
+          filename: msg.filename || null,
+          completedAt: msg.completedAt || Date.now(),
+        },
+      });
+
       const cur_mut = currentMutable();
       if (cur_mut && cur_mut.status !== "generated") {
         cur_mut.status = "generated";
         persistState();
         renderProgress();
       }
+
+      if (typeof orchestrator.markTaskComplete === "function") {
+        const accepted = orchestrator.markTaskComplete();
+        if (accepted) {
+          appendDownloadTrace("task-complete", {
+            taskId: orchestrator.state.taskId ?? null,
+            executionId: orchestrator.state.executionId ?? null,
+            downloadId: msg.downloadId ?? cur.downloadId ?? null,
+            filename: msg.filename || null,
+          });
+        }
+      }
+
+      appendDownloadTrace("workflow-unlocked", {
+        reason: "complete",
+        nextExecutionCanClaim: true,
+      });
+
       setStatusLine(
         "ok",
         `✓ Download complete — ${orchestrator.state.download.filename || "image"}`,
       );
+      forceUnlockAllButtons();
+      renderWorkflowState();
+      refreshSelfTest();
     } else if (msg.state === "interrupted") {
+      try {
+        if (cur.__acquisitionTimer) clearTimeout(cur.__acquisitionTimer);
+        if (cur.__completionTimer) clearTimeout(cur.__completionTimer);
+      } catch (_) {}
+      orchestrator.state.download.__acquisitionTimer = null;
+      orchestrator.state.download.__completionTimer = null;
+
       orchestrator.state.download = {
         ...cur,
         status: "error",
@@ -2172,16 +3072,80 @@
         completedAt: msg.completedAt || Date.now(),
         error: msg.error || "download-interrupted",
       };
+
+      appendDownloadTrace("chrome-download-interrupted", {
+        result: "interrupted",
+        error: msg.error || "download-interrupted",
+        downloadId: msg.downloadId ?? cur.downloadId ?? null,
+      });
+
+      orchestrator.state.downloadClaimedAt = null;
+      if (typeof orchestrator.markDownloadFailed === "function") {
+        orchestrator.markDownloadFailed(msg.error || "download-interrupted");
+      }
+
+      appendDownloadTrace("claim-cleared", {
+        reason: "interrupted",
+      });
+      appendDownloadTrace("workflow-unlocked", {
+        reason: "interrupted",
+        nextExecutionCanClaim: true,
+      });
+
       setStatusLine(
         "error",
-        `DOWNLOAD FAILED — ${orchestrator.state.download.error}. Use Download Image to retry.`,
+        `DOWNLOAD FAILED — ${orchestrator.state.download.error}. Use Retry Download to retry.`,
       );
+      forceUnlockAllButtons();
     } else if (msg.state === "in_progress") {
+      // DownloadId acquired; clear acquisition timer and start 30s completion watchdog
+      try {
+        if (cur.__acquisitionTimer) clearTimeout(cur.__acquisitionTimer);
+      } catch (_) {}
+      cur.__acquisitionTimer = null;
+
+      if (!cur.__completionTimer) {
+        const DOWNLOAD_COMPLETION_TIMEOUT_MS = 30000;
+        cur.timeoutDeadline = Date.now() + DOWNLOAD_COMPLETION_TIMEOUT_MS;
+        cur.__completionTimer = setTimeout(() => {
+          if (!orchestrator || !orchestrator.state || !orchestrator.state.download) return;
+          const d = orchestrator.state.download;
+          if (d.status === "complete" || d.ok === true) return;
+          appendDownloadTrace("completion-timeout", {
+            timeoutMs: DOWNLOAD_COMPLETION_TIMEOUT_MS,
+            downloadStatus: d.status,
+            downloadId: d.downloadId ?? null,
+            executionId: orchestrator.state.executionId,
+            taskId: cur.taskId ?? null,
+            reason: "browser-download-completion-timeout",
+          });
+          try {
+            if (typeof orchestrator.markDownloadFailed === "function") {
+              orchestrator.markDownloadFailed("browser-download-completion-timeout");
+            } else {
+              d.status = "failed";
+              d.ok = false;
+              d.error = "browser-download-completion-timeout";
+            }
+          } catch (_) {}
+          setStatusLine(
+            "error",
+            "Download timed out before image finished loading.",
+          );
+          forceUnlockAllButtons();
+          renderWorkflowState();
+          refreshSelfTest();
+        }, DOWNLOAD_COMPLETION_TIMEOUT_MS);
+      }
+
       orchestrator.state.download = {
         ...cur,
         status: "downloading",
         downloadId: msg.downloadId || cur.downloadId,
       };
+      appendDownloadTrace("chrome-download-in-progress", {
+        downloadId: msg.downloadId ?? cur.downloadId ?? null,
+      });
     }
     renderWorkflowState();
   }
@@ -2370,6 +3334,30 @@
         compLabel = `Generation (${s.error.error || "timeout"})`;
       }
       items.push({ status: compStatus, label: compLabel });
+
+      // 5d. Download Complete Detection
+      let dlStatus = "waiting";
+      let dlLabel = "Download completed";
+      if (s.download && s.download.status === "complete" && s.download.ok) {
+        dlStatus = "ok";
+        dlLabel = "Download completed (✓)";
+      } else if (s.phase === "downloading" || (s.download && (s.download.status === "downloading" || s.download.status === "waiting-browser-download" || s.download.status === "arming" || s.download.status === "clicking"))) {
+        dlStatus = "active";
+        dlLabel = "Downloading image…";
+      } else if (s.download && (s.download.status === "error" || s.download.status === "failed") && !s.download.ok) {
+        dlStatus = "fail";
+        dlLabel = `Download (${s.download.error || "failed"})`;
+      }
+      items.push({ status: dlStatus, label: dlLabel });
+
+      // 5e. Task Complete
+      let taskStatus = "waiting";
+      let taskLabel = "Task complete";
+      if (s.phase === "task-complete" || (cur && cur.status === "generated")) {
+        taskStatus = "ok";
+        taskLabel = "Task complete (✓)";
+      }
+      items.push({ status: taskStatus, label: taskLabel });
     }
 
     prepChecklistEl.textContent = "";
@@ -2403,7 +3391,10 @@
     const busy = orchestrator ? orchestrator.isActive() : false;
 
     if (workflowPhaseEl) {
-      if (s.phase === "ready") {
+      if (s.phase === "task-complete" || (s.download && s.download.status === "complete" && s.download.ok)) {
+        workflowPhaseEl.textContent = "TASK COMPLETE";
+        workflowPhaseEl.dataset.phase = "task-complete";
+      } else if (s.phase === "ready") {
         workflowPhaseEl.textContent = "READY TO GENERATE";
         workflowPhaseEl.dataset.phase = "ready";
       } else if (s.phase === "sending") {
@@ -2607,16 +3598,17 @@
     }
 
     // Recovery Buttons for Generation Failures
-    const isGenError = s.phase === "error" && s.error;
+    const isDlComplete = (s.download && s.download.status === "complete" && s.download.ok) || cur?.status === "generated" || s.phase === "task-complete";
+    const isGenError = !isDlComplete && s.phase === "error" && s.error;
     const errorPhase = s.error?.phase;
     if (retryDetectionBtn) {
       retryDetectionBtn.hidden = busy || !isGenError || (errorPhase !== "waiting-for-generation");
     }
     if (retryDownloadBtn) {
-      retryDownloadBtn.hidden = busy || !isGenError || (errorPhase !== "downloading");
+      retryDownloadBtn.hidden = busy || isDlComplete || !isGenError || (errorPhase !== "downloading");
     }
     if (retryGenerateBtn) {
-      retryGenerateBtn.hidden = busy || !isGenError || (!["sending", "waiting-for-generation", "downloading"].includes(errorPhase));
+      retryGenerateBtn.hidden = busy || isDlComplete || !isGenError || (!["sending", "waiting-for-generation", "downloading"].includes(errorPhase));
     }
 
     if (markApprovedBtn) {
@@ -2624,6 +3616,21 @@
     }
     if (markRedoBtn) {
       markRedoBtn.hidden = !isGenerated;
+    }
+    // v0.10: Reset Conversation button. Shown when the current
+    // download has just finished (status === "complete") OR when the
+    // orchestrator is idle and a reset would be safe. Hidden during
+    // active work so the user cannot silently navigate away during a
+    // running download.
+    if (resetConversationBtn) {
+      const safeToReset =
+        !busy &&
+        s &&
+        (s.phase === "task-complete" ||
+          s.phase === "complete" ||
+          s.phase === "idle" ||
+          s.phase === "ready");
+      resetConversationBtn.hidden = !safeToReset;
     }
 
     // Lock navigation while busy to prevent race conditions.
@@ -2681,16 +3688,14 @@
       onPhaseChange: (phase, info) => {
         logWorkflow("phase", `${info?.prev ?? "?"} → ${phase}`);
         renderWorkflowState();
-        // Persist status if we transitioned to complete and the task
-        // was not yet marked.
-        if (phase === "complete") {
-          const cur = currentMutable();
-          if (cur && cur.status !== "generated") {
-            cur.status = "generated";
-            persistState();
-            renderProgress();
-          }
-        }
+        // Part 2 invariant: task.status === "generated" must be set ONLY
+        // after authoritative chrome.downloads completion. Previously
+        // this handler marked the task generated on phase === "complete",
+        // which fires on generation visual completion (orchestrator.js
+        // generateTask) BEFORE the browser download lands on disk. That
+        // race was the deadlock root cause. task-complete is now reached
+        // only via markTaskComplete() which is called from
+        // applyDownloadStateChange when the SW reports "complete".
       },
       onAttachmentProgress: (info) => {
         const label = info.label || info.assetId || `#${info.index}`;
@@ -3027,16 +4032,219 @@
   //   5. Wait for GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED from the SW
   //      (chrome.downloads.onChanged) with state 'complete'.
   //   6. Mark task Generated.
+  //
+  // v0.10.x (this build): if the official click does NOT produce a
+  // chrome.downloads event within FALLBACK_BLOB_AFTER_MS, the side panel
+  // fetches the generated image in the content-script context (where
+  // the user's session cookies live) and forwards the bytes to the SW
+  // via GEMINI_ASSISTANT_DOWNLOAD_BLOB. The SW's existing handleDownloadBlob
+  // turns the ArrayBuffer into a Blob URL and hands it to
+  // chrome.downloads.download. This restores the v0.6 path as a
+  // recovery route without removing the v0.9.103 official-control
+  // strategy (the official path is still preferred when it works).
+  const FALLBACK_BLOB_AFTER_MS = 4000;
+  let activeBlobFallback = null;
+
+  /**
+   * Recovery path: fetch the generated image via the content script
+   * (Gemini CDN URLs require the user's session cookies) and forward
+   * the bytes to the service worker for chrome.downloads. Idempotent
+   * against the orchestrator's claim — reuses the same executionId so
+   * the SW can correlate. Failures are surfaced in the download trace
+   * and the status line; the user can retry with the existing
+   * Retry Download button.
+   */
+  async function triggerBlobExtractionFallback(cur, baseline) {
+    if (!orchestrator || !cur) return false;
+    if (orchestrator.state.cancelled) return false;
+    const cur_dl = orchestrator.state.download;
+    if (!cur_dl) return false;
+    if (cur_dl.downloadId) {
+      appendDownloadTrace("blob-fallback-skipped", {
+        reason: "download-already-acquired",
+        downloadId: cur_dl.downloadId,
+        status: cur_dl.status,
+      });
+      return false;
+    }
+    if (cur_dl.status === "complete" || cur_dl.status === "error") {
+      appendDownloadTrace("blob-fallback-skipped", {
+        reason: "download-already-terminal",
+        status: cur_dl.status,
+      });
+      return false;
+    }
+
+    appendDownloadTrace("blob-fallback-started", {
+      taskId: cur?.id ?? null,
+      executionId: orchestrator.state.executionId ?? null,
+    });
+    setStatusLine("info", "Official control did not start a download. Falling back to direct fetch…");
+    renderWorkflowState();
+    try {
+      orchestrator.state.download = {
+        ...orchestrator.state.download,
+        status: "blob-fallback-fetching",
+        blobFallbackStartedAt: Date.now(),
+      };
+    } catch (_) {}
+    renderWorkflowState();
+
+    // 1. Resolve image URL — prefer the result captured by the
+    // orchestrator, fall back to a fresh detection via the CS.
+    let imageSrc = orchestrator.state.result?.imageSrc
+      || orchestrator.state.generation?.imageSrc
+      || null;
+    if (!imageSrc && typeof sendToGemini === "function") {
+      try {
+        const det = await sendToGemini("GEMINI_ASSISTANT_FIND_NEW_RESULT", {
+          baseline: baseline || orchestrator.state.baseline || null,
+        });
+        if (det && det.imageSrc) imageSrc = det.imageSrc;
+      } catch (_) { /* ignore */ }
+    }
+    if (!imageSrc) {
+      appendDownloadTrace("blob-fallback-failed", { reason: "no-image-src" });
+      return false;
+    }
+
+    // 2. Fetch the image in the content-script context.
+    let fetched;
+    try {
+      fetched = await sendToGemini("GEMINI_ASSISTANT_FETCH_IMAGE", { url: imageSrc });
+    } catch (e) {
+      appendDownloadTrace("blob-fallback-failed", {
+        reason: "fetch-exception",
+        error: e?.message ?? String(e),
+      });
+      return false;
+    }
+    if (!fetched || !fetched.ok || !fetched.arrayBuffer) {
+      appendDownloadTrace("blob-fallback-failed", {
+        reason: "fetch-rejected",
+        error: fetched?.error || "no-arrayBuffer",
+      });
+      return false;
+    }
+
+    // 3. Compute the same filename we asked the official path to use.
+    const basename =
+      (outputLib &&
+        projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
+      cur.id;
+    const folder = outputLib.buildDownloadFolder(state.source.project.project.id);
+    const finalFilename = folder
+      ? `${folder}/${basename}.png`
+      : `${basename}.png`;
+
+    // 4. Forward to the SW. The SW's handleDownloadBlob is the
+    //    canonical bridge to chrome.downloads for byte payloads.
+    let dl;
+    try {
+      dl = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage(
+          {
+            type: "GEMINI_ASSISTANT_DOWNLOAD_BLOB",
+            arrayBuffer: fetched.arrayBuffer,
+            filename: finalFilename,
+            mime: fetched.mime || "image/png",
+          },
+          (resp) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            resolve(resp);
+          },
+        );
+      });
+    } catch (e) {
+      appendDownloadTrace("blob-fallback-failed", {
+        reason: "send-message-exception",
+        error: e?.message ?? String(e),
+      });
+      return false;
+    }
+    if (!dl || !dl.ok) {
+      appendDownloadTrace("blob-fallback-failed", {
+        reason: "sw-rejected",
+        error: dl?.error || "no-response",
+      });
+      return false;
+    }
+
+    // 5. Reconcile state. The SW will ALSO fire a state-changed post;
+    //    applyDownloadStateChange is idempotent against downloadId.
+    appendDownloadTrace("blob-fallback-success", {
+      downloadId: dl.downloadId,
+      finalFilename: dl.finalFilename,
+      bytes: fetched.arrayBuffer.byteLength,
+    });
+    try {
+      orchestrator.state.download = {
+        ...orchestrator.state.download,
+        status: "blob-fallback-armed",
+        downloadId: dl.downloadId,
+        finalFilename: dl.finalFilename,
+        filename: dl.finalFilename,
+        sourceType: "image-src-blob-fallback",
+      };
+    } catch (_) {}
+    renderWorkflowState();
+    setStatusLine("info", `Blob fallback download ${dl.downloadId} armed. Awaiting browser completion…`);
+    return true;
+  }
+
   async function triggerAutoDownloadViaOfficialControl(cur) {
+    appendDownloadTrace("auto-download-function-entered", {
+      taskId: cur?.id ?? null,
+      executionId: orchestrator?.state?.executionId ?? null,
+    });
+
     // 1. Idempotency claim.
+    const previousClaim = snapshotDownloadClaimState();
     const claim = orchestrator.claimDownload();
     if (!claim.ok) {
       console.log(
         "[Gemini Assistant:sp] triggerAutoDownload: skipped",
-        { reason: claim.reason },
+        { reason: claim.reason, previousClaim },
       );
+      appendDownloadTrace("download-claim-arm-attempt", {
+        previousClaim,
+        currentClaim: null,
+        result: "rejected",
+        reason: claim.reason,
+        taskId: cur?.id ?? null,
+        executionId: orchestrator?.state?.executionId ?? null,
+      });
+      if (typeof orchestrator.markDownloadFailed === "function") {
+        orchestrator.markDownloadFailed(claim.reason || "claim-rejected");
+      }
       return false;
     }
+
+    appendDownloadTrace("download-claim-created", {
+      previousClaim,
+      currentClaim: {
+        executionId: orchestrator?.state?.executionId ?? null,
+        taskId: cur?.id ?? null,
+        downloadClaimedAt: orchestrator?.state?.downloadClaimedAt ?? null,
+      },
+      result: "armed",
+      taskId: cur?.id ?? null,
+      executionId: orchestrator?.state?.executionId ?? null,
+    });
+    appendDownloadTrace("download-claim-arm-attempt", {
+      previousClaim,
+      currentClaim: {
+        executionId: orchestrator?.state?.executionId ?? null,
+        taskId: cur?.id ?? null,
+        downloadClaimedAt: orchestrator?.state?.downloadClaimedAt ?? null,
+      },
+      result: "armed",
+      taskId: cur?.id ?? null,
+      executionId: orchestrator?.state?.executionId ?? null,
+    });
 
     // 2. Desired filename under project folder.
     const basename =
@@ -3062,6 +4270,11 @@
       completedAt: null,
       error: null,
     };
+    appendDownloadTrace("download-claim-armed", {
+      desiredFilename,
+      executionId: orchestrator.state.executionId,
+      taskId: cur.id,
+    });
     setStatusLine("info", "⬇ Downloading image…");
     renderWorkflowState();
 
@@ -3085,20 +4298,43 @@
         );
       });
       if (!armRes || !armRes.ok) {
+        const armErr = (armRes && armRes.error) || "arm-failed";
         orchestrator.state.download = {
           ...orchestrator.state.download,
-          status: "error",
-          error: (armRes && armRes.error) || "arm-failed",
+          status: "failed",
+          ok: false,
+          error: armErr,
         };
+        appendDownloadTrace("download-claim-armed", {
+          result: "failed",
+          error: armErr,
+          armResponse: armRes,
+        });
+        if (typeof orchestrator.markDownloadFailed === "function") {
+          orchestrator.markDownloadFailed(armErr);
+        }
+        setStatusLine("error", "Download was not detected by Chrome.");
+        forceUnlockAllButtons();
         renderWorkflowState();
         return false;
       }
     } catch (e) {
+      const armErr = `arm-failed: ${e?.message ?? String(e)}`;
       orchestrator.state.download = {
         ...orchestrator.state.download,
-        status: "error",
-        error: `arm-failed: ${e?.message ?? String(e)}`,
+        status: "failed",
+        ok: false,
+        error: armErr,
       };
+      appendDownloadTrace("download-claim-armed", {
+        result: "exception",
+        error: armErr,
+      });
+      if (typeof orchestrator.markDownloadFailed === "function") {
+        orchestrator.markDownloadFailed(armErr);
+      }
+      setStatusLine("error", "Download was not detected by Chrome.");
+      forceUnlockAllButtons();
       renderWorkflowState();
       return false;
     }
@@ -3107,44 +4343,216 @@
     orchestrator.state.download.status = "clicking";
     renderWorkflowState();
     const baseline = orchestrator.state.baseline || {};
+    appendDownloadTrace("official-download-control-search-started", {
+      baseline: baseline ? {
+        generatedImageCount: baseline.generatedImageCount ?? null,
+        modelResponseCount: baseline.modelResponseCount ?? null,
+      } : null,
+      executionId: orchestrator.state.executionId,
+      taskId: cur.id,
+    });
+    appendDownloadTrace("official-download-control-click-attempt", {
+      baseline: baseline ? {
+        generatedImageCount: baseline.generatedImageCount ?? null,
+        modelResponseCount: baseline.modelResponseCount ?? null,
+      } : null,
+      executionId: orchestrator.state.executionId,
+      taskId: cur.id,
+    });
     const clickRes = await sendToGemini(
       "GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD",
       { baseline },
     );
     if (!clickRes || !clickRes.ok) {
+      const clickErr = (clickRes && (clickRes.reason || clickRes.error)) || "click-failed";
       orchestrator.state.download = {
         ...orchestrator.state.download,
-        status: "error",
-        error:
-          (clickRes && (clickRes.reason || clickRes.error)) || "click-failed",
+        status: "failed",
+        ok: false,
+        error: clickErr,
         downloadControlDetection:
           (clickRes && clickRes.downloadControlDetection) || null,
       };
+      appendDownloadTrace("official-download-control-click-attempt", {
+        result: "failed",
+        reason: clickErr,
+        clickResponse: clickRes,
+      });
+      if (typeof orchestrator.markDownloadFailed === "function") {
+        orchestrator.markDownloadFailed(clickErr);
+      }
+      setStatusLine("error", "Download was not detected by Chrome.");
+      forceUnlockAllButtons();
       renderWorkflowState();
       return false;
     }
+
+    const pre = clickRes.preClick || {};
+    appendDownloadTrace("official-download-control-found", {
+      ariaLabel: clickRes.ariaLabel || pre.ariaLabel || null,
+      tag: pre.tagName || "button",
+      candidateCount: clickRes.candidateCountInsideCurrentResponse ?? pre.candidateCountInsideCurrentResponse ?? null,
+      insideCurrentResponse: pre.insideCurrentResponse ?? true,
+      enabled: pre.disabled !== undefined ? !pre.disabled : true,
+      disabled: !!pre.disabled,
+      connected: pre.isConnected !== undefined ? !!pre.isConnected : true,
+      isConnected: pre.isConnected !== undefined ? !!pre.isConnected : true,
+      outerHTML: pre.outerHTML || null,
+      customElementFound: clickRes.customElementFound || false,
+      candidateCountGlobal: clickRes.candidateCountGlobal ?? null,
+    });
+
+    appendDownloadTrace("official-download-control-click-returned", {
+      clickReturned: true,
+      elapsedMs: clickRes.elapsedMs ?? 0,
+      clickedAt: clickRes.clickedAt || Date.now(),
+      executionId: orchestrator.state.executionId,
+      taskId: cur.id,
+    });
+
     orchestrator.state.download = {
       ...orchestrator.state.download,
       officialButtonClickedAt: clickRes.clickedAt || Date.now(),
       downloadControlDetection:
         clickRes.downloadControlDetection || null,
     };
+    appendDownloadTrace("official-download-clicked", {
+      clickedAt: clickRes.clickedAt,
+      downloadId: null,
+      candidateCountGlobal:
+        clickRes.candidateCountGlobal ?? null,
+      candidateCountInsideCurrentResponse:
+        clickRes.candidateCountInsideCurrentResponse ?? null,
+      ariaLabel:
+        (clickRes.downloadControlDetection &&
+          clickRes.downloadControlDetection.ariaLabel) ||
+        clickRes.ariaLabel ||
+        null,
+      customElementFound:
+        (clickRes.downloadControlDetection &&
+          clickRes.downloadControlDetection.customElementFound) ||
+        clickRes.customElementFound ||
+        null,
+      executionId: orchestrator.state.executionId,
+      taskId: cur.id,
+    });
     renderWorkflowState();
 
     // 5. Wait for the SW to post GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED.
-    // The applyDownloadStateChange handler (registered below) updates
-    // orchestrator.state.download and marks the task Generated when the
-    // download reaches 'complete'.
-    //
-    // We rely on the SW post back. applyDownloadStateChange runs the
-    // task-marking logic. To avoid a race where the user clicks Manual
-    // Retry before the SW fires, we leave state.download.status at
-    // 'waiting-browser-download' / 'downloading' until the SW speaks.
     orchestrator.state.download.status = "waiting-browser-download";
 
-    // The SW updates state.download and fires setStatusLine on completion.
-    // We return true optimistically; the task will be marked Generated
-    // when the SW's completion event lands.
+    // Capture the baseline for the blob-extraction fallback (it needs
+    // the same imageSrc the official path would have used).
+    const capturedBaseline = orchestrator.state.baseline || baseline || null;
+    const capturedExecutionId = orchestrator.state.executionId;
+    const capturedTaskId = cur.id;
+
+    // 4-second Blob-Fallback Trigger. If the official click did not
+    // start a chrome.downloads event by now, fall back to fetching
+    // the image bytes via the content script and pushing them to the
+    // SW. This guards against the case where the official Gemini
+    // download button does not respond to programmatic clicks (which
+    // we observed in the wild when the Angular host uses pointer
+    // events or shadow DOM).
+    try {
+      if (activeBlobFallback) {
+        clearTimeout(activeBlobFallback);
+      }
+    } catch (_) {}
+    activeBlobFallback = setTimeout(() => {
+      activeBlobFallback = null;
+      const cur = orchestrator.state.download;
+      if (!cur) return;
+      if (cur.downloadId) {
+        appendDownloadTrace("blob-fallback-noop", {
+          reason: "download-already-acquired",
+          downloadId: cur.downloadId,
+        });
+        return;
+      }
+      if (
+        cur.status !== "waiting-browser-download" &&
+        cur.status !== "clicking" &&
+        cur.status !== "arming"
+      ) {
+        appendDownloadTrace("blob-fallback-noop", {
+          reason: "status-not-eligible",
+          status: cur.status,
+        });
+        return;
+      }
+      appendDownloadTrace("blob-fallback-triggered", {
+        afterMs: FALLBACK_BLOB_AFTER_MS,
+        status: cur.status,
+        executionId: capturedExecutionId,
+        taskId: capturedTaskId,
+      });
+      // Re-enter the click handler's scope: re-read `cur` (the
+      // function parameter shadows the outer cur used by retry).
+      const task = currentTask();
+      triggerBlobExtractionFallback(task || cur, capturedBaseline)
+        .then((ok) => {
+          appendDownloadTrace("blob-fallback-finished", { ok });
+        })
+        .catch((e) => {
+          appendDownloadTrace("blob-fallback-finished", {
+            ok: false,
+            error: e?.message ?? String(e),
+          });
+        });
+    }, FALLBACK_BLOB_AFTER_MS);
+
+    // 8-second Acquisition Watchdog
+    const DOWNLOAD_ACQUISITION_TIMEOUT_MS = 8000;
+    try {
+      if (orchestrator.state.download.__acquisitionTimer) {
+        clearTimeout(orchestrator.state.download.__acquisitionTimer);
+      }
+    } catch (_) {}
+    orchestrator.state.download.timeoutDeadline = Date.now() + DOWNLOAD_ACQUISITION_TIMEOUT_MS;
+    orchestrator.state.download.__acquisitionTimer = setTimeout(() => {
+      const cur = orchestrator.state.download;
+      if (!cur) return;
+      if (cur.downloadId) {
+        // Either the official path OR the blob fallback already won.
+        return;
+      }
+      if (
+        cur.status !== "waiting-browser-download" &&
+        cur.status !== "downloading" &&
+        cur.status !== "clicking" &&
+        cur.status !== "arming" &&
+        cur.status !== "blob-fallback-fetching" &&
+        cur.status !== "blob-fallback-armed"
+      ) {
+        return;
+      }
+      appendDownloadTrace("acquisition-timeout", {
+        timeoutMs: DOWNLOAD_ACQUISITION_TIMEOUT_MS,
+        downloadStatus: cur.status,
+        downloadId: cur.downloadId ?? null,
+        executionId: orchestrator.state.executionId,
+        taskId: cur.taskId ?? null,
+        reason: "browser-download-not-detected",
+      });
+      try {
+        if (typeof orchestrator.markDownloadFailed === "function") {
+          orchestrator.markDownloadFailed("browser-download-not-detected");
+        } else {
+          cur.status = "failed";
+          cur.ok = false;
+          cur.error = "browser-download-not-detected";
+        }
+      } catch (_) {}
+      setStatusLine(
+        "error",
+        "Download was not detected by Chrome.",
+      );
+      forceUnlockAllButtons();
+      renderWorkflowState();
+      refreshSelfTest();
+    }, DOWNLOAD_ACQUISITION_TIMEOUT_MS);
+
     return true;
   }
 
@@ -3357,12 +4765,46 @@
       genResult.silent === true;
 
     if (isSuccess) {
-      // v0.9.103: switch the auto-download path from blob extraction
-      // to clicking Gemini's official download control. The button is
-      // resolved INSIDE the current result container — never via a
-      // global selector.
+      appendDownloadTrace("generation-completed-handler-entered", {
+        taskId: cur?.id ?? null,
+        executionId: orchestrator.state.executionId,
+        preparationSessionId: orchestrator.state.preparationSessionId,
+      });
+      const downloadStateBeforeArm = snapshotDownloadClaimState();
+      appendDownloadTrace("generation-complete", {
+        currentClaim: downloadStateBeforeArm.activeDownloadClaim,
+        downloadStatusBeforeArm: downloadStateBeforeArm.downloadStatus,
+        executionId: orchestrator.state.executionId,
+        taskId: cur?.id ?? null,
+      });
       try {
         const dlOk = await triggerAutoDownloadViaOfficialControl(cur);
+        const downloadStateAfterArm = snapshotDownloadClaimState();
+        appendDownloadTrace("workflow-unlocked", {
+          reason: "download-arm-attempt-complete",
+          previousDownloadClaim: downloadStateBeforeArm.activeDownloadClaim,
+          currentDownloadClaim: downloadStateAfterArm.activeDownloadClaim,
+          downloadStateBeforeArm,
+          downloadStateAfterArm,
+          downloadAttemptOk: dlOk,
+        });
+        // Console dump for the user's "VERY IMPORTANT DIAGNOSTIC"
+        // requirement: when scene-003 reaches generation complete,
+        // print the full claim-transition snapshot.
+        try {
+          console.log(
+            "[download-diagnostic] generation-complete",
+            {
+              previousDownloadClaim: downloadStateBeforeArm.activeDownloadClaim,
+              currentDownloadClaim: downloadStateAfterArm.activeDownloadClaim,
+              downloadStateBeforeArm,
+              downloadStateAfterArm,
+              downloadAttemptOk: dlOk,
+            },
+          );
+        } catch (_) {
+          /* ignore */
+        }
         if (!dlOk) {
           setStatusLine(
             "error",
@@ -3370,6 +4812,15 @@
           );
         }
       } catch (e) {
+        const downloadStateAfterArm = snapshotDownloadClaimState();
+        appendDownloadTrace("workflow-unlocked", {
+          reason: "download-arm-exception",
+          error: e?.message ?? String(e),
+          previousDownloadClaim: downloadStateBeforeArm.activeDownloadClaim,
+          currentDownloadClaim: downloadStateAfterArm.activeDownloadClaim,
+          downloadStateBeforeArm,
+          downloadStateAfterArm,
+        });
         setStatusLine("error", `Auto-download error: ${e?.message ?? String(e)}`);
       }
     } else if (isSilentBail) {
@@ -3506,18 +4957,64 @@
     // Clear FAILED claim only. Successful downloads keep their claim so
     // we don't double-download; the user should use Mark as Redo to
     // re-run generation.
-    if (orchestrator.state.download?.status === "error") {
+    if (
+      orchestrator.state.download?.status === "error" ||
+      orchestrator.state.download?.status === "failed" ||
+      orchestrator.state.phase === "error"
+    ) {
       orchestrator.state.downloadClaimedAt = null;
+      orchestrator.state.phase = "downloading";
     }
+    setStatusLine("info", "Retrying download…");
+    renderWorkflowState();
     try {
       const ok = await triggerAutoDownloadViaOfficialControl(cur);
       if (!ok) {
-        setStatusLine("error", "Retry download failed. See diagnostics.");
+        setStatusLine("error", "Download was not detected by Chrome.");
       }
     } catch (e) {
       setStatusLine("error", `Retry download error: ${e?.message ?? String(e)}`);
     }
+    forceUnlockAllButtons();
     renderWorkflowState();
+    refreshSelfTest();
+  }
+
+  // v0.10: explicit "Reset Gemini Conversation" button. Shares the
+  // exact same production reset implementation as Next Task.
+  async function onResetConversation() {
+    if (!orchestrator) {
+      setStatusLine("error", "Reset failed: orchestrator not ready.");
+      return;
+    }
+    // Defence-in-depth: refuse if a new execution is currently in
+    // flight. The user must finish or cancel the current run.
+    if (orchestrator.isActive && orchestrator.isActive()) {
+      setStatusLine(
+        "error",
+        `Reset blocked: orchestrator is busy (phase=${orchestrator.state.phase}).`,
+      );
+      return;
+    }
+    // Confirmation gate: only ask if the current task has not yet
+    // reached "generated" status. A generated task can be reset
+    // without confirmation because the download is already persisted.
+    const cur = currentMutable();
+    const alreadyGenerated = cur && cur.status === "generated";
+    if (!alreadyGenerated) {
+      const ok = window.confirm(
+        "Reset will navigate Gemini to a clean conversation. " +
+          "Any unsent draft / in-flight generation for the current task will be abandoned. Continue?",
+      );
+      if (!ok) return;
+    }
+    const result = await resetConversationAndAdvance({
+      advanceToNext: false,
+      source: "reset-conversation-button",
+    });
+    if (!result) {
+      warn("onResetConversation: resetConversationAndAdvance returned false");
+    }
   }
 
   async function onCancel() {

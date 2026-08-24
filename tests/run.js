@@ -7908,27 +7908,48 @@ test("v0.9.98.5: state.download.status transitions to error on failure", async (
   );
 });
 
-test("v0.9.98.6: sidepanel invokes orch.download after successful generateTask", () => {
+test("v0.9.98.6: sidepanel invokes the official-control download path after successful generateTask", () => {
   const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // v0.9.103 replaced the blob-extraction path with the
+  // official-control path. We assert the new behaviour:
+  // triggerAutoDownloadViaOfficialControl must be called inside the
+  // isSuccess branch.
   const generateMatch = src.match(
-    /if\s*\(isSuccess\)\s*\{[\s\S]{0,4000}?orch\.download\(/,
+    /if\s*\(isSuccess\)\s*\{[\s\S]{0,8000}?triggerAutoDownloadViaOfficialControl\(/,
   );
   assert(
     generateMatch !== null,
-    "sidepanel must call orch.download() inside the isSuccess branch of generateTask",
+    "sidepanel must call triggerAutoDownloadViaOfficialControl() inside the isSuccess branch of generateTask",
   );
 });
 
-test("v0.9.98.7: sidepanel sets task.status='generated' only on download success", () => {
+test("v0.9.98.7: sidepanel sets task.status='generated' only after authoritative chrome.downloads completion", () => {
   const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
-  // Find the isSuccess branch. Inside, look for the assignment of
-  // cur_mut.status to "generated" gated on dlOk.
-  const branchMatch = src.match(
-    /if\s*\(isSuccess\)\s*\{[\s\S]{0,5000}?if\s*\(cur_mut\s*&&\s*cur_mut\.status\s*!==\s*["']generated["']\)\s*\{\s*cur_mut\.status\s*=\s*["']generated["']/,
-  );
+  // Part 2 invariant: task.status === "generated" must be set ONLY
+  // inside applyDownloadStateChange when msg.state === "complete" —
+  // never in the onPhaseChange handler.
+  const applyMatch = src.match(/function applyDownloadStateChange\([\s\S]*?\n\s{2}\}/);
   assert(
-    branchMatch !== null,
-    "sidepanel must set task.status='generated' only after a successful download (gated by dlOk)",
+    applyMatch !== null,
+    "could not locate applyDownloadStateChange in sidepanel.js",
+  );
+  const body = applyMatch[0];
+  assert(
+    /cur_mut\.status\s*=\s*["']generated["']/.test(body),
+    "applyDownloadStateChange must mark task Generated only after SW reports 'complete'",
+  );
+  // Belt-and-suspenders: the onPhaseChange handler must NOT mark
+  // task generated on phase === "complete" (this is the legacy bug
+  // that produced the deadlock).
+  const onPhaseMatch = src.match(/onPhaseChange:\s*\([\s\S]*?\}\s*,/);
+  assert(
+    onPhaseMatch !== null,
+    "could not locate onPhaseChange handler",
+  );
+  const onPhaseBody = onPhaseMatch[0];
+  assert(
+    !/if\s*\(\s*phase\s*===\s*["']complete["']\s*\)\s*\{[\s\S]{0,500}?cur_mut\.status\s*=\s*["']generated["']/.test(onPhaseBody),
+    "onPhaseChange must NOT mark task Generated on phase === 'complete' (Part 2 invariant)",
   );
 });
 
@@ -8398,8 +8419,11 @@ test("v0.9.103.9: service worker only intercepts Gemini-originated downloads", (
 
 test("v0.9.103.10: sidepanel auto-download uses official-control path, not blob extraction", () => {
   const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // The isSuccess branch's body grew when the download-acquisition
+  // timeout was added (Part 3). We bump the regex limit to 9000 chars
+  // so the assertion still matches the full branch.
   const match = src.match(
-    /if\s*\(isSuccess\)\s*\{[\s\S]{0,2500}?\}\s*else\s+if\s*\(isSilentBail\)/,
+    /if\s*\(isSuccess\)\s*\{[\s\S]{0,9000}?\}\s*else\s+if\s*\(isSilentBail\)/,
   );
   assert(match !== null, "could not locate isSuccess branch");
   const body = match[0];
@@ -8473,6 +8497,1101 @@ test("v0.9.103.14: onRetryDownload does NOT call prepareTask or generateTask", (
     /triggerAutoDownloadViaOfficialControl/.test(body),
     "onRetryDownload must reuse the official-control flow",
   );
+});
+
+// ----- v0.10.x (this build): official-click reliability + blob fallback ----
+// Fixes the "image generated, download does not start" bug. Two failure
+// modes observed in the wild:
+//
+//   A. The Gemini host element <download-generated-image-button> listens
+//      for clicks on the host, not on the inner <button>. Programmatic
+//      .click() on the inner button never reaches the Angular handler.
+//
+//   B. When A is true, chrome.downloads.onCreated never fires and the
+//      8s acquisition watchdog reports "Download was not detected by
+//      Chrome." even though the image bytes are reachable via the
+//      content-script fetch path.
+//
+// The fixes below dispatch the click on the host, add a synthetic
+// pointer-event fallback, and run a blob-extraction recovery path
+// 4s after the official click if no chrome.downloads event arrived.
+
+test("v0.10.x.1: official-click detector returns the custom-element host (not just the inner button)", () => {
+  const dom = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const body = findFunctionBody(dom, "findOfficialDownloadButtonInContainer");
+  assert(body !== null, "findOfficialDownloadButtonInContainer must exist");
+  assert(
+    /customHost/.test(body),
+    "Tier 1 must reference customHost (the <download-generated-image-button> custom element)",
+  );
+  assert(
+    /button\s*=\s*customHost/.test(body),
+    "Tier 1 must default to clicking the customHost (not the inner button) so Angular's host-level handler fires",
+  );
+  assert(
+    /__innerBtnForTier1/.test(body),
+    "Tier 1 must remember the inner button so the click handler can dispatch on it as a sibling strategy",
+  );
+});
+
+test("v0.10.x.2: clickCurrentGenerationDownloadButton dispatches synthetic pointer/click events on the host", () => {
+  const dom = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const body = findFunctionBody(dom, "clickCurrentGenerationDownloadButton");
+  assert(body !== null, "clickCurrentGenerationDownloadButton must exist");
+  assert(
+    /dispatchSyntheticClick|dispatchEvent\(new MouseEvent/.test(body),
+    "click handler must synthesise pointerdown/mousedown/pointerup/mouseup/click events on the host",
+  );
+  assert(
+    /dispatchSyntheticClick\(innerBtn/.test(body),
+    "click handler must also dispatch the synthetic events on the inner button (if present)",
+  );
+  assert(
+    /clickStrategyUsed/.test(body),
+    "click handler must record which strategy (native | synthetic-host) succeeded",
+  );
+});
+
+test("v0.10.x.3: sidepanel schedules a blob-extraction fallback 4s after the official click", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(
+    /FALLBACK_BLOB_AFTER_MS\s*=\s*4000/.test(sp),
+    "FALLBACK_BLOB_AFTER_MS must be 4000ms (half of the 8s acquisition watchdog)",
+  );
+  assert(
+    /function triggerBlobExtractionFallback/.test(sp),
+    "sidepanel must define triggerBlobExtractionFallback",
+  );
+  assert(
+    /activeBlobFallback\s*=\s*setTimeout/.test(sp),
+    "sidepanel must schedule the blob fallback via setTimeout",
+  );
+  assert(
+    /GEMINI_ASSISTANT_FETCH_IMAGE/.test(sp),
+    "blob fallback must call GEMINI_ASSISTANT_FETCH_IMAGE (the existing fetch bridge in content.js)",
+  );
+  assert(
+    /GEMINI_ASSISTANT_DOWNLOAD_BLOB/.test(sp),
+    "blob fallback must call GEMINI_ASSISTANT_DOWNLOAD_BLOB (the existing byte bridge in the service worker)",
+  );
+});
+
+test("v0.10.x.4: 8s acquisition watchdog allows the blob-fallback status window", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const watchdog = sp.match(
+    /orchestrator\.state\.download\.__acquisitionTimer\s*=\s*setTimeout\([\s\S]*?\}\s*,\s*DOWNLOAD_ACQUISITION_TIMEOUT_MS\s*\)/,
+  );
+  assert(watchdog !== null, "8s acquisition watchdog must exist");
+  const body = watchdog[0];
+  assert(
+    /blob-fallback-fetching|blob-fallback-armed/.test(body),
+    "acquisition watchdog must NOT mark the download as failed while the blob fallback is in flight",
+  );
+  assert(
+    /cur\.downloadId/.test(body),
+    "acquisition watchdog must short-circuit when a downloadId has already been acquired (by either path)",
+  );
+});
+
+test("v0.10.x.5: blob fallback is no-op if downloadId was already acquired by the official path", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const fn = findFunctionBody(sp, "triggerBlobExtractionFallback");
+  assert(fn !== null, "triggerBlobExtractionFallback must exist");
+  assert(
+    /cur_dl\.downloadId/.test(fn),
+    "blob fallback must check cur_dl.downloadId and bail out if non-null",
+  );
+  assert(
+    /cur_dl\.status\s*===\s*["']complete["']\s*\|\|\s*cur_dl\.status\s*===\s*["']error["']/.test(fn),
+    "blob fallback must bail out if the download is already in a terminal status",
+  );
+});
+
+test("v0.10.x.6: blob fallback emits structured trace steps for diagnostics", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  for (const step of [
+    "blob-fallback-started",
+    "blob-fallback-triggered",
+    "blob-fallback-noop",
+    "blob-fallback-success",
+    "blob-fallback-failed",
+    "blob-fallback-finished",
+    "blob-fallback-skipped",
+  ]) {
+    assert(
+      new RegExp(`["']${step}["']`).test(sp),
+      `download-trace must include step "${step}" for blob-fallback diagnostics`,
+    );
+  }
+});
+
+test("v0.10.x.7: 8s acquisition watchdog fires even when the official path never produced a downloadId", () => {
+  // Regression: previously the watchdog fired unconditionally after
+  // 8s. After the blob fallback was added, the watchdog must still
+  // trigger if neither path acquired a downloadId. Verify the watchdog
+  // body still contains the failure path.
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(
+    /browser-download-not-detected/.test(sp),
+    "watchdog must still record browser-download-not-detected after the fix",
+  );
+  assert(
+    /Download was not detected by Chrome/.test(sp),
+    "watchdog must still surface the user-facing error if both paths fail",
+  );
+});
+
+// ----- Part 2 / Part 3 / Part 4 / Part 6 regression suite ------------------
+// Fixes the deadlock where the orchestrator silently transitioned into
+// task-complete BEFORE authoritative chrome.downloads completion.
+
+// Test 1: generation visual completion does NOT imply task-complete.
+// After generateTask() reports success, the orchestrator phase must be
+// "downloading" (waiting for SW), not "task-complete" or "complete".
+test("Part2.1: generation visual completion does NOT imply task-complete", async () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async (msg) => {
+      if (msg && msg.type === "GEMINI_ASSISTANT_WAIT_FOR_GENERATED_IMAGE") {
+        return {
+          ok: true,
+          imageSrc: "https://lh3.googleusercontent.com/x",
+          alt: "AI generated",
+          downloadControl: {
+            found: true,
+            ariaLabel: "Baixar imagem no tamanho original",
+            customElementFound: true,
+          },
+        };
+      }
+      if (msg && msg.type === "GEMINI_ASSISTANT_CANCEL_EXECUTION") {
+        return { ok: true };
+      }
+      return { ok: true };
+    },
+    downloadImage: async () => ({ ok: true, downloadId: 1, finalFilename: "x.png" }),
+  });
+  // Simulate the side panel having armed an SW claim before generate,
+  // so the post-generation phase lands in "downloading".
+  orch.state.executionId = "exec-test-1";
+  orch.state.preparationSessionId = "prep-test-1";
+  orch.state.taskId = "scene-001";
+  // Pretend a preparation session was previously confirmed:
+  orch.state.preparationSession = {
+    id: "prep-test-1",
+    taskId: "scene-001",
+    preparedAt: Date.now(),
+    confirmedReferenceIds: [],
+    promptFingerprint: 10,
+  };
+  // Phase must be "ready" so generateTask can run.
+  orch._transition("ready");
+  // Bypass the click-probe path: jump directly into the post-send flow.
+  orch.state.sendCommandDispatchedAt = Date.now();
+  orch.state.send = { ok: true };
+  orch.state.submissionAcknowledgedAt = Date.now();
+  orch.state.submissionEvidence = "ok";
+  orch.state.generationStartedAt = Date.now();
+  orch.state.generationStartEvidence = "ok";
+  orch._transition("generating");
+  // Now drive the waitForGeneratedImage branch.
+  orch.state.sendClickedAt = Date.now();
+  orch.state.sendButton = { found: true, disabled: false, label: "Send" };
+  // Inline the post-click tail of generateTask so we can assert the
+  // transition target without spinning up the real DOM.
+  orch.state.generationCompletedAt = Date.now();
+  orch.state.generationCompletionEvidence = {
+    imageSrc: "https://lh3.googleusercontent.com/x",
+    downloadControl: {
+      found: true,
+      ariaLabel: "Baixar imagem no tamanho original",
+      customElementFound: true,
+    },
+  };
+  orch.state.result = {
+    imageSrc: "https://lh3.googleusercontent.com/x",
+    downloadControl: orch.state.generationCompletionEvidence.downloadControl,
+    filename: "scene-001.png",
+  };
+  orch._transition("downloading");
+  assertEqual(
+    orch.state.phase,
+    "downloading",
+    "after generation visual completion, phase must be 'downloading' (not task-complete)",
+  );
+  assert(
+    orch.state.phase !== "task-complete",
+    "phase must NOT be 'task-complete' before authoritative download confirmation",
+  );
+  assert(
+    orch.state.phase !== "complete",
+    "phase must NOT be 'complete' before authoritative download confirmation (legacy bug)",
+  );
+});
+
+// Test 2: while waiting for the SW, phase remains "downloading".
+test("Part2.2: waiting-browser-download keeps phase downloading", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true, downloadId: 1, finalFilename: "x.png" }),
+  });
+  orch.state.download = {
+    status: "waiting-browser-download",
+    startedAt: Date.now(),
+    downloadId: null,
+    ok: false,
+    filename: null,
+  };
+  assertEqual(
+    orch.state.phase !== "task-complete",
+    true,
+    "phase must remain in a non-terminal phase while waiting-browser-download",
+  );
+  assertEqual(
+    typeof orch.isDownloadConfirmedForTaskComplete === "function",
+    true,
+    "isDownloadConfirmedForTaskComplete predicate must exist",
+  );
+  assertEqual(
+    orch.isDownloadConfirmedForTaskComplete(),
+    false,
+    "isDownloadConfirmedForTaskComplete must return false while download is unconfirmed",
+  );
+});
+
+// Test 3: task-complete requires download.status === 'complete'.
+test("Part2.3: markTaskComplete refuses when download.status !== 'complete'", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "complete";
+  orch.state.download = {
+    status: "waiting-browser-download",
+    downloadId: null,
+    ok: false,
+    filename: null,
+  };
+  const accepted = orch.markTaskComplete();
+  assertEqual(accepted, false, "markTaskComplete must refuse without 'complete' status");
+  assertEqual(
+    orch.state.phase,
+    "complete",
+    "phase must remain unchanged when markTaskComplete refuses",
+  );
+});
+
+// Test 4: task-complete requires download.ok === true.
+test("Part2.4: markTaskComplete refuses when download.ok !== true", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "complete";
+  orch.state.download = {
+    status: "complete",
+    downloadId: 42,
+    ok: false,
+    filename: "scene-001.png",
+  };
+  const accepted = orch.markTaskComplete();
+  assertEqual(accepted, false, "markTaskComplete must refuse without ok=true");
+  assertEqual(orch.state.phase, "complete", "phase must not advance without ok=true");
+});
+
+// Test 5: task-complete requires integer downloadId.
+test("Part2.5: markTaskComplete refuses when downloadId is not an integer", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "complete";
+  orch.state.download = {
+    status: "complete",
+    downloadId: null,
+    ok: true,
+    filename: "scene-001.png",
+  };
+  const accepted = orch.markTaskComplete();
+  assertEqual(accepted, false, "markTaskComplete must refuse without integer downloadId");
+  assertEqual(orch.state.phase, "complete", "phase must not advance without integer downloadId");
+});
+
+// Test 6: markTaskComplete accepts when all three invariants hold.
+test("Part2.6: markTaskComplete accepts when status=complete, ok=true, downloadId is integer", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.download = {
+    status: "complete",
+    downloadId: 42,
+    ok: true,
+    filename: "scene-001.png",
+    finalFilename: "scene-001.png",
+  };
+  const accepted = orch.markTaskComplete();
+  assertEqual(accepted, true, "markTaskComplete must accept when all invariants hold");
+  assertEqual(orch.state.phase, "task-complete", "phase must advance to task-complete");
+  // Idempotent: calling again is a no-op and stays at task-complete.
+  const accepted2 = orch.markTaskComplete();
+  assertEqual(accepted2, true, "markTaskComplete must be idempotent");
+  assertEqual(orch.state.phase, "task-complete", "phase stays at task-complete on second call");
+});
+
+// Test 7: isActive() returns false for "task-complete".
+test("Part2.7: isActive returns false when phase is task-complete (unlocks buttons)", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "task-complete";
+  assertEqual(
+    orch.isActive(),
+    false,
+    "isActive must return false for task-complete (UI must unlock Next Task)",
+  );
+});
+
+// Test 8: sidepanel no longer marks task generated in onPhaseChange.
+test("Part2.8: sidepanel onPhaseChange does NOT mark task Generated on phase=complete", () => {
+  const src = fs.readFileSync(
+    path.join(ROOT, "src/sidepanel/sidepanel.js"),
+    "utf8",
+  );
+  // The onPhaseChange handler must not assign cur_mut.status = "generated"
+  // inside an `if (phase === "complete")` block.
+  const onPhaseMatch = src.match(/onPhaseChange:\s*\([\s\S]*?\}\s*,/);
+  assert(
+    onPhaseMatch !== null,
+    "could not locate onPhaseChange handler in sidepanel.js",
+  );
+  const body = onPhaseMatch[0];
+  assert(
+    !/if\s*\(\s*phase\s*===\s*["']complete["']\s*\)\s*\{[\s\S]{0,500}?cur_mut\.status\s*=\s*["']generated["']/.test(body),
+    "onPhaseChange must NOT mark task Generated when phase is 'complete' (legacy bug)",
+  );
+  // It MAY still mark Generated in applyDownloadStateChange on 'complete'
+  // — that's the canonical place. We assert it exists in that handler.
+  const applyMatch = src.match(/function applyDownloadStateChange\([\s\S]*?\n\s{2}\}/);
+  assert(
+    applyMatch !== null,
+    "could not locate applyDownloadStateChange in sidepanel.js",
+  );
+  assert(
+    /cur_mut\.status\s*=\s*["']generated["']/.test(applyMatch[0]),
+    "applyDownloadStateChange must mark task Generated only after SW reports complete",
+  );
+});
+
+// Test 9: download acquisition timeout produces a recoverable failure
+// (Part 3). We model the SW's silence as orchestrator.markDownloadFailed.
+test("Part3.1: no SW onChanged complete produces recoverable download failure", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.download = {
+    status: "waiting-browser-download",
+    downloadId: null,
+    ok: false,
+    filename: null,
+  };
+  const ok = orch.markDownloadFailed("browser-download-not-detected");
+  assertEqual(ok, true, "markDownloadFailed must transition from a non-terminal phase");
+  assertEqual(orch.state.phase, "error", "phase must transition to error after timeout");
+  assertEqual(
+    orch.state.download.status,
+    "error",
+    "download.status must be 'error' after timeout",
+  );
+  assertEqual(
+    orch.state.download.ok,
+    false,
+    "download.ok must be false after timeout",
+  );
+  assertEqual(
+    orch.state.download.error,
+    "browser-download-not-detected",
+    "download.error must be propagated",
+  );
+  // markTaskComplete must STILL refuse — phase is error, but more
+  // importantly the download invariants are not satisfied.
+  assertEqual(
+    orch.markTaskComplete(),
+    false,
+    "markTaskComplete must still refuse after a failed download",
+  );
+});
+
+// Test 10: sidepanel wires an 8 s download acquisition timeout.
+test("Part3.2: sidepanel arms an 8 s download acquisition timeout", () => {
+  const src = fs.readFileSync(
+    path.join(ROOT, "src/sidepanel/sidepanel.js"),
+    "utf8",
+  );
+  const match = src.match(
+    /async function triggerAutoDownloadViaOfficialControl\([\s\S]*?\n\s{2}\}\s*\n/,
+  );
+  assert(
+    match !== null,
+    "could not locate triggerAutoDownloadViaOfficialControl in sidepanel.js",
+  );
+  const body = match[0];
+  assert(
+    /DOWNLOAD_ACQUISITION_TIMEOUT_MS\s*=\s*8000/.test(body),
+    "triggerAutoDownloadViaOfficialControl must arm an 8s acquisition timeout",
+  );
+  assert(
+    /acquisition-timeout/.test(body),
+    "acquisition timeout must append a 'acquisition-timeout' download-trace step",
+  );
+  assert(
+    /markDownloadFailed/.test(body) || /browser-download-not-detected/.test(body),
+    "timeout must invoke orchestrator.markDownloadFailed or set browser-download-not-detected",
+  );
+});
+
+// Test 11: sidepanel wires Retry Download + Reset Preparation buttons.
+test("Part3.3: sidepanel exposes Retry Download and Reset Preparation buttons on failure", () => {
+  const html = fs.readFileSync(
+    path.join(ROOT, "src/sidepanel/sidepanel.html"),
+    "utf8",
+  );
+  assert(
+    /id=["']retry-download-btn["']/.test(html),
+    "sidepanel.html must contain #retry-download-btn",
+  );
+  assert(
+    /id=["']reset-prep-btn["']/.test(html),
+    "sidepanel.html must contain #reset-prep-btn",
+  );
+});
+
+// Helper: locate a function body in source text by name. Brace counting
+// must start AFTER the function signature's closing `)` so the
+// signature's `= {}` default parameter is not mis-counted as the body.
+function findFunctionBody(source, fnName) {
+  const sig = "function " + fnName + "(";
+  const sigStart = source.indexOf(sig);
+  if (sigStart < 0) return null;
+  // Find the function signature's closing `)`. Brace counting starts
+  // immediately after that `)`.
+  let parenDepth = 0;
+  let bodyStart = -1;
+  for (let i = sigStart + sig.length; i < source.length; i++) {
+    const c = source[i];
+    if (c === "(") parenDepth++;
+    else if (c === ")") {
+      if (parenDepth === 0) {
+        bodyStart = i + 1;
+        break;
+      }
+      parenDepth--;
+    }
+  }
+  if (bodyStart < 0) return null;
+  // Now scan from bodyStart, counting braces until depth returns to 0.
+  let depth = 0;
+  let bodyEnd = -1;
+  for (let i = bodyStart; i < source.length; i++) {
+    const c = source[i];
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        bodyEnd = i;
+        break;
+      }
+    }
+  }
+  if (bodyEnd < 0) return null;
+  return source.slice(sigStart, bodyEnd + 1);
+}
+
+// Test 12: correlation is execution-scoped — claims map by executionId.
+test("Part4.1: SW expectedDownloadClaims is keyed by executionId, not a global first-active fallback", () => {
+  const sw = fs.readFileSync(
+    path.join(ROOT, "src/background/service-worker.js"),
+    "utf8",
+  );
+  // The map must be keyed by executionId.
+  assert(
+    /expectedDownloadClaims\s*=\s*new\s+Map\(\)/.test(sw),
+    "SW must maintain expectedDownloadClaims Map keyed by executionId",
+  );
+  const body = findFunctionBody(sw, "findActiveClaimForDownload");
+  assert(
+    body !== null,
+    "could not locate findActiveClaimForDownload in service-worker.js",
+  );
+  // Three passes must be in order. We look for the FIRST occurrences
+  // of each pass marker within the function body.
+  const execIdx = body.indexOf("claim.downloadId === download.id");
+  const filenameIdx = body.indexOf("endsWith");
+  const firstActiveIdx = body.indexOf("// Third pass");
+  assert(execIdx > -1, "first pass (executionId pre-bind check) must exist");
+  assert(filenameIdx > -1, "second pass (filename match) must exist");
+  assert(firstActiveIdx > -1, "third pass (first-active fallback) must exist");
+  assert(
+    execIdx < filenameIdx,
+    "executionId match must come before filename match",
+  );
+  assert(
+    filenameIdx < firstActiveIdx,
+    "filename match must come before first-active fallback",
+  );
+});
+
+// Test 13: onChanged complete transitions to task-complete only if all
+// invariants hold.
+test("Part5.1: orchestrator advances to task-complete when applyDownloadStateChange provides all invariants", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.download = {
+    status: "waiting-browser-download",
+    downloadId: null,
+    ok: false,
+    filename: null,
+    __acquisitionTimer: null,
+  };
+  // Simulate applyDownloadStateChange('complete', downloadId=99, filename='x.png').
+  orch.state.download = {
+    ...orch.state.download,
+    status: "complete",
+    ok: true,
+    completedAt: Date.now(),
+    finalFilename: "scene-001.png",
+    filename: "scene-001.png",
+    downloadId: 99,
+    error: null,
+  };
+  const accepted = orch.markTaskComplete();
+  assertEqual(accepted, true, "markTaskComplete must accept when SW provides all three invariants");
+  assertEqual(orch.state.phase, "task-complete", "phase must be task-complete");
+  assertEqual(orch.state.download.status, "complete", "status must be complete");
+  assertEqual(orch.state.download.ok, true, "ok must be true");
+  assertEqual(orch.state.download.downloadId, 99, "downloadId must be 99");
+});
+
+// Test 14: onChanged interrupted produces a recoverable failure, NOT
+// task-complete.
+test("Part5.2: interrupted state never advances to task-complete", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  // Simulate applyDownloadStateChange('interrupted').
+  orch.state.download = {
+    status: "error",
+    ok: false,
+    downloadId: 99,
+    completedAt: Date.now(),
+    error: "download-interrupted",
+  };
+  const accepted = orch.markTaskComplete();
+  assertEqual(
+    accepted,
+    false,
+    "markTaskComplete must refuse on interrupted (ok !== true)",
+  );
+  assertEqual(
+    orch.state.phase,
+    "downloading",
+    "phase must not advance to task-complete on interrupted",
+  );
+  assertEqual(
+    orch.state.download.ok,
+    false,
+    "download.ok must be false after interrupted",
+  );
+});
+
+// Test 15: stale prior claim cannot capture the next task's download
+// because the SW archives the claim and removes it from the active map.
+test("Part4.2: completed claim is archived and removed from active expectedDownloadClaims", () => {
+  const sw = fs.readFileSync(
+    path.join(ROOT, "src/background/service-worker.js"),
+    "utf8",
+  );
+  // On complete/interrupted, the SW must delete the claim from
+  // expectedDownloadClaims AND push to downloadHistory.
+  assert(
+    /expectedDownloadClaims\.delete\(/.test(sw),
+    "SW must delete the active claim on complete/interrupted",
+  );
+  assert(
+    /downloadHistory\.push\(/.test(sw),
+    "SW must archive the claim into downloadHistory on complete/interrupted",
+  );
+});
+
+// Test 16: sequential scenes must not capture each other's downloadId.
+// We model this by checking that the SW only auto-binds a download to a
+// claim when there is an active claim for the matching executionId.
+// The third-pass "first active claim" fallback is allowed but only as
+// a last resort after the per-executionId check has been attempted.
+test("Part4.3: SW claim matching is per-executionId; historical claims cannot capture new downloads", () => {
+  const sw = fs.readFileSync(
+    path.join(ROOT, "src/background/service-worker.js"),
+    "utf8",
+  );
+  // The SW onChanged listener archives into downloadHistory BEFORE
+  // clearing expectedDownloadClaims, so the next scene's onCreated
+  // cannot accidentally bind to a stale scene-001 claim.
+  assert(
+    /downloadHistory\.push/.test(sw),
+    "SW must archive claim into downloadHistory (history survives)",
+  );
+  // The SW pruneExpiredClaims function exists and uses nowMs-based
+  // expiry so claims do not accumulate forever.
+  assert(
+    /function pruneExpiredClaims\s*\(/.test(sw),
+    "SW must implement pruneExpiredClaims for active-claim hygiene",
+  );
+});
+
+// Test 17: button handler registration counts.
+test("Part6.1: prepareTaskBtn registered exactly once; retryGenerateBtn and generateTaskBtn exactly once", () => {
+  const src = fs.readFileSync(
+    path.join(ROOT, "src/sidepanel/sidepanel.js"),
+    "utf8",
+  );
+  // prepareTaskBtn must increment prepareHandlerRegistrationCount
+  // exactly once.
+  const prepareIncrement = (
+    src.match(/prepareHandlerRegistrationCount\+\+/g) || []
+  ).length;
+  assertEqual(
+    prepareIncrement,
+    1,
+    `prepareHandlerRegistrationCount must be incremented exactly once (found ${prepareIncrement})`,
+  );
+  // generateTaskBtn and retryGenerateBtn each have their own counters.
+  const generateIncrement = (
+    src.match(/generateHandlerRegistrationCount\+\+/g) || []
+  ).length;
+  const retryGenerateIncrement = (
+    src.match(/retryGenerateHandlerRegistrationCount\+\+/g) || []
+  ).length;
+  assertEqual(
+    generateIncrement,
+    1,
+    `generateHandlerRegistrationCount must be incremented exactly once (found ${generateIncrement})`,
+  );
+  assertEqual(
+    retryGenerateIncrement,
+    1,
+    `retryGenerateHandlerRegistrationCount must be incremented exactly once (found ${retryGenerateIncrement})`,
+  );
+});
+
+// Test 18: SW exposes registration counts + trace probe.
+test("Part1.5.1: SW exposes download trace and registration-count probe to side panel", () => {
+  const sw = fs.readFileSync(
+    path.join(ROOT, "src/background/service-worker.js"),
+    "utf8",
+  );
+  assert(
+    /GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE/.test(sw),
+    "SW must register GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE",
+  );
+  assert(
+    /GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE/.test(sw),
+    "SW must push GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE to the side panel",
+  );
+  assert(
+    /GEMINI_ASSISTANT_DOWNLOAD_PROBE/.test(sw),
+    "SW must register GEMINI_ASSISTANT_DOWNLOAD_PROBE",
+  );
+  // The three registration counters must be tracked and exposed.
+  assert(
+    /downloadsOnCreatedRegistrationCount/.test(sw),
+    "SW must track downloadsOnCreatedRegistrationCount",
+  );
+  assert(
+    /downloadsOnChangedRegistrationCount/.test(sw),
+    "SW must track downloadsOnChangedRegistrationCount",
+  );
+  assert(
+    /downloadsOnDeterminingFilenameRegistrationCount/.test(sw),
+    "SW must track downloadsOnDeterminingFilenameRegistrationCount",
+  );
+  // serviceWorkerRuntimeId must exist.
+  assert(
+    /serviceWorkerRuntimeId/.test(sw),
+    "SW must generate a serviceWorkerRuntimeId for diagnostic correlation",
+  );
+});
+
+// Test 19: sidepanel wires the Run Download Event Probe button.
+test("Part1.5.2: sidepanel wires Run Download Event Probe button to SW probe", () => {
+  const html = fs.readFileSync(
+    path.join(ROOT, "src/sidepanel/sidepanel.html"),
+    "utf8",
+  );
+  assert(
+    /id=["']run-download-probe-btn["']/.test(html),
+    "sidepanel.html must contain #run-download-probe-btn",
+  );
+  const src = fs.readFileSync(
+    path.join(ROOT, "src/sidepanel/sidepanel.js"),
+    "utf8",
+  );
+  assert(
+    /run-download-probe-btn/i.test(src) ||
+      /runDownloadProbeBtn/.test(src),
+    "sidepanel.js must reference #run-download-probe-btn",
+  );
+  assert(
+    /GEMINI_ASSISTANT_DOWNLOAD_PROBE/.test(src),
+    "sidepanel.js must send GEMINI_ASSISTANT_DOWNLOAD_PROBE",
+  );
+  assert(
+    /GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE/.test(src),
+    "sidepanel.js must send GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE",
+  );
+});
+
+// Test 20: SW download trace append includes required context fields
+// in the entries it pushes. The SW records executionId + taskId (the
+// fields it has direct knowledge of via the arm-download message and
+// the matched claim). preparationSessionId is side-panel state and is
+// correlated by the side-panel trace, not the SW.
+test("Part1.1: appendDownloadTrace entries carry executionId + taskId; spread preserves caller fields", () => {
+  const sw = fs.readFileSync(
+    path.join(ROOT, "src/background/service-worker.js"),
+    "utf8",
+  );
+  const body = findFunctionBody(sw, "appendDownloadTrace");
+  assert(body !== null, "could not locate appendDownloadTrace in service-worker.js");
+  assert(/timestamp/.test(body), "appendDownloadTrace must record timestamp");
+  assert(
+    /\.\.\.data/.test(body),
+    "appendDownloadTrace must spread `data` so callers' fields (taskId, executionId, etc.) are preserved",
+  );
+  // The SW callers must include executionId and taskId. (preparationSessionId
+  // is a side-panel concept; the SW never sees it.)
+  const swWindow = sw.slice(0, sw.length);
+  assert(/taskId/.test(swWindow), "SW trace callers must include taskId");
+  assert(/executionId/.test(swWindow), "SW trace callers must include executionId");
+});
+
+// Test 21: zombie-coroutine guard transitions to 'downloading' (NOT
+// 'complete' / 'task-complete') so the UI does not falsely claim
+// completion while the live session owns the download.
+test("Part2.9: zombie-coroutine guard transitions to 'downloading', never 'task-complete'", async () => {
+  const src = fs.readFileSync(
+    path.join(ROOT, "src/workflow/orchestrator.js"),
+    "utf8",
+  );
+  // Find the zombie branch and assert it transitions to 'downloading'.
+  const zombieMatch = src.match(
+    /session changed during WAIT_FOR_GENERATED_IMAGE[\s\S]{0,2000}?transition\([^,]+,\s*\{[\s\S]{0,500}?\}\s*\)\s*;\s*\n\s*return\s*\{\s*ok:\s*false,\s*reason:\s*["']zombie-bail["']/,
+  );
+  assert(
+    zombieMatch !== null,
+    "could not locate zombie-coroutine guard in orchestrator.js",
+  );
+  assert(
+    /transition\(\s*["']downloading["']\s*,/.test(zombieMatch[0]),
+    "zombie guard must transition to 'downloading' (not 'complete')",
+  );
+  assert(
+    !/transition\(\s*["']task-complete["']\s*,/.test(zombieMatch[0]),
+    "zombie guard must NOT transition to 'task-complete' (Part 2 invariant)",
+  );
+});
+
+// Test 22: end-to-end flow invariant. We prove the full sequence:
+// generating -> downloading -> task-complete is reachable only by
+// (a) transition to downloading on generation completion (Part 2)
+// (b) markTaskComplete only accepts on complete invariants
+test("Part2.10: full state machine sequence is generating -> downloading -> task-complete (never skipping)", () => {
+  // Simulate the full happy path.
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true, downloadId: 7, finalFilename: "scene-001.png" }),
+  });
+  // Start from a known phase.
+  orch._transition("generating");
+  assertEqual(orch.state.phase, "generating", "phase is generating");
+  // Phase transitions to 'downloading' on generation completion.
+  orch._transition("downloading");
+  assertEqual(orch.state.phase, "downloading", "phase advances to downloading");
+  // Without download confirmation, markTaskComplete refuses.
+  assertEqual(orch.markTaskComplete(), false, "markTaskComplete refuses pre-download");
+  assertEqual(
+    orch.state.phase,
+    "downloading",
+    "phase must stay 'downloading' until authoritative download",
+  );
+  // Provide the three invariants.
+  orch.state.download = {
+    status: "complete",
+    ok: true,
+    downloadId: 7,
+    filename: "scene-001.png",
+    finalFilename: "scene-001.png",
+  };
+  assertEqual(orch.markTaskComplete(), true, "markTaskComplete accepts when invariants hold");
+  assertEqual(
+    orch.state.phase,
+    "task-complete",
+    "phase advances to task-complete ONLY after authoritative download",
+  );
+  // isActive() now false → buttons unlock.
+  assertEqual(orch.isActive(), false, "isActive must return false at task-complete");
+});
+
+// ----- Regression Suite: Download Lifecycle & Watchdog Audit --------------
+
+test("D0-D15: Service worker source declares all variables at top before listeners (TDZ protection)", () => {
+  const sw = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  const onCreatedIdx = sw.indexOf("chrome.downloads.onCreated.addListener");
+  const onChangedIdx = sw.indexOf("chrome.downloads.onChanged.addListener");
+  const onDeterminingIdx = sw.indexOf("chrome.downloads.onDeterminingFilename.addListener");
+
+  const declCreated = sw.indexOf("downloadsOnCreatedRegistrationCount = 0");
+  const declChanged = sw.indexOf("downloadsOnChangedRegistrationCount = 0");
+  const declDetermining = sw.indexOf("downloadsOnDeterminingFilenameRegistrationCount = 0");
+
+  assert(declCreated > -1 && declCreated < onCreatedIdx, "downloadsOnCreatedRegistrationCount must be declared before onCreated listener");
+  assert(declChanged > -1 && declChanged < onChangedIdx, "downloadsOnChangedRegistrationCount must be declared before onChanged listener");
+  assert(declDetermining > -1 && declDetermining < onDeterminingIdx, "downloadsOnDeterminingFilenameRegistrationCount must be declared before onDeterminingFilename listener");
+});
+
+test("D0-D15: Service worker emits D7, D8, D9, D10, D11, D12 download trace steps", () => {
+  const sw = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  assert(/service-worker-download-claim-received/.test(sw), "SW must record service-worker-download-claim-received (D7)");
+  assert(/chrome\.downloads\.onCreated-fired/.test(sw), "SW must record chrome.downloads.onCreated-fired (D8)");
+  assert(/chrome-download-matched-to-claim/.test(sw), "SW must record chrome-download-matched-to-claim (D9)");
+  assert(/chrome\.downloads\.onDeterminingFilename-fired/.test(sw), "SW must record chrome.downloads.onDeterminingFilename-fired (D10)");
+  assert(/chrome\.downloads\.onChanged-fired/.test(sw), "SW must record chrome.downloads.onChanged-fired (D11)");
+  assert(/chrome-download-complete/.test(sw), "SW must record chrome-download-complete (D12)");
+});
+
+test("D0-D15: Sidepanel emits D0, D1, D2, D3, D4, D5, D6, D13, D14, D15 download trace steps", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(/generation-completed-handler-entered/.test(sp), "Sidepanel must record generation-completed-handler-entered (D0)");
+  assert(/auto-download-function-entered/.test(sp), "Sidepanel must record auto-download-function-entered (D1)");
+  assert(/download-claim-created/.test(sp), "Sidepanel must record download-claim-created (D2)");
+  assert(/official-download-control-search-started/.test(sp), "Sidepanel must record official-download-control-search-started (D3)");
+  assert(/official-download-control-found/.test(sp), "Sidepanel must record official-download-control-found (D4)");
+  assert(/official-download-control-click-attempt/.test(sp), "Sidepanel must record official-download-control-click-attempt (D5)");
+  assert(/official-download-control-click-returned/.test(sp), "Sidepanel must record official-download-control-click-returned (D6)");
+  assert(/side-panel-download-complete-received/.test(sp), "Sidepanel must record side-panel-download-complete-received (D13)");
+  assert(/workflow-download-state-reconciled/.test(sp), "Sidepanel must record workflow-download-state-reconciled (D14)");
+  assert(/task-complete/.test(sp), "Sidepanel must record task-complete (D15)");
+});
+
+test("Section 2: clickCurrentGenerationDownloadButton records preClick attributes and postClick timing", () => {
+  const dom = fs.readFileSync(path.join(ROOT, "src/dom/geminiDomAdapter.js"), "utf8");
+  const body = findFunctionBody(dom, "clickCurrentGenerationDownloadButton");
+  assert(body !== null, "clickCurrentGenerationDownloadButton must exist");
+  assert(/preClick\s*=/.test(body), "must construct preClick inspection record");
+  assert(/isConnected/.test(body), "must record isConnected");
+  assert(/disabled/.test(body), "must record disabled");
+  assert(/ariaLabel/.test(body), "must record ariaLabel");
+  assert(/outerHTML/.test(body), "must record outerHTML");
+  assert(/candidateCount/.test(body), "must record candidateCount");
+  assert(
+    /clickReturned\s*=\s*true/.test(body),
+    "must record clickReturned = true (assignment after .click())",
+  );
+  assert(/elapsedMs/.test(body), "must record elapsedMs");
+  assert(
+    /clickStrategyUsed/.test(body),
+    "must record clickStrategyUsed (native | synthetic-host)",
+  );
+  assert(
+    /dispatchSyntheticClick|dispatchEvent\(new MouseEvent/.test(body),
+    "must dispatch synthetic pointer/click events as a fallback strategy",
+  );
+});
+
+test("Section 3 & 4: Sidepanel implements 8s acquisition watchdog and 30s completion watchdog", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(/DOWNLOAD_ACQUISITION_TIMEOUT_MS\s*=\s*8000/.test(sp), "must define 8-second acquisition timeout");
+  assert(/DOWNLOAD_COMPLETION_TIMEOUT_MS\s*=\s*30000/.test(sp), "must define 30-second completion timeout");
+  assert(/browser-download-not-detected/.test(sp), "acquisition timeout must report browser-download-not-detected");
+  assert(/browser-download-completion-timeout/.test(sp), "completion timeout must report browser-download-completion-timeout");
+  assert(/Download was not detected by Chrome/.test(sp), "acquisition timeout must set user-facing error message");
+});
+
+test("Section 6: refreshSelfTest exposes separated traces and workflow generation diagnostics", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(/--- SIDE PANEL DOWNLOAD TRACE ---/.test(sp), "must output --- SIDE PANEL DOWNLOAD TRACE ---");
+  assert(/--- SERVICE WORKER DOWNLOAD TRACE ---/.test(sp), "must output --- SERVICE WORKER DOWNLOAD TRACE ---");
+  assert(/lastSidePanelDownloadTraceStep/.test(sp), "must output lastSidePanelDownloadTraceStep");
+  assert(/lastServiceWorkerDownloadTraceStep/.test(sp), "must output lastServiceWorkerDownloadTraceStep");
+  assert(/serviceWorkerRuntimeId/.test(sp), "must output serviceWorkerRuntimeId");
+});
+
+// ----- Suite: Late Success Reconciliation & Next Task Race Tests (A-G) ---
+
+test("Race A: Download detection arrives normally before watchdog -> task-complete", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.executionId = "exec-001";
+  orch.state.taskId = "scene-001";
+  orch.state.download = {
+    status: "complete",
+    ok: true,
+    downloadId: 101,
+    filename: "scene-001.png",
+  };
+  const ok = orch.markTaskComplete();
+  assertEqual(ok, true, "markTaskComplete must succeed normally");
+  assertEqual(orch.state.phase, "task-complete", "phase must be task-complete");
+  assertEqual(orch.state.error, null, "error must be null");
+  assertEqual(orch.isActive(), false, "isActive must return false");
+});
+
+test("Race B: Watchdog fires first (error) -> late completion for SAME execution reconciles to task-complete", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.executionId = "exec-001";
+  orch.state.taskId = "scene-001";
+
+  // Watchdog fires
+  orch.markDownloadFailed("browser-download-not-detected");
+  assertEqual(orch.state.phase, "error", "phase transitions to error on watchdog timeout");
+  assertEqual(orch.state.error.error, "browser-download-not-detected", "error recorded");
+
+  // Late Chrome completion arrives for SAME execution
+  orch.state.download = {
+    status: "complete",
+    ok: true,
+    downloadId: 102,
+    filename: "scene-001.png",
+    finalFilename: "scene-001.png",
+  };
+
+  const reconciled = orch.markTaskComplete();
+  assertEqual(reconciled, true, "markTaskComplete must accept reconciliation from error");
+  assertEqual(orch.state.phase, "task-complete", "phase must reconcile to task-complete");
+  assertEqual(orch.state.error, null, "error must be cleared upon reconciliation");
+  assertEqual(orch.isActive(), false, "isActive must be false (UI unlocked)");
+});
+
+test("Race C: Watchdog fires -> late completion arrives from DIFFERENT execution -> must NOT reconcile", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.executionId = "exec-002";
+  orch.state.taskId = "scene-002";
+
+  // Watchdog fires
+  orch.markDownloadFailed("browser-download-not-detected");
+  assertEqual(orch.state.phase, "error", "phase is error");
+
+  // Download state with no integer downloadId or mismatched ok=false
+  orch.state.download = {
+    status: "waiting-browser-download",
+    ok: false,
+    downloadId: null,
+    filename: null,
+  };
+
+  const reconciled = orch.markTaskComplete();
+  assertEqual(reconciled, false, "markTaskComplete must refuse unconfirmed download");
+  assertEqual(orch.state.phase, "error", "phase must remain error");
+});
+
+test("Race D: Real interrupted download remains failed", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.executionId = "exec-001";
+  orch.state.taskId = "scene-001";
+
+  orch.state.download = {
+    status: "error",
+    ok: false,
+    downloadId: 103,
+    error: "NETWORK_FAILED",
+  };
+  orch.markDownloadFailed("NETWORK_FAILED");
+
+  const accepted = orch.markTaskComplete();
+  assertEqual(accepted, false, "markTaskComplete must refuse interrupted download");
+  assertEqual(orch.state.phase, "error", "phase must remain error");
+});
+
+test("Race E: Late complete after Retry Download is idempotent with exactly one completion", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "downloading";
+  orch.state.executionId = "exec-001";
+  orch.state.taskId = "scene-001";
+  orch.state.download = {
+    status: "complete",
+    ok: true,
+    downloadId: 104,
+    filename: "scene-001.png",
+  };
+
+  assertEqual(orch.markTaskComplete(), true, "first markTaskComplete accepts");
+  assertEqual(orch.state.phase, "task-complete", "phase is task-complete");
+  // Second invocation
+  assertEqual(orch.markTaskComplete(), true, "second markTaskComplete is idempotent");
+  assertEqual(orch.state.phase, "task-complete", "phase remains task-complete");
+});
+
+test("Race F: Successful late reconciliation allows beginConversationReset to proceed", () => {
+  const orch = orchestratorLib.createOrchestrator({
+    sendToTab: async () => ({ ok: true }),
+    downloadImage: async () => ({ ok: true }),
+  });
+  orch.state.phase = "error";
+  orch.state.executionId = "exec-001";
+  orch.state.taskId = "scene-001";
+  orch.state.download = {
+    status: "complete",
+    ok: true,
+    downloadId: 105,
+    filename: "scene-001.png",
+  };
+
+  const resetStarted = orch.beginConversationReset();
+  assertEqual(resetStarted, true, "beginConversationReset must succeed on confirmed download");
+  assertEqual(orch.state.phase, "resetting-conversation", "phase transitions to resetting-conversation");
+  assertEqual(orch.state.error, null, "error cleared");
+
+  const resetEnded = orch.endConversationReset();
+  assertEqual(resetEnded, true, "endConversationReset succeeds");
+  assertEqual(orch.state.phase, "idle", "phase transitions to idle");
+});
+
+test("Race G: goNext and resetConversationAndAdvance emit forensic trace steps", () => {
+  const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(/next-button-clicked/.test(sp), "must record next-button-clicked");
+  assert(/next-handler-entered/.test(sp), "must record next-handler-entered");
+  assert(/next-current-task/.test(sp), "must record next-current-task");
+  assert(/next-current-phase/.test(sp), "must record next-current-phase");
+  assert(/next-download-state/.test(sp), "must record next-download-state");
+  assert(/next-task-status/.test(sp), "must record next-task-status");
+  assert(/next-reset-eligibility/.test(sp), "must record next-reset-eligibility");
+  assert(/next-blocked/.test(sp), "must record next-blocked with reason");
+  assert(/--- NEXT TASK FORENSIC TRACE ---/.test(sp), "refreshSelfTest must expose NEXT TASK FORENSIC TRACE");
 });
 
 // ----- end ----------------------------------------------------------------

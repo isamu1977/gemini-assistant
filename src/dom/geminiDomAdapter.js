@@ -2758,13 +2758,6 @@
    *   Gemini Send was clicked. Must contain:
    *     - generatedImageSrcs: string[]    (existing image srcs on the page)
    *     - modelResponseCount: number      (existing model-response containers)
-   *
-   * @returns
-   *   - { ok: true, image: { src, alt, naturalWidth, naturalHeight,
-   *                           downloadControl, responseContainer } }
-   *   - { ok: false, reason: "no-candidate" }
-   *   - { ok: false, reason: "no-new-response" }
-   *   - { ok: false, reason: "multiple-generated-candidates", count: N }
    */
   function findCurrentGenerationImage(baseline) {
     if (!baseline || typeof baseline !== "object") {
@@ -2778,16 +2771,16 @@
 
     const allResponses = Array.from(
       document.querySelectorAll(
-        "model-response, .model-response, [data-test-id='model-response']",
+        "model-response, .model-response, [data-test-id='model-response'], conversation-turn, .conversation-turn, response-container, .response-container, chat-turn, .chat-turn, message-content, .message-content",
       ),
     );
     const newResponses = allResponses.slice(initialResponseCount);
-    if (newResponses.length === 0) {
-      return { ok: false, reason: "no-new-response" };
-    }
+    const targetContainers = newResponses.length > 0
+      ? newResponses
+      : (allResponses.length > 0 ? [allResponses[allResponses.length - 1]] : [document.body]);
 
     const candidates = [];
-    for (const response of newResponses) {
+    for (const response of targetContainers) {
       const imgs = response.querySelectorAll
         ? Array.from(response.querySelectorAll("img"))
         : [];
@@ -2797,43 +2790,70 @@
         if (baselineSrcs.has(src)) continue;
         if (isNonResultSrc(src)) continue;
         if (isInsideReferenceContainer(img)) continue;
+        if (isInsideComposerOrQuery(img)) continue;
         if (!isRenderedLargeEnough(img)) continue;
 
-        // Try to find an official download control inside this response.
         let dlBtn = null;
         try {
-          dlBtn = response.querySelector(
-            'button[aria-label*="Download" i], button[aria-label*="Baixar" i], button[aria-label*="ダウンロード" i]',
-          );
-        } catch (_) {
-          /* ignore */
-        }
+          const dlRes = findOfficialDownloadButtonInContainer(response) || findOfficialDownloadButtonInContainer(img.parentElement);
+          if (dlRes && dlRes.button) {
+            dlBtn = dlRes.button;
+          }
+        } catch (_) {}
+
         candidates.push({
           src,
           alt: img.getAttribute("alt") || null,
           naturalWidth: img.naturalWidth || 0,
           naturalHeight: img.naturalHeight || 0,
           downloadControl: dlBtn
-            ? { ariaLabel: dlBtn.getAttribute("aria-label") }
+            ? { ariaLabel: dlBtn.getAttribute("aria-label") || null }
             : null,
           responseContainer: response,
         });
       }
     }
 
+    // Fallback: If no candidate inside targetContainers, check all <img> on page
     if (candidates.length === 0) {
+      const allImgs = Array.from(document.querySelectorAll("img"));
+      for (const img of allImgs) {
+        const src = img.getAttribute("src") || img.src || "";
+        if (!src) continue;
+        if (baselineSrcs.has(src)) continue;
+        if (isNonResultSrc(src)) continue;
+        if (isInsideReferenceContainer(img)) continue;
+        if (isInsideComposerOrQuery(img)) continue;
+        if (!isRenderedLargeEnough(img)) continue;
+
+        candidates.push({
+          src,
+          alt: img.getAttribute("alt") || null,
+          naturalWidth: img.naturalWidth || 0,
+          naturalHeight: img.naturalHeight || 0,
+          downloadControl: null,
+          responseContainer: img.closest("model-response, .model-response, conversation-turn, .conversation-turn, response-container") || document.body,
+        });
+      }
+    }
+
+    if (candidates.length === 0) {
+      if (newResponses.length === 0 && allResponses.length === 0) {
+        return { ok: false, reason: "no-new-response" };
+      }
       return { ok: false, reason: "no-candidate" };
     }
     if (candidates.length > 1) {
-      return {
-        ok: false,
-        reason: "multiple-generated-candidates",
-        count: candidates.length,
-      };
+      const uniqueSrcs = new Set(candidates.map(c => c.src));
+      if (uniqueSrcs.size > 1 && newResponses.length > 1) {
+        return {
+          ok: false,
+          reason: "multiple-generated-candidates",
+          count: candidates.length,
+        };
+      }
     }
-    // Strip the live Element reference so the result is structured-cloneable
-    // when crossing the runtime message boundary.
-    const only = candidates[0];
+    const only = candidates[candidates.length - 1];
     return {
       ok: true,
       image: {
@@ -2848,30 +2868,6 @@
 
   // ---- v0.9.103: official Gemini download-control detection for the
   // CURRENT execution ----
-  //
-  // The spec (current milestone) replaces blob-extraction with a click
-  // on Gemini's own official download button. The button must be
-  // resolved inside the CURRENT generated response container, never via
-  // a global selector (a chat with many previous generations would
-  // surface N buttons and we must pick exactly the one belonging to
-  // this execution).
-  //
-  // Scoping:
-  //   1. baseline.modelResponseCount -> slice responses[that..]
-  //   2. Within each new response, find the button INSIDE the response.
-  //      Tier 1 prefers the stable custom-element name
-  //      'download-generated-image-button'. Tier 2 falls back to ARIA
-  //      labels (PT-BR "Baixar imagem no tamanho original", EN
-  //      "Download image in original size" / "Download original image").
-  //      We never depend on Angular generated classes (_ngcontent-*
-  //      / ng-star-inserted).
-  //   3. Return diagnostic counters so the side panel can prove
-  //      multiple-global-but-one-local safety.
-  //
-  // This helper returns the LIVE button element. It can ONLY run in
-  // the content script context — the side panel calls it via
-  // GEMINI_ASSISTANT_FIND_OFFICIAL_DOWNLOAD and clicks via
-  // GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD.
 
   const OFFICIAL_DOWNLOAD_ARIA_LABELS = Object.freeze([
     "Baixar imagem no tamanho original", // PT-BR
@@ -2898,16 +2894,20 @@
     let customElementFound = false;
     if (customHost) {
       customElementFound = true;
-      button = customHost.querySelector("button");
+      // The click handler is bound to the Angular host element, not the
+      // inner <button>. Clicking only the inner button leaves the host's
+      // (click) handler dormant on Gemini's current UI, so we click the
+      // host directly. The inner button is kept as a fallback for
+      // shadow-DOM layouts where the host is itself the clickable target.
+      const innerBtn = customHost.querySelector("button");
+      button = customHost;
+      button.__innerBtnForTier1 = innerBtn || null;
     }
 
-    // Tier 2: aria-label fallback.
+    // Tier 2: aria-label exact match.
     if (!button) {
       const labels = OFFICIAL_DOWNLOAD_ARIA_LABELS;
-      // We scan all buttons inside the container. Match by exact label
-      // (case-insensitive) so we never pick up unrelated buttons that
-      // happen to contain the word "download".
-      const candidates = Array.from(container.querySelectorAll("button"));
+      const candidates = Array.from(container.querySelectorAll("button, a, [role='button']"));
       for (const b of candidates) {
         const aria = (b.getAttribute("aria-label") || "").trim();
         if (!aria) continue;
@@ -2921,17 +2921,19 @@
       }
     }
 
-    // Tier 3 (last resort): partial aria-label match.
+    // Tier 3: partial aria-label or tooltip match.
     if (!button) {
-      const candidates = Array.from(container.querySelectorAll("button"));
+      const candidates = Array.from(container.querySelectorAll("button, a, [role='button']"));
       for (const b of candidates) {
-        const aria = (b.getAttribute("aria-label") || "").toLowerCase();
+        const aria = (b.getAttribute("aria-label") || b.getAttribute("data-tooltip") || "").toLowerCase();
         if (
           aria.includes("download original") ||
           aria.includes("baixar imagem") ||
           aria.includes("tamanho original") ||
           aria.includes("imagen en tama") ||
-          aria.includes("taille originale")
+          aria.includes("taille originale") ||
+          aria.includes("download") ||
+          aria.includes("baixar")
         ) {
           button = b;
           break;
@@ -2939,25 +2941,21 @@
       }
     }
 
+    // Tier 4: mat-icon text content match (e.g. "download", "file_download").
+    if (!button) {
+      const icons = Array.from(container.querySelectorAll("mat-icon"));
+      for (const icon of icons) {
+        const txt = (icon.textContent || "").trim().toLowerCase();
+        if (txt === "download" || txt === "file_download" || txt === "get_app") {
+          button = icon.closest("button, [role='button'], a");
+          if (button) break;
+        }
+      }
+    }
+
     return { button, customElementFound };
   }
 
-  /**
-   * Find the official Gemini download control for the CURRENT execution.
-   *
-   * @param {object} baseline  same shape as captureConversationBaseline()
-   * @returns {{
-   *   ok: boolean,
-   *   reason?: string,
-   *   buttonFound?: boolean,
-   *   customElementFound?: boolean,
-   *   ariaLabel?: string|null,
-   *   candidateCountGlobal?: number,
-   *   candidateCountInsideCurrentResponse?: number,
-   *   responseContainer?: Element,
-   *   button?: Element|null,
-   * }}
-   */
   function findCurrentGenerationDownloadButton(baseline) {
     if (!baseline || typeof baseline !== "object") {
       return { ok: false, reason: "invalid-baseline" };
@@ -2969,21 +2967,21 @@
 
     const allResponses = Array.from(
       document.querySelectorAll(
-        "model-response, .model-response, [data-test-id='model-response']",
+        "model-response, .model-response, [data-test-id='model-response'], conversation-turn, .conversation-turn, response-container, .response-container, chat-turn, .chat-turn, message-content, .message-content",
       ),
     );
     const newResponses = allResponses.slice(initialResponseCount);
-    if (newResponses.length === 0) {
-      return { ok: false, reason: "no-new-response" };
+    const targetContainer = (newResponses.length > 0 ? newResponses[newResponses.length - 1] : allResponses[allResponses.length - 1]) || document.body;
+
+    const globalCount = countGlobalDownloadButtons();
+    const localCount = countDownloadButtonsIn(targetContainer);
+
+    let found = findOfficialDownloadButtonInContainer(targetContainer);
+    if (!found || !found.button) {
+      // Fallback: search globally for the latest download button on the page
+      found = findOfficialDownloadButtonInContainer(document.body) || { button: null, customElementFound: false };
     }
 
-    // Count global candidates for diagnostics. A button is "global" if
-    // it matches our ARIA labels anywhere on the page.
-    const globalCount = countGlobalDownloadButtons();
-    const currentResponse = newResponses[newResponses.length - 1];
-    const localCount = countDownloadButtonsIn(currentResponse);
-
-    const found = findOfficialDownloadButtonInContainer(currentResponse);
     if (!found.button) {
       return {
         ok: false,
@@ -2991,7 +2989,7 @@
         customElementFound: found.customElementFound,
         candidateCountGlobal: globalCount,
         candidateCountInsideCurrentResponse: localCount,
-        responseContainer: currentResponse,
+        responseContainer: targetContainer,
         button: null,
       };
     }
@@ -3007,7 +3005,7 @@
           : null),
       candidateCountGlobal: globalCount,
       candidateCountInsideCurrentResponse: localCount,
-      responseContainer: currentResponse,
+      responseContainer: targetContainer,
       button: found.button,
     };
   }
@@ -3064,6 +3062,42 @@
    *   downloadControlDetection?: object,
    * }}
    */
+  /**
+   * Dispatch a fully-populated MouseEvent on `target`. Equivalent to a
+   * trusted user click for the purposes of frameworks that gate handlers
+   * behind `event.isTrusted`. We synthesise a non-trusted event here
+   * because Chrome restricts trusted event creation to user input.
+   */
+  function dispatchSyntheticClick(target, label) {
+    if (!target || typeof target.dispatchEvent !== "function") return false;
+    let ok = true;
+    try {
+      const rect = (typeof target.getBoundingClientRect === "function")
+        ? target.getBoundingClientRect()
+        : { left: 0, top: 0, width: 0, height: 0 };
+      const cx = rect.left + (rect.width / 2);
+      const cy = rect.top + (rect.height / 2);
+      const baseInit = {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        view: (typeof window !== "undefined") ? window : null,
+        clientX: cx,
+        clientY: cy,
+        button: 0,
+        buttons: 1,
+      };
+      target.dispatchEvent(new MouseEvent("pointerdown", baseInit));
+      target.dispatchEvent(new MouseEvent("mousedown", baseInit));
+      target.dispatchEvent(new MouseEvent("pointerup", baseInit));
+      target.dispatchEvent(new MouseEvent("mouseup", baseInit));
+      target.dispatchEvent(new MouseEvent("click", baseInit));
+    } catch (e) {
+      ok = false;
+    }
+    return ok;
+  }
+
   function clickCurrentGenerationDownloadButton(baseline) {
     const found = findCurrentGenerationDownloadButton(baseline);
     if (!found.ok) {
@@ -3078,8 +3112,73 @@
         downloadControlDetection: buildDownloadControlDetection(found),
       };
     }
+
+    const btn = found.button;
+    const innerBtn = btn && btn.__innerBtnForTier1 ? btn.__innerBtnForTier1 : null;
+    const preClick = {
+      isConnected: !!(btn && btn.isConnected),
+      disabled: !!(btn && btn.disabled),
+      ariaLabel: btn ? (btn.getAttribute("aria-label") || null) : null,
+      tagName: btn ? (btn.tagName || "").toLowerCase() : "",
+      outerHTML: btn ? (btn.outerHTML || "").slice(0, 300) : "",
+      insideCurrentResponse: !!(found.responseContainer && btn && (
+        typeof found.responseContainer.contains === "function"
+          ? found.responseContainer.contains(btn)
+          : true
+      )),
+      candidateCountGlobal: found.candidateCountGlobal ?? 0,
+      candidateCountInsideCurrentResponse: found.candidateCountInsideCurrentResponse ?? 0,
+    };
+
+    let elapsedMs = 0;
+    let clickStrategyUsed = "native";
+    let clickReturned = false;
+    let clickError = null;
     try {
-      found.button.click();
+      const t0 = (typeof performance !== "undefined" && performance.now)
+        ? performance.now()
+        : Date.now();
+
+      // Strategy 1: programmatic .click() on the host (Tier 1) or the
+      // resolved button (Tier 2-4). This is the original behaviour and
+      // is sufficient when the framework listens on the same element.
+      try {
+        btn.click();
+        clickReturned = true;
+      } catch (e) {
+        clickError = e?.message ?? String(e);
+      }
+
+      // Strategy 2: also click the inner <button> when Tier 1 matched.
+      // Some Angular hosts bubble the event correctly, others do not —
+      // emitting it on both targets covers both layouts with no
+      // duplicate side-effect (the host's handler runs at most once per
+      // event dispatch).
+      if (innerBtn && innerBtn !== btn && typeof innerBtn.click === "function") {
+        try { innerBtn.click(); } catch (_) { /* swallow */ }
+      }
+
+      // Strategy 3: synthesise a full pointer + click event sequence.
+      // Required when the Gemini host uses Angular event delegation and
+      // relies on pointer events instead of the legacy click event.
+      try {
+        if (!clickReturned) {
+          if (dispatchSyntheticClick(btn, "host")) {
+            clickReturned = true;
+            clickStrategyUsed = "synthetic-host";
+          }
+        }
+        if (innerBtn && innerBtn !== btn) {
+          dispatchSyntheticClick(innerBtn, "inner");
+        }
+      } catch (e) {
+        if (!clickError) clickError = e?.message ?? String(e);
+      }
+
+      const t1 = (typeof performance !== "undefined" && performance.now)
+        ? performance.now()
+        : Date.now();
+      elapsedMs = Math.round((t1 - t0) * 100) / 100;
     } catch (e) {
       return {
         ok: false,
@@ -3088,22 +3187,29 @@
         buttonFound: true,
         candidateCountGlobal: found.candidateCountGlobal,
         candidateCountInsideCurrentResponse: found.candidateCountInsideCurrentResponse,
-        downloadControlDetection: buildDownloadControlDetection(found),
+        preClick,
+        clickReturned: false,
+        downloadControlDetection: buildDownloadControlDetection(found, preClick, 0),
       };
     }
     return {
-      ok: true,
+      ok: clickReturned,
       clickedAt: Date.now(),
       ariaLabel: found.ariaLabel,
       customElementFound: found.customElementFound,
       buttonFound: true,
       candidateCountGlobal: found.candidateCountGlobal,
       candidateCountInsideCurrentResponse: found.candidateCountInsideCurrentResponse,
-      downloadControlDetection: buildDownloadControlDetection(found),
+      preClick,
+      clickReturned,
+      clickStrategyUsed,
+      clickError,
+      elapsedMs,
+      downloadControlDetection: buildDownloadControlDetection(found, preClick, elapsedMs),
     };
   }
 
-  function buildDownloadControlDetection(found) {
+  function buildDownloadControlDetection(found, preClick, elapsedMs) {
     return {
       resultContainerFound: !!found.responseContainer,
       customElementFound: !!found.customElementFound,
@@ -3113,6 +3219,17 @@
         found.candidateCountInsideCurrentResponse ?? 0,
       candidateCountGlobal: found.candidateCountGlobal ?? 0,
       clickedAt: found.clickedAt ?? null,
+      isConnected: preClick ? preClick.isConnected : (found.button ? !!found.button.isConnected : false),
+      disabled: preClick ? preClick.disabled : (found.button ? !!found.button.disabled : false),
+      tagName: preClick ? preClick.tagName : (found.button ? (found.button.tagName || "").toLowerCase() : ""),
+      outerHTML: preClick ? preClick.outerHTML : (found.button ? (found.button.outerHTML || "").slice(0, 300) : ""),
+      insideCurrentResponse: preClick ? preClick.insideCurrentResponse : false,
+      clickReturned: preClick ? true : false,
+      clickStrategyUsed: preClick && preClick.clickStrategyUsed
+        ? preClick.clickStrategyUsed
+        : "native",
+      clickError: preClick ? (preClick.clickError || null) : null,
+      elapsedMs: typeof elapsedMs === "number" ? elapsedMs : 0,
     };
   }
 
@@ -4353,7 +4470,405 @@
       roleTextbox: 5,
       visible: 1,
     }),
+    // v0.10: clean-conversation lifecycle
+    resetToCleanConversation,
+    waitForCleanConversation,
+    extractConversationId,
+    buildCleanGeminiUrl,
   });
+
+  // v0.10: clean-conversation lifecycle helpers -----------------------------
+  //
+  // Strategy A: Click Gemini's own "Nova conversa" / "New conversation"
+  // control if reliably detectable.
+  // Strategy B: Navigate the SAME tab to the canonical Gemini entry
+  //   point /app?hl=<locale>, preserving the current locale so the
+  //   user is not thrown into English unexpectedly.
+  // Strategy C: Window.location.reload() on the same conversation URL
+  //   is INTENTIONALLY avoided. Reloading /app/<id> would just rebuild
+  //   the same conversation and defeat the purpose of the reset.
+
+  const NEW_CONVERSATION_LABELS = Object.freeze([
+    "Nova conversa",            // pt-BR
+    "New chat",                  // en
+    "New conversation",          // en alt
+    "Nueva conversación",        // es
+    "Nouvelle conversation",     // fr
+    "Neue Konversation",         // de
+    "Nuova conversazione",       // it
+    "新しい会話を開始",            // ja
+    "새 대화",                    // ko
+    "新对话",                     // zh-CN
+    "開新對話",                    // zh-TW
+  ]);
+
+  // Hints for "stop generating" / "parar geração" — when one of these
+  // is present the conversation is mid-generation and any reset attempt
+  // must be blocked.
+  const STOP_GENERATION_HINTS = Object.freeze([
+    "stop generating",
+    "stop response",
+    "parar geração",
+    "parar resposta",
+    "interromper",
+    "detener",
+  ]);
+
+  function extractConversationId(href) {
+    if (typeof href !== "string" || href.length === 0) return null;
+    // Pattern: https://gemini.google.com/app/<conversation-id>?...
+    const m = href.match(/gemini\.google\.com\/app\/([^/?#]+)/);
+    return m ? m[1] : null;
+  }
+
+  function buildCleanGeminiUrl(locale) {
+    // Always navigate to the canonical entry point (no conversation id).
+    // We never preserve the previous conversationId.
+    const detected =
+      locale ||
+      (typeof navigator !== "undefined" && navigator.language) ||
+      "pt";
+    const norm = String(detected).toLowerCase();
+    const lang = norm.startsWith("pt") ? "pt" : "en";
+    return `https://gemini.google.com/app?hl=${lang}`;
+  }
+
+  function isStopGenerationControlPresent() {
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+    for (const b of buttons) {
+      const aria = (b.getAttribute("aria-label") || "").toLowerCase();
+      const text = (b.textContent || "").toLowerCase();
+      if (!aria && !text) continue;
+      for (const hint of STOP_GENERATION_HINTS) {
+        if (aria.includes(hint) || text.includes(hint)) return true;
+      }
+    }
+    return false;
+  }
+
+  function snapshotConversationState() {
+    const composer =
+      document.querySelector('[role="textbox"]') ||
+      (typeof findPromptInput === "function" ? findPromptInput() : null) ||
+      document.querySelector("rich-textarea") ||
+      document.querySelector(".ql-editor") ||
+      null;
+    const area =
+      (typeof findPromptInputArea === "function"
+        ? findPromptInputArea()
+        : null) ||
+      document.querySelector("input-area-v2") ||
+      null;
+    const attachments =
+      typeof countComposerAttachments === "function"
+        ? countComposerAttachments(area)
+        : area
+          ? area.querySelectorAll("gem-media-attachment").length
+          : 0;
+    const pendingUploads =
+      typeof countActiveUploads === "function"
+        ? countActiveUploads(area)
+        : 0;
+    const composerText = composer
+      ? String(composer.textContent || composer.innerText || "").trim()
+      : "";
+    const generationActive = isStopGenerationControlPresent();
+    return {
+      composerFound: !!composer,
+      composerTextLength: composerText.length,
+      composerTextSample: composerText.slice(0, 80) || null,
+      attachmentCount: attachments,
+      pendingUploadCount: pendingUploads,
+      generationActive,
+    };
+  }
+
+  function tryClickNewConversationButton() {
+    // Scan sidebar, top bar, and main layout for the new-chat control.
+    // We accept links, buttons, and role=button so this works whether
+    // Gemini renders the entry point as an anchor or a custom element.
+    const candidates = Array.from(
+      document.querySelectorAll(
+        'a, button, [role="button"], [role="link"]',
+      ),
+    );
+    for (const el of candidates) {
+      const aria = (el.getAttribute("aria-label") || "").trim();
+      const text = (el.textContent || "").trim();
+      if (!aria && !text) continue;
+      for (const label of NEW_CONVERSATION_LABELS) {
+        const target = label.toLowerCase();
+        if (
+          aria.toLowerCase() === target ||
+          aria.toLowerCase().includes(target) ||
+          text.toLowerCase() === target
+        ) {
+          try {
+            el.click();
+            return {
+              ok: true,
+              buttonFound: true,
+              ariaLabel: aria || label,
+              matchedLabel: label,
+            };
+          } catch (e) {
+            return {
+              ok: false,
+              buttonFound: true,
+              ariaLabel: aria || label,
+              matchedLabel: label,
+              error: e?.message ?? String(e),
+            };
+          }
+        }
+      }
+    }
+    return { ok: false, buttonFound: false };
+  }
+
+  /**
+   * Reset the current Gemini conversation to a clean state.
+   *
+   * Strategy:
+   *   1. If a "New conversation" / "Nova conversa" control is reliably
+   *      detectable, click it.
+   *   2. Otherwise, navigate the SAME tab to /app?hl=<locale>.
+   *
+   * Never uses window.location.reload() on the same conversation URL —
+   * that would just reconstruct the previous conversation and defeat
+   * the reset.
+   *
+   * Returns:
+   *   {
+   *     ok,
+   *     strategy: "new-conversation-button" | "navigate-app" | "noop",
+   *     previousUrl,
+   *     currentUrl,
+   *     previousConversationId,
+   *     elapsedMs,
+   *     error?,
+   *     buttonFound?
+   *   }
+   */
+  async function resetToCleanConversation(opts) {
+    const options = opts && typeof opts === "object" ? opts : {};
+    const startMs = Date.now();
+    const previousUrl =
+      typeof location !== "undefined" ? location.href : "";
+    const previousConversationId = extractConversationId(previousUrl);
+    const locale = options.locale || null;
+    const strategy = options.strategy || "auto"; // "auto" | "new-conversation-button" | "navigate-app"
+
+    // Refuse to reset mid-generation. The caller should already have
+    // gated on download-complete, but we double-check here as a
+    // safety net.
+    if (isStopGenerationControlPresent()) {
+      return {
+        ok: false,
+        strategy: "noop",
+        error: "generation-in-progress",
+        previousUrl,
+        currentUrl: previousUrl,
+        previousConversationId,
+        elapsedMs: Date.now() - startMs,
+      };
+    }
+
+    // Strategy A
+    if (strategy === "auto" || strategy === "new-conversation-button") {
+      const btn = tryClickNewConversationButton();
+      if (btn && btn.ok) {
+        return {
+          ok: true,
+          strategy: "new-conversation-button",
+          previousUrl,
+          currentUrl:
+            typeof location !== "undefined" ? location.href : previousUrl,
+          previousConversationId,
+          elapsedMs: Date.now() - startMs,
+          buttonFound: true,
+          ariaLabel: btn.ariaLabel || null,
+        };
+      }
+      if (strategy === "new-conversation-button") {
+        return {
+          ok: false,
+          strategy: "new-conversation-button",
+          previousUrl,
+          currentUrl: previousUrl,
+          previousConversationId,
+          elapsedMs: Date.now() - startMs,
+          error: "new-conversation-button-not-found",
+          buttonFound: false,
+        };
+      }
+    }
+
+    // Strategy B — navigate same tab to /app?hl=<locale>.
+    if (strategy === "auto" || strategy === "navigate-app") {
+      const targetUrl = buildCleanGeminiUrl(locale);
+      try {
+        if (
+          typeof location !== "undefined" &&
+          typeof location.assign === "function"
+        ) {
+          location.assign(targetUrl);
+        } else if (typeof window !== "undefined" && window.location) {
+          window.location.href = targetUrl;
+        } else {
+          return {
+            ok: false,
+            strategy: "navigate-app",
+            previousUrl,
+            currentUrl: previousUrl,
+            previousConversationId,
+            elapsedMs: Date.now() - startMs,
+            error: "no-location-api",
+          };
+        }
+        return {
+          ok: true,
+          strategy: "navigate-app",
+          previousUrl,
+          currentUrl: targetUrl,
+          previousConversationId,
+          elapsedMs: Date.now() - startMs,
+          note: "navigation initiated",
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          strategy: "navigate-app",
+          previousUrl,
+          currentUrl: previousUrl,
+          previousConversationId,
+          elapsedMs: Date.now() - startMs,
+          error: e?.message ?? String(e),
+        };
+      }
+    }
+
+    return {
+      ok: false,
+      strategy: "noop",
+      previousUrl,
+      currentUrl: previousUrl,
+      previousConversationId,
+      elapsedMs: Date.now() - startMs,
+      error: "no-strategy-matched",
+    };
+  }
+
+  /**
+   * Poll the DOM until a clean conversation is verified.
+   *
+   * Success criteria (all required):
+   *   - composer exists
+   *   - composer text length === 0
+   *   - composer attachment count === 0
+   *   - no active generation (no "stop generating" control)
+   *   - URL no longer points at the previous conversation id
+   *
+   * We do NOT require the whole page DOM to contain zero images
+   * because Gemini's image-generation landing page contains template
+   * thumbnails unrelated to the active execution.
+   */
+  async function waitForCleanConversation(timeoutMs) {
+    const tmo =
+      typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : 10000;
+    const startMs = Date.now();
+    const deadline = startMs + tmo;
+    const previousUrl =
+      typeof location !== "undefined" ? location.href : "";
+    const previousConversationId = extractConversationId(previousUrl);
+
+    let last = null;
+    let attempts = 0;
+    while (Date.now() < deadline) {
+      attempts++;
+      const snap = snapshotConversationState();
+      const currentUrl =
+        typeof location !== "undefined" ? location.href : previousUrl;
+      const currentConversationId = extractConversationId(currentUrl);
+      // After a successful reset the conversation id should change OR
+      // (if Gemini kept the same URL) the composer must be empty. We
+      // accept either signal.
+      const urlChanged =
+        !previousConversationId ||
+        !currentConversationId ||
+        previousConversationId !== currentConversationId;
+      const composerClean =
+        snap.composerFound &&
+        snap.composerTextLength === 0 &&
+        snap.attachmentCount === 0 &&
+        snap.pendingUploadCount === 0;
+      const ready =
+        composerClean &&
+        !snap.generationActive &&
+        (urlChanged || currentUrl !== previousUrl);
+
+      if (ready) {
+        return {
+          ok: true,
+          previousUrl,
+          currentUrl,
+          previousConversationId,
+          currentConversationId,
+          composerFound: snap.composerFound,
+          composerTextLength: snap.composerTextLength,
+          attachmentCount: snap.attachmentCount,
+          pendingUploadCount: snap.pendingUploadCount,
+          generationActive: snap.generationActive,
+          urlChanged,
+          elapsedMs: Date.now() - startMs,
+          attempts,
+        };
+      }
+
+      last = {
+        ok: false,
+        previousUrl,
+        currentUrl,
+        previousConversationId,
+        currentConversationId,
+        composerFound: snap.composerFound,
+        composerTextLength: snap.composerTextLength,
+        attachmentCount: snap.attachmentCount,
+        pendingUploadCount: snap.pendingUploadCount,
+        generationActive: snap.generationActive,
+        urlChanged,
+        elapsedMs: Date.now() - startMs,
+        attempts,
+      };
+
+      await sleep(200);
+    }
+
+    if (last) {
+      return {
+        ...last,
+        reason: "timeout",
+        elapsedMs: Date.now() - startMs,
+      };
+    }
+
+    return {
+      ok: false,
+      previousUrl,
+      currentUrl: previousUrl,
+      previousConversationId,
+      currentConversationId: previousConversationId,
+      composerFound: false,
+      composerTextLength: 0,
+      attachmentCount: 0,
+      pendingUploadCount: 0,
+      generationActive: false,
+      urlChanged: false,
+      elapsedMs: Date.now() - startMs,
+      attempts,
+      reason: "timeout-no-snapshots",
+    };
+  }
 
   log("adapter loaded");
 })();

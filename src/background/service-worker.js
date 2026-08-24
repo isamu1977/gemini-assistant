@@ -12,6 +12,8 @@
  *       stage 1: side panel -> content script (fetch + return Blob).
  *       stage 2: side panel -> service worker (chrome.downloads).
  *     The service worker only sees the Blob (encoded as ArrayBuffer).
+ *   - Download claim interception via chrome.downloads.onDeterminingFilename (v0.9.103)
+ *   - Download state change tracking via chrome.downloads.onChanged (v0.9.99)
  *
  * Activation timing: we set the panel behavior on every install/update.
  * Chrome caches the value, but re-registering is safe and idempotent.
@@ -20,6 +22,58 @@
 "use strict";
 
 const GEMINI_HOST_PATTERN = "https://gemini.google.com/*";
+const FILENAME_PATTERN = /^[a-zA-Z0-9 ._\-()\[\]']{1,200}\.[a-z0-9]{2,5}$/;
+
+const GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED =
+  "GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED";
+const GEMINI_ASSISTANT_ARM_DOWNLOAD = "GEMINI_ASSISTANT_ARM_DOWNLOAD";
+const GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE = "GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE";
+const GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE =
+  "GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE";
+const GEMINI_ASSISTANT_DOWNLOAD_PROBE = "GEMINI_ASSISTANT_DOWNLOAD_PROBE";
+
+const CLAIM_WINDOW_MS = 25_000; // 15-30s per spec; pick the upper-middle.
+
+// Declare all state and diagnostic counters at top-level before any listeners
+// to avoid Temporal Dead Zone (TDZ) ReferenceErrors on service worker startup.
+let downloadsOnCreatedRegistrationCount = 0;
+let downloadsOnChangedRegistrationCount = 0;
+let downloadsOnDeterminingFilenameRegistrationCount = 0;
+
+let serviceWorkerRuntimeId = 0;
+try {
+  serviceWorkerRuntimeId = (typeof crypto !== "undefined" && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : "sw-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+} catch (_) {
+  serviceWorkerRuntimeId = "sw-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+}
+
+const expectedDownloadClaims = new Map();
+const trackedDownloads = new Map(); // downloadId -> { requestedFilename, startedAt, executionId, taskId }
+const downloadTrace = []; // SW-side mirror of the download trace
+const downloadHistory = []; // [{ executionId, taskId, downloadId, filename, requestedFilename, finalState, completedAt }]
+
+function nowMs() {
+  return Date.now();
+}
+
+function appendDownloadTrace(step, data = {}) {
+  const entry = {
+    step,
+    timestamp: new Date().toISOString(),
+    ...data,
+  };
+  downloadTrace.push(entry);
+  if (downloadTrace.length > 200) {
+    downloadTrace.splice(0, downloadTrace.length - 200);
+  }
+  try {
+    console.log(`[Gemini Assistant:sw download-trace] ${step}`, entry);
+  } catch (_) {
+    /* ignore */
+  }
+}
 
 function registerSidePanelBehavior() {
   if (!chrome?.sidePanel?.setPanelBehavior) {
@@ -55,20 +109,6 @@ function setDefaultSidePanelOptions() {
   }
 }
 
-// ---- v0.6: download bridge -----------------------------------------
-
-// We expect the side panel to call:
-//   chrome.runtime.sendMessage({ type: "GEMINI_ASSISTANT_DOWNLOAD_BLOB",
-//     arrayBuffer, filename, mime })
-// and we respond with { ok, downloadId, finalFilename } or { ok:false, error }.
-//
-// We refuse any path traversal: filename must be a basename only, and
-// we always route it under the user's Downloads directory. The
-// chrome.downloads API automatically handles "(1)", "(2)" collisions
-// when conflictAction is "uniquify".
-
-const FILENAME_PATTERN = /^[a-zA-Z0-9 ._\-()\[\]']{1,200}\.[a-z0-9]{2,5}$/;
-
 function isAcceptableFilename(filename) {
   if (typeof filename !== "string") return false;
   if (filename.length === 0 || filename.length > 260) return false;
@@ -91,8 +131,6 @@ async function handleDownloadBlob(msg, sender) {
     return { ok: false, error: "chrome.downloads API unavailable" };
   }
 
-  // Build a Blob URL inside the service worker. Some Chrome versions
-  // also accept URL.createObjectURL(blob); both work.
   let blob;
   try {
     blob = new Blob([arrayBuffer], {
@@ -105,13 +143,10 @@ async function handleDownloadBlob(msg, sender) {
   try {
     const downloadId = await chrome.downloads.download({
       url,
-      filename, // relative; chrome saves under Downloads by default.
+      filename,
       conflictAction: "uniquify",
       saveAs: false,
     });
-    // We deliberately do NOT await completion: we want the side panel
-    // to update immediately when the download STARTS. Monitoring of
-    // completion happens via chrome.downloads.onChanged (out of scope).
     return {
       ok: true,
       downloadId,
@@ -124,8 +159,6 @@ async function handleDownloadBlob(msg, sender) {
       error: `chrome.downloads.download failed: ${e?.message ?? "unknown"}`,
     };
   } finally {
-    // We do NOT revoke the URL immediately: chrome.downloads needs it.
-    // We revoke after a short grace period to free memory.
     setTimeout(() => {
       try {
         URL.revokeObjectURL(url);
@@ -136,56 +169,16 @@ async function handleDownloadBlob(msg, sender) {
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (!msg || typeof msg !== "object") return false;
-  if (msg.type === "GEMINI_ASSISTANT_DOWNLOAD_BLOB") {
-    handleDownloadBlob(msg, sender)
-      .then(sendResponse)
-      .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
-    return true;
-  }
-  return false;
-});
-
-registerSidePanelBehavior();
-setDefaultSidePanelOptions();
-
-chrome.runtime.onInstalled.addListener(() => {
-  registerSidePanelBehavior();
-  setDefaultSidePanelOptions();
-});
-
-chrome.runtime.onStartup.addListener(() => {
-  registerSidePanelBehavior();
-  setDefaultSidePanelOptions();
-});
-
-// ---- v0.9.99: download completion tracking (Part 19) ------------------
-//
-// chrome.downloads.download returns a downloadId IMMEDIATELY without
-// waiting for the file to actually finish writing to disk. To know
-// whether the file is on disk and what its final filename is (after
-// Chrome applied conflictAction:'uniquify'), we hook chrome.downloads
-// .onChanged and post state transitions back to the side panel.
-//
-// We track only downloadIds WE created (startedBy === 'user' or the
-// filename pattern we used). Other downloads in the user's browser are
-// ignored.
-
-const GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED =
-  "GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED";
-
-const trackedDownloads = new Map(); // downloadId -> { requestedFilename, startedAt }
-
 // Mark downloads we initiated so onChanged can recognise them.
-function trackDownload(downloadId, requestedFilename) {
+function trackDownload(downloadId, requestedFilename, executionId, taskId) {
   trackedDownloads.set(downloadId, {
     requestedFilename,
     startedAt: Date.now(),
+    executionId: executionId || null,
+    taskId: taskId || null,
   });
 }
 
-// Forget the tracking entry after the terminal state has been delivered.
 function forgetDownload(downloadId) {
   trackedDownloads.delete(downloadId);
 }
@@ -193,94 +186,11 @@ function forgetDownload(downloadId) {
 function postDownloadState(payload) {
   try {
     chrome.runtime.sendMessage(payload).catch(() => {
-      // Side panel may not be open; the message is best-effort. Ignore
-      // any "Receiving end does not exist" errors.
+      // Side panel may not be open; ignore receiving end does not exist errors.
     });
   } catch (_) {
     /* ignore */
   }
-}
-
-if (chrome?.downloads?.onChanged && typeof chrome.downloads.onChanged.addListener === "function") {
-  chrome.downloads.onChanged.addListener((delta) => {
-    if (!delta || typeof delta.id !== "number") return;
-    const tracked = trackedDownloads.get(delta.id);
-    if (!tracked) return; // Not ours.
-
-    // chrome.downloads.DownloadDelta exposes:
-    //   state?: { current: 'in_progress'|'complete'|'interrupted', previous? }
-    //   filename?: { current }
-    //   error?: { current }
-    if (!delta.state) return;
-    const cur = delta.state.current;
-    const filenameDelta = delta.filename && delta.filename.current
-      ? delta.filename.current
-      : null;
-    const errorDelta = delta.error && delta.error.current
-      ? delta.error.current
-      : null;
-
-    if (cur === "complete" || cur === "interrupted") {
-      postDownloadState({
-        type: GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
-        downloadId: delta.id,
-        state: cur,
-        filename: filenameDelta,
-        requestedFilename: tracked.requestedFilename,
-        error: errorDelta,
-        completedAt: Date.now(),
-      });
-      forgetDownload(delta.id);
-    }
-    // 'in_progress' transitions are ignored — the side panel does not
-    // need per-progress pings.
-  });
-}
-
-// ---- v0.9.103: filename interception via onDeterminingFilename ----
-//
-// Per the spec, we click Gemini's own official download control and let
-// Chrome / Gemini's authenticated session perform the actual transfer.
-// To control WHERE the file lands on disk, we use the
-// chrome.downloads.onDeterminingFilename event.
-//
-// Flow:
-//   1. The side panel arms an `expectedDownloadClaim` via
-//      GEMINI_ASSISTANT_ARM_DOWNLOAD (with executionId, taskId,
-//      desiredFilename, expiresAt).
-//   2. The side panel calls the content script to click Gemini's
-//      download button inside the current result container.
-//   3. Chrome starts the download; Gemini's download URL is on the
-//      same Google CDN (lh3.googleusercontent.com / gemini.google.com).
-//   4. chrome.downloads.onCreated fires; we capture the downloadId and
-//      bind it to the active claim.
-//   5. chrome.downloads.onDeterminingFilename fires for the new
-//      download; we call suggest({ filename, conflictAction:'uniquify' }).
-//   6. chrome.downloads.onChanged fires for state transitions
-//      (complete / interrupted); we post to the side panel.
-//   7. After the expected download is delivered, the claim is cleared.
-//
-// Crucially, we ONLY intercept downloads while an active claim is
-// present AND the download URL is Gemini-Google-originated. Other
-// downloads in the user's browser are NOT touched.
-
-const GEMINI_ASSISTANT_ARM_DOWNLOAD = "GEMINI_ASSISTANT_ARM_DOWNLOAD";
-
-// One active claim per execution. Replaces any prior claim for the same
-// executionId. Older claims expire automatically.
-const expectedDownloadClaims = new Map();
-// executionId -> {
-//   taskId,
-//   desiredFilename,    // e.g. "Gemini Assistant/<project-id>/scene-001...png"
-//   expiresAt,
-//   downloadId?: number,
-//   createdAt,
-// }
-
-const CLAIM_WINDOW_MS = 25_000; // 15-30s per spec; pick the upper-middle.
-
-function nowMs() {
-  return Date.now();
 }
 
 function pruneExpiredClaims() {
@@ -307,16 +217,13 @@ function setExpectedClaim({ executionId, taskId, desiredFilename }) {
 
 function findActiveClaimForDownload(download) {
   pruneExpiredClaims();
-  // First pass: match by executionId if the side panel pre-bound a
-  // downloadId to a claim (defensive — currently we don't pre-bind).
+  // First pass: match by executionId if the side panel pre-bound a downloadId.
   for (const [execId, claim] of expectedDownloadClaims) {
     if (claim.downloadId === download.id) {
       return { execId, claim };
     }
   }
-  // Second pass: any active claim, preferring one whose desiredFilename
-  // matches the download's existing filename (Chrome fills `suggestedFilename`
-  // for some sources).
+  // Second pass: match by filename if desiredFilename ends with same filename.
   for (const [execId, claim] of expectedDownloadClaims) {
     if (
       download.filename &&
@@ -326,7 +233,7 @@ function findActiveClaimForDownload(download) {
       return { execId, claim };
     }
   }
-  // Third pass: just the first active claim.
+  // Third pass: first active claim.
   for (const [execId, claim] of expectedDownloadClaims) {
     claim.downloadId = download.id;
     return { execId, claim };
@@ -334,15 +241,6 @@ function findActiveClaimForDownload(download) {
   return null;
 }
 
-function clearClaim(executionId, reason) {
-  const claim = expectedDownloadClaims.get(executionId);
-  if (!claim) return null;
-  expectedDownloadClaims.delete(executionId);
-  return { executionId, ...claim, clearedReason: reason };
-}
-
-// Gemini-Google-originated URL detector. Matches gemini.google.com and
-// the common Google CDN hosts Gemini uses for generated images.
 function isGeminiOriginatedDownload(download) {
   if (!download) return false;
   const url = download.url || "";
@@ -351,66 +249,6 @@ function isGeminiOriginatedDownload(download) {
   return /gemini\.google\.com|lh[0-9]*\.googleusercontent\.com|gstatic\.com/.test(
     combined,
   );
-}
-
-// chrome.downloads.onCreated: bind the new download to the active claim
-// (if any). This gives us a stable handle for filename interception.
-if (
-  chrome?.downloads?.onCreated &&
-  typeof chrome.downloads.onCreated.addListener === "function"
-) {
-  chrome.downloads.onCreated.addListener((download) => {
-    if (!download || typeof download.id !== "number") return;
-    const matched = findActiveClaimForDownload(download);
-    if (matched) {
-      // Record in trackedDownloads so the onChanged listener can post
-      // terminal-state events back to the side panel.
-      trackedDownloads.set(download.id, {
-        requestedFilename: matched.claim.desiredFilename,
-        startedAt: nowMs(),
-        executionId: matched.execId,
-      });
-    }
-  });
-}
-
-// chrome.downloads.onDeterminingFilename: ONLY act if the active claim
-// is present AND the download is Gemini-originated. We MUST call suggest()
-// synchronously or Chrome proceeds with its own default filename.
-if (
-  chrome?.downloads?.onDeterminingFilename &&
-  typeof chrome.downloads.onDeterminingFilename.addListener === "function"
-) {
-  chrome.downloads.onDeterminingFilename.addListener((download, suggest) => {
-    if (!download || typeof suggest !== "function") return;
-    pruneExpiredClaims();
-
-    // Find a claim bound to this downloadId, or pick the first active
-    // claim and bind it now (the click in the content script and this
-    // event are usually separated by <100ms; we don't want to miss).
-    let matched = null;
-    for (const [execId, claim] of expectedDownloadClaims) {
-      if (claim.downloadId === download.id) {
-        matched = { execId, claim };
-        break;
-      }
-    }
-    if (!matched) {
-      // No pre-bound claim for this downloadId. We can only intercept
-      // downloads we initiated; for an unrelated download (e.g. user
-      // clicking elsewhere in Chrome), let Chrome pick the default.
-      if (!isGeminiOriginatedDownload(download)) return;
-      matched = findActiveClaimForDownload(download);
-      if (!matched) return;
-    }
-
-    if (!isGeminiOriginatedDownload(download)) return;
-
-    suggest({
-      filename: matched.claim.desiredFilename,
-      conflictAction: "uniquify",
-    });
-  });
 }
 
 function handleArmDownload(msg) {
@@ -423,21 +261,319 @@ function handleArmDownload(msg) {
     typeof desiredFilename !== "string" ||
     desiredFilename.length === 0
   ) {
+    appendDownloadTrace("service-worker-download-claim-received", {
+      result: "rejected",
+      reason: "missing-params",
+      executionId: executionId || null,
+      taskId: taskId || null,
+    });
     return { ok: false, error: "missing executionId/taskId/desiredFilename" };
   }
   const claim = setExpectedClaim({ executionId, taskId, desiredFilename });
+  appendDownloadTrace("service-worker-download-claim-received", {
+    result: "accepted",
+    executionId,
+    taskId,
+    desiredFilename,
+    activeClaimCount: expectedDownloadClaims.size,
+  });
   return { ok: true, claim };
 }
 
-// Extend onMessage to handle the arm-download message.
-const __geminiAssistantOriginalOnMessage =
-  chrome.runtime.onMessage && chrome.runtime.onMessage.hasListeners && null;
+// Register listeners
+registerSidePanelBehavior();
+setDefaultSidePanelOptions();
+
+chrome.runtime.onInstalled.addListener(() => {
+  registerSidePanelBehavior();
+  setDefaultSidePanelOptions();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  registerSidePanelBehavior();
+  setDefaultSidePanelOptions();
+});
+
+// chrome.downloads.onCreated: D8 & D9
+if (
+  chrome?.downloads?.onCreated &&
+  typeof chrome.downloads.onCreated.addListener === "function"
+) {
+  downloadsOnCreatedRegistrationCount++;
+  chrome.downloads.onCreated.addListener((download) => {
+    if (!download || typeof download.id !== "number") return;
+    const matched = findActiveClaimForDownload(download);
+    if (matched) {
+      trackedDownloads.set(download.id, {
+        requestedFilename: matched.claim.desiredFilename,
+        startedAt: nowMs(),
+        executionId: matched.execId,
+        taskId: matched.claim.taskId || null,
+      });
+      appendDownloadTrace("chrome.downloads.onCreated-fired", {
+        downloadId: download.id,
+        executionId: matched.execId,
+        taskId: matched.claim.taskId || null,
+        url: (download.url || "").slice(0, 256),
+        suggestedFilename: download.filename || null,
+        matched: true,
+      });
+      appendDownloadTrace("chrome-download-matched-to-claim", {
+        downloadId: download.id,
+        executionId: matched.execId,
+        taskId: matched.claim.taskId || null,
+        desiredFilename: matched.claim.desiredFilename,
+      });
+      // Inform the side panel right away that a downloadId has been acquired
+      postDownloadState({
+        type: GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
+        downloadId: download.id,
+        state: "in_progress",
+        filename: download.filename || matched.claim.desiredFilename,
+        requestedFilename: matched.claim.desiredFilename,
+        executionId: matched.execId,
+        taskId: matched.claim.taskId || null,
+      });
+    } else {
+      appendDownloadTrace("chrome.downloads.onCreated-fired", {
+        downloadId: download.id,
+        executionId: null,
+        taskId: null,
+        url: (download.url || "").slice(0, 256),
+        suggestedFilename: download.filename || null,
+        matched: false,
+        note: "no-active-claim",
+      });
+    }
+  });
+}
+
+// chrome.downloads.onDeterminingFilename: D10
+if (
+  chrome?.downloads?.onDeterminingFilename &&
+  typeof chrome.downloads.onDeterminingFilename.addListener === "function"
+) {
+  downloadsOnDeterminingFilenameRegistrationCount++;
+  chrome.downloads.onDeterminingFilename.addListener((download, suggest) => {
+    if (!download || typeof suggest !== "function") return;
+    pruneExpiredClaims();
+
+    appendDownloadTrace("chrome.downloads.onDeterminingFilename-fired", {
+      downloadId: download.id,
+      geminiOriginated: isGeminiOriginatedDownload(download),
+      activeClaimCount: expectedDownloadClaims.size,
+      historyCount: downloadHistory.length,
+      url: (download.url || "").slice(0, 256),
+    });
+
+    let matched = null;
+    for (const [execId, claim] of expectedDownloadClaims) {
+      if (claim.downloadId === download.id) {
+        matched = { execId, claim };
+        break;
+      }
+    }
+    if (!matched) {
+      if (!isGeminiOriginatedDownload(download)) return;
+      matched = findActiveClaimForDownload(download);
+      if (!matched) {
+        appendDownloadTrace("filename-suggested", {
+          result: "no-claim",
+          downloadId: download.id,
+        });
+        return;
+      }
+    }
+
+    if (!isGeminiOriginatedDownload(download)) {
+      appendDownloadTrace("filename-suggested", {
+        result: "not-gemini",
+        downloadId: download.id,
+      });
+      return;
+    }
+
+    appendDownloadTrace("filename-suggested", {
+      result: "ok",
+      downloadId: download.id,
+      executionId: matched.execId,
+      taskId: matched.claim.taskId || null,
+      filename: matched.claim.desiredFilename,
+    });
+
+    suggest({
+      filename: matched.claim.desiredFilename,
+      conflictAction: "uniquify",
+    });
+  });
+}
+
+// chrome.downloads.onChanged: D11 & D12
+if (chrome?.downloads?.onChanged && typeof chrome.downloads.onChanged.addListener === "function") {
+  downloadsOnChangedRegistrationCount++;
+  chrome.downloads.onChanged.addListener((delta) => {
+    if (!delta || typeof delta.id !== "number") return;
+    const tracked = trackedDownloads.get(delta.id);
+    if (!tracked) return;
+
+    if (!delta.state) return;
+    const cur = delta.state.current;
+    const filenameDelta = delta.filename && delta.filename.current
+      ? delta.filename.current
+      : null;
+    const errorDelta = delta.error && delta.error.current
+      ? delta.error.current
+      : null;
+
+    appendDownloadTrace("chrome.downloads.onChanged-fired", {
+      downloadId: delta.id,
+      state: cur,
+      filename: filenameDelta,
+      error: errorDelta,
+      executionId: tracked.executionId || null,
+      taskId: tracked.taskId || null,
+    });
+
+    if (cur === "complete" || cur === "interrupted") {
+      const archivedClaim = tracked.executionId
+        ? expectedDownloadClaims.get(tracked.executionId)
+        : null;
+      if (tracked.executionId) {
+        expectedDownloadClaims.delete(tracked.executionId);
+      }
+      downloadHistory.push({
+        executionId: tracked.executionId || null,
+        taskId: tracked.taskId || null,
+        downloadId: delta.id,
+        filename: filenameDelta || (archivedClaim && archivedClaim.desiredFilename) || null,
+        requestedFilename: tracked.requestedFilename || null,
+        finalState: cur,
+        completedAt: Date.now(),
+      });
+
+      if (cur === "complete") {
+        appendDownloadTrace("chrome-download-complete", {
+          downloadId: delta.id,
+          filename: filenameDelta || (archivedClaim && archivedClaim.desiredFilename) || null,
+          requestedFilename: tracked.requestedFilename,
+          executionId: tracked.executionId || null,
+          taskId: tracked.taskId || null,
+          completedAt: Date.now(),
+        });
+      } else {
+        appendDownloadTrace("chrome-download-interrupted", {
+          downloadId: delta.id,
+          error: errorDelta || "download-interrupted",
+          executionId: tracked.executionId || null,
+          taskId: tracked.taskId || null,
+        });
+      }
+
+      appendDownloadTrace("claim-cleared", {
+        reason: cur,
+        executionId: tracked.executionId || null,
+        taskId: tracked.taskId || null,
+        downloadId: delta.id,
+        filename: filenameDelta || null,
+        previousClaim: archivedClaim
+          ? {
+              executionId: tracked.executionId,
+              taskId: archivedClaim.taskId,
+              desiredFilename: archivedClaim.desiredFilename,
+            }
+          : null,
+      });
+
+      postDownloadState({
+        type: GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
+        downloadId: delta.id,
+        state: cur,
+        filename: filenameDelta || (archivedClaim && archivedClaim.desiredFilename) || null,
+        requestedFilename: tracked.requestedFilename,
+        error: errorDelta,
+        completedAt: Date.now(),
+        executionId: tracked.executionId || null,
+        taskId: tracked.taskId || null,
+      });
+      forgetDownload(delta.id);
+    } else if (cur === "in_progress") {
+      appendDownloadTrace("chrome-download-in-progress", {
+        downloadId: delta.id,
+        executionId: tracked.executionId || null,
+        taskId: tracked.taskId || null,
+      });
+      postDownloadState({
+        type: GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
+        downloadId: delta.id,
+        state: "in_progress",
+        filename: filenameDelta,
+        requestedFilename: tracked.requestedFilename,
+        executionId: tracked.executionId || null,
+        taskId: tracked.taskId || null,
+      });
+    }
+  });
+}
+
+// Messaging handler
 if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage) {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || typeof msg !== "object") return false;
+    if (msg.type === "GEMINI_ASSISTANT_DOWNLOAD_BLOB") {
+      handleDownloadBlob(msg, sender)
+        .then(sendResponse)
+        .catch((e) => sendResponse({ ok: false, error: e?.message ?? String(e) }));
+      return true;
+    }
     if (msg.type === GEMINI_ASSISTANT_ARM_DOWNLOAD) {
       const r = handleArmDownload(msg);
       sendResponse(r);
+      return true;
+    }
+    if (msg.type === GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE) {
+      const last = downloadTrace.slice(-50);
+      try {
+        chrome.runtime.sendMessage({
+          type: GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE,
+          ok: true,
+          trace: last,
+          traceLength: downloadTrace.length,
+          registrationCounts: {
+            downloadsOnCreatedRegistrationCount,
+            downloadsOnChangedRegistrationCount,
+            downloadsOnDeterminingFilenameRegistrationCount,
+          },
+          serviceWorkerRuntimeId,
+        }).catch(() => {});
+      } catch (_) {}
+      sendResponse({
+        ok: true,
+        traceLength: downloadTrace.length,
+        registrationCounts: {
+          downloadsOnCreatedRegistrationCount,
+          downloadsOnChangedRegistrationCount,
+          downloadsOnDeterminingFilenameRegistrationCount,
+        },
+        serviceWorkerRuntimeId,
+      });
+      return true;
+    }
+    if (msg.type === GEMINI_ASSISTANT_DOWNLOAD_PROBE) {
+      const lastStep =
+        downloadTrace.length > 0
+          ? downloadTrace[downloadTrace.length - 1].step
+          : null;
+      sendResponse({
+        ok: true,
+        traceLength: downloadTrace.length,
+        lastStep,
+        registrationCounts: {
+          downloadsOnCreatedRegistrationCount,
+          downloadsOnChangedRegistrationCount,
+          downloadsOnDeterminingFilenameRegistrationCount,
+        },
+        serviceWorkerRuntimeId,
+      });
       return true;
     }
     return false;
@@ -449,9 +585,20 @@ if (typeof globalThis !== "undefined") {
   globalThis.__GEMINI_ASSISTANT_SW__ = {
     GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED,
     GEMINI_ASSISTANT_ARM_DOWNLOAD,
+    GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE,
+    GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE,
+    GEMINI_ASSISTANT_DOWNLOAD_PROBE,
     trackedDownloads,
     expectedDownloadClaims,
+    downloadHistory,
+    downloadTrace,
     CLAIM_WINDOW_MS,
     isGeminiOriginatedDownload,
+    getRegistrationCounts: () => ({
+      downloadsOnCreatedRegistrationCount,
+      downloadsOnChangedRegistrationCount,
+      downloadsOnDeterminingFilenameRegistrationCount,
+    }),
+    getServiceWorkerRuntimeId: () => serviceWorkerRuntimeId,
   };
 }
