@@ -168,6 +168,18 @@
   const resetPrepBtn = $("#reset-prep-btn");
   const retryPrepBtn = $("#retry-prep-btn");
   const resetConversationBtn = $("#reset-conversation-btn");
+  // v0.10.x: Batch processing controls
+  const generateAllBtn = $("#generate-all-btn");
+  const cancelBatchBtn = $("#cancel-batch-btn");
+  const batchProgressEl = $("#batch-progress");
+  const batchProgressTitleEl = $("#batch-progress-title");
+  const batchProgressPhaseEl = $("#batch-progress-phase");
+  const batchProgressFillEl = $("#batch-progress-fill");
+  const batchProgressCompletedEl = $("#batch-progress-completed");
+  const batchProgressFailedEl = $("#batch-progress-failed");
+  const batchProgressSkippedEl = $("#batch-progress-skipped");
+  const batchProgressResultsEl = $("#batch-progress-results");
+  const batchProgressResultsListEl = $("#batch-progress-results-list");
   const generationResultBoxEl = $("#generation-result-box");
   const resultFilenameEl = $("#result-filename");
   const resultStatusBadgeEl = $("#result-status-badge");
@@ -810,6 +822,7 @@
   function renderProgress() {
     if (!state.tasks) {
       progressSummaryEl.textContent = "";
+      if (typeof renderGenerateAllButton === "function") renderGenerateAllButton();
       return;
     }
     const s = projectLib.summarizeProgress(state.tasks);
@@ -825,6 +838,7 @@
           `<div class="progress-cell"><span class="label">${label}</span><span class="value">${value}</span></div>`,
       )
       .join("");
+    if (typeof renderGenerateAllButton === "function") renderGenerateAllButton();
   }
 
   function renderReferences() {
@@ -2852,6 +2866,13 @@
   }
   if (retryDetectionBtn) retryDetectionBtn.addEventListener("click", onRetryDetection);
   if (retryDownloadBtn) retryDownloadBtn.addEventListener("click", onRetryDownload);
+  // v0.10.x: Batch processing click handlers.
+  if (generateAllBtn) {
+    generateAllBtn.addEventListener("click", onGenerateAll);
+  }
+  // cancelBatchBtn listener is attached dynamically when the batch
+  // starts (see onGenerateAll), because the cancel listener flips a
+  // closure-scoped flag that the orchestrator's shouldContinue polls.
   // Bug C fix: Retry Generate uses its OWN counter
   // (retryGenerateHandlerRegistrationCount) so the regression assertion
   // `generateHandlerRegistrationCount === 1` measures only the Generate
@@ -3827,6 +3848,9 @@
         // only via markTaskComplete() which is called from
         // applyDownloadStateChange when the SW reports "complete".
       },
+      // v0.10.x: Batch processing callbacks. Defined later in the
+      // closure (after onGenerateAll, renderBatchProgress, etc. exist),
+      // so we attach them as getters to avoid hoisting issues.
       onAttachmentProgress: (info) => {
         const label = info.label || info.assetId || `#${info.index}`;
         if (info.phase === "start") {
@@ -5236,6 +5260,262 @@
     await persistState();
     renderProgress();
     setStatusLine("info", "Marked as redo. You can re-run Generate Task.");
+  }
+
+  // v0.10.x: Batch processing ------------------------------------------------
+
+  /**
+   * Render the batch progress panel from the orchestrator's batch state.
+   * Called from the onBatchProgress / onBatchTaskComplete callbacks
+   * fired by orchestrator.runBatch.
+   */
+  function renderBatchProgress(info) {
+    if (!batchProgressEl) return;
+    batchProgressEl.hidden = false;
+
+    const total =
+      info.total ?? (orchestrator?.state?.batch?.taskIds.length ?? 0);
+    const completed =
+      info.completed ??
+      (orchestrator?.state?.batch?.completed.length ?? 0);
+    const failed =
+      info.failed ?? (orchestrator?.state?.batch?.failed.length ?? 0);
+    const skipped =
+      info.skipped ?? (orchestrator?.state?.batch?.skipped.length ?? 0);
+    const index =
+      info.index ?? info.currentIndex ?? completed + failed + skipped;
+    const taskId = info.currentTaskId || info.taskId || null;
+    const phase = info.currentPhase || info.phase || null;
+
+    if (batchProgressTitleEl) {
+      batchProgressTitleEl.textContent = `Batch: ${index + (info.type === "finished" ? 0 : 1) || 0}/${total}`;
+      // On finished, show final summary
+      if (info.type === "finished" || !info.active) {
+        const total2 = info.total ?? total;
+        batchProgressTitleEl.textContent = `Batch finished: ${completed}/${total2}`;
+      }
+    }
+    if (batchProgressPhaseEl) {
+      let phaseLabel = phase || "idle";
+      if (info.type === "finished") phaseLabel = "finished";
+      else if (info.type === "task-started") phaseLabel = "preparing";
+      else if (info.type === "task-finished") phaseLabel = "resetting";
+      batchProgressPhaseEl.textContent = taskId
+        ? `${phaseLabel} — ${taskId}`
+        : phaseLabel;
+    }
+    if (batchProgressFillEl) {
+      const pct =
+        total > 0 ? Math.min(100, Math.round(((completed + failed + skipped) / total) * 100)) : 0;
+      batchProgressFillEl.style.width = `${pct}%`;
+    }
+    if (batchProgressCompletedEl) {
+      batchProgressCompletedEl.textContent = `✓ ${completed}`;
+    }
+    if (batchProgressFailedEl) {
+      batchProgressFailedEl.textContent = `✕ ${failed}`;
+    }
+    if (batchProgressSkippedEl) {
+      batchProgressSkippedEl.textContent = `↷ ${skipped}`;
+    }
+
+    // If finished, render the final results list.
+    if (info.type === "finished" || info.cancelled !== undefined) {
+      renderBatchResults(info);
+    } else {
+      renderBatchResults(orchestrator?.state?.batch);
+    }
+  }
+
+  /**
+   * Render the per-task results list (shown inside the <details>).
+   * Always reads from orchestrator.state.batch so we get the full picture.
+   */
+  function renderBatchResults(info) {
+    if (!batchProgressResultsListEl) return;
+    batchProgressResultsListEl.innerHTML = "";
+    const results =
+      (info && info.results) ||
+      (orchestrator?.state?.batch?.results ?? []);
+    for (const r of results) {
+      const li = document.createElement("li");
+      li.className = r.status;
+      const file = r.finalFilename ? ` → ${r.finalFilename}` : "";
+      const err = r.error ? ` (${r.error})` : "";
+      li.textContent = `${r.taskId}${file}${err}`;
+      batchProgressResultsListEl.appendChild(li);
+    }
+  }
+
+  /**
+   * Prompt the user for what to do when a task fails during a batch.
+   * We use a three-button confirm-style flow: by default we STOP
+   * (safest); the user can explicitly choose skip or retry via the
+   * native confirm dialogs.
+   *
+   * Returns "stop" | "skip" | "retry".
+   */
+  function promptBatchFailure(info) {
+    const msg =
+      `Task "${info.taskId}" failed at index ${info.index + 1}/${info.total}:\n\n` +
+      `${info.error}\n\n` +
+      `What would you like to do?\n` +
+      `OK = Stop batch\n` +
+      `Cancel = Skip this task and continue with the next\n\n` +
+      `Press Esc to retry the same task.`;
+    // Use 3-step confirm: first OK=stop, second dialog if not OK=skip,
+    // third if not OK=retry. This keeps it native and accessible.
+    const stop = window.confirm(msg);
+    if (stop) return "stop";
+    const skip = window.confirm(
+      `Skip "${info.taskId}" and continue with the next task?`,
+    );
+    if (skip) return "skip";
+    return "retry";
+  }
+
+  /**
+   * Collect all pending tasks from the loaded project and start a batch.
+   * "Pending" = tasks whose mutable status is missing or not in
+   * {generated, approved}. We preserve the project's task order.
+   */
+  async function onGenerateAll() {
+    if (!orchestrator) {
+      setStatusLine("error", "Orchestrator not ready.");
+      return;
+    }
+    if (!state.source || !state.source.project) {
+      setStatusLine("error", "No project loaded. Import a project JSON first.");
+      return;
+    }
+    const project = state.source.project;
+    const allTasks = Array.isArray(project.tasks) ? project.tasks : [];
+    if (allTasks.length === 0) {
+      setStatusLine("info", "Project has no tasks.");
+      return;
+    }
+
+    // Pending = not yet generated (or marked redo).
+    const pending = allTasks
+      .filter((t) => {
+        const live = state.tasks && state.tasks[t.id];
+        const status = (live && live.status) || t.status || "pending";
+        return status !== "generated" && status !== "approved";
+      })
+      .map((t) => t.id);
+
+    if (pending.length === 0) {
+      setStatusLine("info", "All tasks already generated. Nothing to do.");
+      return;
+    }
+
+    const ok = window.confirm(
+      `Generate ${pending.length} pending task(s) sequentially?\n\n` +
+        `Each task will: Prepare → Generate → Download → Reset chat.\n` +
+        `You can cancel mid-batch via the Cancel Batch button.`,
+    );
+    if (!ok) return;
+
+    logWorkflow("info", "Batch starting", {
+      total: pending.length,
+      taskIds: pending.slice(),
+    });
+    if (batchProgressEl) {
+      batchProgressEl.hidden = false;
+      if (batchProgressResultsListEl) batchProgressResultsListEl.innerHTML = "";
+      if (batchProgressTitleEl)
+        batchProgressTitleEl.textContent = `Batch: 0/${pending.length}`;
+      if (batchProgressFillEl) batchProgressFillEl.style.width = "0%";
+    }
+    if (cancelBatchBtn) cancelBatchBtn.hidden = false;
+
+    // Wrap resetConversationAndAdvance so the orchestrator can call it
+    // between tasks. We strip advanceToNext because the orchestrator
+    // handles the loop and navigation itself.
+    async function resetConversation() {
+      return await resetConversationAndAdvance({
+        advanceToNext: false,
+        source: "batch-reset",
+      }).then((r) => !!r);
+    }
+
+    // shouldContinue: returns false if the user clicks Cancel Batch.
+    let batchCancelled = false;
+    if (cancelBatchBtn) {
+      const cancelListener = () => {
+        batchCancelled = true;
+        if (orchestrator?.state?.batch) {
+          orchestrator.state.batch.cancelled = true;
+        }
+        setStatusLine("info", "Batch cancellation requested…");
+      };
+      cancelBatchBtn.addEventListener("click", cancelListener, { once: true });
+    }
+    const shouldContinue = () => !batchCancelled;
+
+    const summary = await orchestrator.runBatch({
+      taskIds: pending,
+      resetConversation,
+      shouldContinue,
+      maxRetries: 1,
+      onBatchProgress: renderBatchProgress,
+      onBatchTaskComplete: (info) => {
+        logWorkflow(
+          info.status === "completed" ? "info" : "warn",
+          `Batch task ${info.status}`,
+          {
+            taskId: info.taskId,
+            index: info.index,
+            status: info.status,
+            resetOk: info.resetOk,
+            finalFilename: info.finalFilename,
+            error: info.error,
+          },
+        );
+        renderBatchProgress(orchestrator.state.batch);
+      },
+      onBatchPauseRequested: promptBatchFailure,
+      onBatchComplete: (summary) => {
+        if (cancelBatchBtn) cancelBatchBtn.hidden = true;
+        logWorkflow(
+          summary.cancelled ? "warn" : summary.ok ? "ok" : "error",
+          "Batch finished",
+          {
+            total: summary.total,
+            completed: summary.completed,
+            failed: summary.failed,
+            skipped: summary.skipped,
+            cancelled: summary.cancelled,
+            cancelledReason: summary.cancelledReason,
+            durationMs: summary.durationMs,
+          },
+        );
+        setStatusLine(
+          summary.ok ? "ok" : "info",
+          summary.cancelled
+            ? `Batch stopped: ${summary.completed} done, ${summary.failed} failed (${Math.round(summary.durationMs / 1000)}s)`
+            : summary.failed === 0
+              ? `Batch complete: ${summary.completed}/${summary.total} (${Math.round(summary.durationMs / 1000)}s)`
+              : `Batch done with errors: ${summary.completed} ok, ${summary.failed} failed, ${summary.skipped} skipped (${Math.round(summary.durationMs / 1000)}s)`,
+        );
+        renderBatchProgress(summary);
+      },
+    });
+
+    // After batch finishes, re-render to show final state.
+    renderBatchProgress(summary);
+    forceUnlockAllButtons();
+  }
+
+  /**
+   * Show or hide the Generate All button based on context. Visible
+   * only when a project is loaded and no batch is currently running.
+   */
+  function renderGenerateAllButton() {
+    if (!generateAllBtn) return;
+    const hasProject = !!(state.source && state.source.project);
+    const batchActive = !!(orchestrator?.state?.batch?.active);
+    generateAllBtn.hidden = !hasProject || batchActive;
   }
 
   init();

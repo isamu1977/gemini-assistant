@@ -111,6 +111,25 @@
         ? deps.onAttachmentProgress
         : () => {};
     const onLog = typeof deps.onLog === "function" ? deps.onLog : () => {};
+    // v0.10.x: Batch processing callbacks.
+    const onBatchProgress =
+      typeof deps.onBatchProgress === "function" ? deps.onBatchProgress : () => {};
+    const onBatchTaskComplete =
+      typeof deps.onBatchTaskComplete === "function"
+        ? deps.onBatchTaskComplete
+        : () => {};
+    const onBatchComplete =
+      typeof deps.onBatchComplete === "function" ? deps.onBatchComplete : () => {};
+    // onBatchPauseRequested: optional user-provided hook. When set, the
+    // orchestrator calls it whenever a task fails; the hook may return
+    //   "skip"  -> continue with the next task
+    //   "stop"  -> abort the batch (sets cancelled=true)
+    //   "retry" -> retry the same task
+    // If absent or returns null/undefined, the default is "stop".
+    const onBatchPauseRequested =
+      typeof deps.onBatchPauseRequested === "function"
+        ? deps.onBatchPauseRequested
+        : () => "stop";
 
     // The single messaging choke point. Defends against malformed
     // payloads and normalises the error shape so the UI can render a
@@ -161,6 +180,12 @@
       generationCompletionEvidence: null,
       result: null,
       lastGenerateTrace: [],
+      // v0.10.x: Batch processing state. When runBatch() is active, the
+      // orchestrator drives the full lifecycle (prepare → generate →
+      // wait → reset) for a list of tasks without user intervention.
+      // Side panel subscribes via onBatchProgress / onBatchTaskComplete
+      // callbacks to render a progress bar.
+      batch: null, // { active, paused, cancelled, taskIds, currentIndex, completed[], failed[], skipped[], startedAt, finishedAt }
     };
 
     let currentTask = null; // Promise that resolves the in-flight phase.
@@ -1498,6 +1523,388 @@
       return true;
     }
 
+    /**
+     * v0.10.x: Run a batch of tasks end-to-end without user intervention.
+     *
+     * For each task in `params.taskIds`, performs:
+     *   1. prepareTask  (re-uses current orchestrator state)
+     *   2. generateTask
+     *   3. waits for the SW to confirm the download (status=complete)
+     *   4. resets the conversation via the supplied reset callback
+     *      (the side panel owns the "new tab" reset logic)
+     *
+     * Failure handling: if a task fails, calls onBatchPauseRequested
+     * with the failure context. The hook may return:
+     *   "skip"  -> record as skipped and continue
+     *   "stop"  -> cancel the batch
+     *   "retry" -> retry the same task (max 2 retries by default)
+     *   anything else -> treated as "stop"
+     *
+     * Returns a summary:
+     *   { ok, total, completed, failed, skipped, cancelled, results: [{taskId, status, error?}] }
+     *
+     * The orchestrator's lifecycle remains single-tasked (only one
+     * task can be preparing/generating at a time) — runBatch simply
+     * loops sequentially, emitting progress events along the way.
+     *
+     * @param {object} params
+     * @param {string[]} params.taskIds             ordered list of task ids
+     * @param {function} params.resetConversation   async () => boolean
+     *   Side panel-supplied function that closes the current Gemini tab
+     *   and opens a new one. Returns true on success. The orchestrator
+     *   awaits this between every task.
+     * @param {function} [params.shouldContinue]    optional () => boolean
+     *   Called between tasks. If returns false, batch stops cleanly.
+     * @param {number} [params.maxRetries=2]        retries per task on failure
+     */
+    async function runBatch(params) {
+      const taskIds = Array.isArray(params?.taskIds) ? params.taskIds : [];
+      const resetConversation =
+        typeof params?.resetConversation === "function"
+          ? params.resetConversation
+          : async () => false;
+      const shouldContinue =
+        typeof params?.shouldContinue === "function"
+          ? params.shouldContinue
+          : () => true;
+      const maxRetries =
+        typeof params?.maxRetries === "number" && params.maxRetries >= 0
+          ? Math.floor(params.maxRetries)
+          : 2;
+
+      if (taskIds.length === 0) {
+        return {
+          ok: false,
+          total: 0,
+          completed: 0,
+          failed: 0,
+          skipped: 0,
+          cancelled: false,
+          results: [],
+          reason: "no-tasks",
+        };
+      }
+      if (state.batch && state.batch.active) {
+        return {
+          ok: false,
+          total: taskIds.length,
+          completed: 0,
+          failed: 0,
+          skipped: 0,
+          cancelled: false,
+          results: [],
+          reason: "batch-already-running",
+        };
+      }
+
+      const batch = {
+        active: true,
+        paused: false,
+        cancelled: false,
+        taskIds: taskIds.slice(),
+        currentIndex: -1,
+        currentTaskId: null,
+        currentPhase: "idle",
+        completed: [],
+        failed: [],
+        skipped: [],
+        startedAt: Date.now(),
+        finishedAt: null,
+        results: [],
+      };
+      state.batch = batch;
+      recordGenerateTrace("batch-started", {
+        total: taskIds.length,
+        taskIds: taskIds.slice(),
+      });
+      onBatchProgress({
+        type: "started",
+        total: taskIds.length,
+        completed: 0,
+        failed: 0,
+        skipped: 0,
+        currentIndex: -1,
+        currentTaskId: null,
+        currentPhase: "idle",
+      });
+
+      // Helper: wait for the SW to confirm the download for the
+      // current task. Polls orchestrator.state.download.ok with a
+      // generous timeout (90s — covers slow image generation).
+      async function waitForDownloadComplete(taskId, timeoutMs = 90000) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          if (batch.cancelled || !batch.active) return false;
+          const dl = state.download;
+          if (dl && dl.ok === true && dl.status === "complete" && Number.isInteger(dl.downloadId)) {
+            return true;
+          }
+          if (dl && dl.status === "error") {
+            return false;
+          }
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        return false;
+      }
+
+      for (let i = 0; i < taskIds.length; i++) {
+        if (batch.cancelled || !batch.active) break;
+        if (!shouldContinue()) {
+          batch.cancelled = true;
+          batch.cancelledReason = "user-paused";
+          break;
+        }
+        const taskId = taskIds[i];
+        batch.currentIndex = i;
+        batch.currentTaskId = taskId;
+        batch.currentPhase = "preparing";
+        recordGenerateTrace("batch-task-started", { taskId, index: i });
+        onBatchProgress({
+          type: "task-started",
+          taskId,
+          index: i,
+          total: taskIds.length,
+          completed: batch.completed.length,
+          failed: batch.failed.length,
+          skipped: batch.skipped.length,
+        });
+
+        let attempts = 0;
+        let taskOk = false;
+        let taskError = null;
+        while (attempts <= maxRetries && !batch.cancelled) {
+          attempts++;
+          try {
+            // Reset orchestrator state for this task.
+            reset({ id: taskId });
+
+            // 1. Prepare
+            const prepOk = await prepareTask({ taskId, prompt: null });
+            if (!prepOk) {
+              throw new Error(
+                `prepareTask failed: ${state.error?.error || "unknown"}`,
+              );
+            }
+
+            // 2. Generate (status will go through sending ->
+            //    submitted -> waiting-for-generation -> generating ->
+            //    downloading -> task-complete).
+            batch.currentPhase = "generating";
+            onBatchProgress({
+              type: "phase",
+              taskId,
+              index: i,
+              phase: "generating",
+              attempt: attempts,
+            });
+            const genResult = await generateTask({
+              taskId,
+              prompt: null,
+              resolvedRefs: null,
+              generationStartTimeoutMs: 15000,
+              generationTimeoutMs: 60000,
+            });
+            const silentBail =
+              genResult &&
+              typeof genResult === "object" &&
+              genResult.silent === true;
+            if (silentBail) {
+              throw new Error(
+                `generateTask silent-bail: ${genResult.reason || "unknown"}`,
+              );
+            }
+            if (genResult !== true) {
+              throw new Error(
+                `generateTask returned ${JSON.stringify(genResult)}`,
+              );
+            }
+
+            // 3. Wait for SW to confirm download.
+            batch.currentPhase = "downloading";
+            onBatchProgress({
+              type: "phase",
+              taskId,
+              index: i,
+              phase: "downloading",
+              attempt: attempts,
+            });
+            const downloadOk = await waitForDownloadComplete(taskId);
+            if (!downloadOk) {
+              throw new Error(
+                state.download?.error
+                  ? `download failed: ${state.download.error}`
+                  : "download timeout (90s)",
+              );
+            }
+
+            // 4. Mark task complete (idempotent if SW already did).
+            markTaskComplete();
+
+            taskOk = true;
+            taskError = null;
+            break;
+          } catch (e) {
+            taskError = e?.message ?? String(e);
+            recordGenerateTrace("batch-task-attempt-failed", {
+              taskId,
+              index: i,
+              attempt: attempts,
+              error: taskError,
+            });
+            if (attempts > maxRetries) break;
+          }
+        }
+
+        if (taskOk) {
+          // 5. Reset conversation before next task. Best-effort: if it
+          //    fails, record a warning but don't fail the task itself
+          //    (the image is already on disk).
+          batch.currentPhase = "resetting";
+          onBatchProgress({
+            type: "phase",
+            taskId,
+            index: i,
+            phase: "resetting",
+          });
+          let resetOk = true;
+          try {
+            resetOk = await resetConversation();
+            if (!resetOk) {
+              recordGenerateTrace("batch-reset-warning", {
+                taskId,
+                index: i,
+                note: "reset returned false; next task may fail to download",
+              });
+            }
+          } catch (e) {
+            resetOk = false;
+            recordGenerateTrace("batch-reset-exception", {
+              taskId,
+              index: i,
+              error: e?.message ?? String(e),
+            });
+          }
+
+          batch.completed.push({
+            taskId,
+            index: i,
+            downloadId: state.download?.downloadId ?? null,
+            finalFilename:
+              state.download?.finalFilename || state.download?.filename || null,
+            resetOk,
+            completedAt: Date.now(),
+          });
+          batch.results.push({
+            taskId,
+            status: "completed",
+            downloadId: state.download?.downloadId ?? null,
+            finalFilename:
+              state.download?.finalFilename || state.download?.filename || null,
+            resetOk,
+          });
+          onBatchTaskComplete({
+            taskId,
+            status: "completed",
+            index: i,
+            resetOk,
+            downloadId: state.download?.downloadId ?? null,
+            finalFilename:
+              state.download?.finalFilename || state.download?.filename || null,
+          });
+        } else {
+          // Failure path. Ask the user (via callback) what to do.
+          const decision = onBatchPauseRequested({
+            taskId,
+            index: i,
+            total: taskIds.length,
+            error: taskError,
+          });
+          const action =
+            typeof decision === "string"
+              ? decision
+              : (decision && decision.action) || "stop";
+          if (action === "retry" && attempts <= maxRetries) {
+            // Re-loop this task (attempts already incremented;
+            // loop will retry up to maxRetries total).
+            i--;
+            continue;
+          }
+          if (action === "skip") {
+            batch.skipped.push({ taskId, index: i, error: taskError });
+            batch.results.push({ taskId, status: "skipped", error: taskError });
+            onBatchTaskComplete({
+              taskId,
+              status: "skipped",
+              index: i,
+              error: taskError,
+            });
+            // After skip, still try to reset so the next task starts clean.
+            try {
+              await resetConversation();
+            } catch (_) {}
+          } else {
+            // Default: stop the batch on failure (user chose to pause).
+            batch.cancelled = true;
+            batch.cancelledReason = `failed-at-${taskId}`;
+            batch.failed.push({
+              taskId,
+              index: i,
+              error: taskError,
+              attempts,
+            });
+            batch.results.push({
+              taskId,
+              status: "failed",
+              error: taskError,
+              attempts,
+            });
+            onBatchTaskComplete({
+              taskId,
+              status: "failed",
+              index: i,
+              error: taskError,
+              attempts,
+            });
+            break;
+          }
+        }
+
+        onBatchProgress({
+          type: "task-finished",
+          taskId,
+          index: i,
+          total: taskIds.length,
+          completed: batch.completed.length,
+          failed: batch.failed.length,
+          skipped: batch.skipped.length,
+        });
+      }
+
+      batch.active = false;
+      batch.finishedAt = Date.now();
+      const summary = {
+        ok: batch.failed.length === 0 && !batch.cancelled,
+        total: taskIds.length,
+        completed: batch.completed.length,
+        failed: batch.failed.length,
+        skipped: batch.skipped.length,
+        cancelled: batch.cancelled,
+        cancelledReason: batch.cancelledReason || null,
+        results: batch.results.slice(),
+        startedAt: batch.startedAt,
+        finishedAt: batch.finishedAt,
+        durationMs: batch.finishedAt - batch.startedAt,
+      };
+      recordGenerateTrace("batch-finished", summary);
+      onBatchComplete(summary);
+      onBatchProgress({
+        type: "finished",
+        ...summary,
+      });
+
+      return summary;
+    }
+
     return {
       state,
       PHASES,
@@ -1527,6 +1934,8 @@
       clearComposer,
       resetPreparation,
       retryDetection,
+      // v0.10.x: batch processing for "Generate All"
+      runBatch,
       // High-level flows:
       prepareTask,
       generateTask,

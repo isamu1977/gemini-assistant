@@ -131,6 +131,30 @@
             <button id="generate-task-btn" type="button" class="primary full-width" disabled hidden>
               Generate Task
             </button>
+            <button id="generate-all-btn" type="button" class="primary full-width" hidden>
+              🚀 Generate All Pending
+            </button>
+            <button id="cancel-batch-btn" type="button" class="ghost" hidden>
+              Cancel Batch
+            </button>
+            <div id="batch-progress" class="batch-progress" hidden>
+              <div class="batch-progress-header">
+                <strong id="batch-progress-title">Batch: 0/0</strong>
+                <span id="batch-progress-phase"></span>
+              </div>
+              <div class="batch-progress-bar">
+                <div id="batch-progress-fill" class="batch-progress-fill"></div>
+              </div>
+              <div class="batch-progress-stats">
+                <span id="batch-progress-completed" class="batch-stat-completed">✓ 0</span>
+                <span id="batch-progress-failed" class="batch-stat-failed">✕ 0</span>
+                <span id="batch-progress-skipped" class="batch-stat-skipped">↷ 0</span>
+              </div>
+              <details id="batch-progress-results" class="batch-progress-results">
+                <summary>Details</summary>
+                <ul id="batch-progress-results-list"></ul>
+              </details>
+            </div>
             <button id="retry-detection-btn" type="button" class="secondary full-width" hidden>
               Retry Detection
             </button>

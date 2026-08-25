@@ -1040,3 +1040,80 @@ button:disabled {
   from { opacity: 0.4; }
   to { opacity: 1; }
 }
+
+/* v0.10.x: Batch processing UI */
+.batch-progress {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-elev-1);
+  font-size: 12px;
+}
+
+.batch-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+  color: var(--fg);
+}
+
+#batch-progress-phase {
+  color: var(--fg-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.batch-progress-bar {
+  width: 100%;
+  height: 6px;
+  background: var(--bg-elev-2);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.batch-progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 200ms ease-out;
+}
+
+.batch-progress-stats {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.batch-stat-completed { color: #1a8754; }
+.batch-stat-failed    { color: #c0392b; }
+.batch-stat-skipped   { color: #c98a1d; }
+
+.batch-progress-results {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+
+.batch-progress-results summary {
+  cursor: pointer;
+  user-select: none;
+}
+
+.batch-progress-results ul {
+  margin: 4px 0 0 0;
+  padding-left: 14px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.batch-progress-results li {
+  margin-bottom: 2px;
+}
+
+.batch-progress-results li.completed::marker { content: "✓ "; color: #1a8754; }
+.batch-progress-results li.failed::marker    { content: "✕ "; color: #c0392b; }
+.batch-progress-results li.skipped::marker   { content: "↷ "; color: #c98a1d; }

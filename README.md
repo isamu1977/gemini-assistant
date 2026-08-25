@@ -1,6 +1,6 @@
 # Gemini Assistant
 
-> **Status:** Active development (`v0.8.0+`). Plain JavaScript (Manifest V3 Side Panel) — no build step or bundler required.
+> **Status:** Active development (`v0.9.0+`). Plain JavaScript (Manifest V3 Side Panel) — no build step or bundler required.
 
 **Gemini Assistant** is a Chrome extension that turns `gemini.google.com` into a structured, scriptable target for multi-scene creative workflows. It is driven by a **Project JSON**, a **bound local project folder**, and a **list of tasks**. 
 
@@ -188,6 +188,16 @@ node tests/run.js
 
 ## Release History Summary
 
+- **v0.9.0 (Batch processing + per-task reliability):**
+  - **Generate All Pending** — one-click batch that runs every pending task end-to-end (Prepare → Generate → Download → Reset chat) without manual intervention.
+  - Live progress panel: counter, current task, current phase, animated progress bar, per-task results list, cancel button.
+  - Three-tier conversation reset (new Gemini tab → force reload → in-place) for clean state between tasks.
+  - Parallel blob-extraction fallback runs alongside the official Gemini download click so a broken Angular host still downloads the image.
+  - 8s acquisition watchdog extends to 30s while the blob fallback is in flight.
+  - 3-step confirm prompt (Stop / Skip / Retry) on per-task failure during the batch.
+  - Structured `logWorkflow` entries everywhere (Debug panel surfaces real errors with stack traces).
+  - Single canonical download path — removed the v0.6 `downloadImageViaServiceWorker` and `orch.download()` code paths.
+  - Fixed long-standing `ReferenceError: cur is not defined` in `renderPreparationChecklist`.
 - **v0.8.0+ / v0.9.x / v0.10.x:**
   - Official Gemini download button detection (`download-generated-image-button`) with synthetic events and blob fallback.
   - Automatic download completion tracking via `chrome.downloads.onChanged`.
