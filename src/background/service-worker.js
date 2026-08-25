@@ -31,6 +31,20 @@ const GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE = "GEMINI_ASSISTANT_GET_DOWNLOAD_TRACE
 const GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE =
   "GEMINI_ASSISTANT_DOWNLOAD_TRACE_RESPONSE";
 const GEMINI_ASSISTANT_DOWNLOAD_PROBE = "GEMINI_ASSISTANT_DOWNLOAD_PROBE";
+// v0.10.x: Force a complete tab reload to /app (bypasses SPA routing).
+// This is the most reliable way to get a fully fresh Gemini page after
+// a download — location.assign() in the content script sometimes leaves
+// the Angular host in an inconsistent state where the official download
+// button no longer triggers a real chrome.downloads event.
+const GEMINI_ASSISTANT_RELOAD_TAB = "GEMINI_ASSISTANT_RELOAD_TAB";
+
+// v0.10.x: Open a brand-new Gemini tab (and optionally close the old
+// one). This is the most robust reset strategy: the new tab is a
+// 100% fresh page with no Angular state, no SPA cache, no stale
+// click handlers. Use this when in-place reset (reload / New Chat
+// button) keeps leaving the host in an inconsistent state where
+// the official download button stops firing chrome.downloads events.
+const GEMINI_ASSISTANT_OPEN_NEW_TAB = "GEMINI_ASSISTANT_OPEN_NEW_TAB";
 
 const CLAIM_WINDOW_MS = 25_000; // 15-30s per spec; pick the upper-middle.
 
@@ -241,12 +255,19 @@ function findActiveClaimForDownload(download) {
   return null;
 }
 
+// Detect whether a chrome.downloads event was triggered by Gemini
+// (so we know whether to intercept and rename it). We accept:
+//   - gemini.google.com (the host itself)
+//   - googleusercontent.com / lh*.googleusercontent.com (image CDN)
+//   - gstatic.com (Google static assets)
+//   - storage.googleapis.com (sometimes used for generated images)
+//   - prod.geminiprod.com / *.geminiprod.com (Gemini production CDN)
 function isGeminiOriginatedDownload(download) {
   if (!download) return false;
   const url = download.url || "";
   const referrer = download.referrer || "";
   const combined = `${url}\n${referrer}`;
-  return /gemini\.google\.com|lh[0-9]*\.googleusercontent\.com|gstatic\.com/.test(
+  return /(gemini\.google\.com|geminiprod\.com|googleusercontent\.com|googleapis\.com|gstatic\.com)/.test(
     combined,
   );
 }
@@ -574,6 +595,76 @@ if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.onMessage)
         },
         serviceWorkerRuntimeId,
       });
+      return true;
+    }
+    if (msg.type === GEMINI_ASSISTANT_RELOAD_TAB) {
+      // v0.10.x: Force-reload a Gemini tab to /app. We re-navigate via
+      // chrome.tabs.update so the SPA host is fully torn down and rebuilt.
+      const tabId = msg.tabId;
+      const url = msg.url || "https://gemini.google.com/app";
+      if (typeof tabId !== "number") {
+        sendResponse({ ok: false, error: "missing tabId" });
+        return true;
+      }
+      chrome.tabs
+        .update(tabId, { url })
+        .then((tab) => {
+          appendDownloadTrace("tab-reload-requested", {
+            tabId,
+            url,
+            newTabId: tab?.id ?? null,
+          });
+          sendResponse({ ok: true, tabId: tab?.id ?? null });
+        })
+        .catch((e) => {
+          appendDownloadTrace("tab-reload-failed", {
+            tabId,
+            url,
+            error: e?.message ?? String(e),
+          });
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        });
+      return true;
+    }
+    if (msg.type === GEMINI_ASSISTANT_OPEN_NEW_TAB) {
+      // v0.10.x: Open a brand-new Gemini tab. Optionally close the old
+      // one (default: keep it open so the user does not lose context).
+      // The new tab has a 100% fresh Angular host, no SPA cache, no
+      // stale click handlers — guaranteed good state for the next task.
+      const url = msg.url || "https://gemini.google.com/app";
+      const closeOldTabId =
+        typeof msg.closeOldTabId === "number" ? msg.closeOldTabId : null;
+      const makeActive = msg.makeActive !== false; // default true
+      chrome.tabs
+        .create({ url, active: makeActive })
+        .then((newTab) => {
+          appendDownloadTrace("new-tab-opened", {
+            newTabId: newTab?.id ?? null,
+            url,
+            closedOldTabId: closeOldTabId,
+          });
+          if (closeOldTabId !== null) {
+            chrome.tabs
+              .remove(closeOldTabId)
+              .then(() => {
+                appendDownloadTrace("old-tab-closed", { oldTabId: closeOldTabId });
+              })
+              .catch((e) => {
+                appendDownloadTrace("old-tab-close-failed", {
+                  oldTabId: closeOldTabId,
+                  error: e?.message ?? String(e),
+                });
+              });
+          }
+          sendResponse({ ok: true, tabId: newTab?.id ?? null });
+        })
+        .catch((e) => {
+          appendDownloadTrace("new-tab-open-failed", {
+            url,
+            error: e?.message ?? String(e),
+          });
+          sendResponse({ ok: false, error: e?.message ?? String(e) });
+        });
       return true;
     }
     return false;

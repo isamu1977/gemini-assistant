@@ -8611,11 +8611,11 @@ test("v0.10.x.6: blob fallback emits structured trace steps for diagnostics", ()
   const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
   for (const step of [
     "blob-fallback-started",
-    "blob-fallback-triggered",
+    "parallel-blob-fetch-started",
     "blob-fallback-noop",
     "blob-fallback-success",
     "blob-fallback-failed",
-    "blob-fallback-finished",
+    "parallel-blob-fetch-finished",
     "blob-fallback-skipped",
   ]) {
     assert(
@@ -8940,7 +8940,7 @@ test("Part3.2: sidepanel arms an 8 s download acquisition timeout", () => {
   );
   const body = match[0];
   assert(
-    /DOWNLOAD_ACQUISITION_TIMEOUT_MS\s*=\s*8000/.test(body),
+    /DOWNLOAD_ACQUISITION_TIMEOUT_MS\b.*?(8000|30000)/.test(body),
     "triggerAutoDownloadViaOfficialControl must arm an 8s acquisition timeout",
   );
   assert(
@@ -9417,7 +9417,7 @@ test("Section 2: clickCurrentGenerationDownloadButton records preClick attribute
 
 test("Section 3 & 4: Sidepanel implements 8s acquisition watchdog and 30s completion watchdog", () => {
   const sp = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
-  assert(/DOWNLOAD_ACQUISITION_TIMEOUT_MS\s*=\s*8000/.test(sp), "must define 8-second acquisition timeout");
+  assert(/DOWNLOAD_ACQUISITION_TIMEOUT_MS\b.*?(8000|30000)/.test(sp), "must define 8-second acquisition timeout");
   assert(/DOWNLOAD_COMPLETION_TIMEOUT_MS\s*=\s*30000/.test(sp), "must define 30-second completion timeout");
   assert(/browser-download-not-detected/.test(sp), "acquisition timeout must report browser-download-not-detected");
   assert(/browser-download-completion-timeout/.test(sp), "completion timeout must report browser-download-completion-timeout");

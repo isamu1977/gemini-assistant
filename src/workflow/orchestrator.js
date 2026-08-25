@@ -954,6 +954,13 @@
      *
      * Implements Part 18: "One execution may trigger only ONE automatic
      * download. downloadClaimedAt is set BEFORE any await."
+     *
+     * v0.10.x: This used to gate an internal `download()` method. The
+     * orchestrator no longer owns the download lifecycle — the side panel
+     * drives it via triggerAutoDownloadViaOfficialControl after image
+     * detection. We keep claimDownload here so the orchestrator's
+     * generation/idempotency invariants are still enforced when the side
+     * panel uses it.
      */
     function claimDownload() {
       if (state.downloadClaimedAt) {
@@ -961,92 +968,6 @@
       }
       state.downloadClaimedAt = Date.now();
       return { ok: true, claimedAt: state.downloadClaimedAt };
-    }
-
-    /**
-     * Download the current generation's image.
-     *
-     * v0.9.98: extends the original flow with:
-     *   - idempotency via claimDownload (Part 18)
-     *   - lifecycle `status` field on state.download (Part 12)
-     *   - returns a structured result object so callers can branch on
-     *     outcome (e.g. surface "multiple-generated-candidates")
-     */
-    async function download(basename, projectId, mimeOrExt) {
-      transition("downloading");
-      if (!state.generation || !state.generation.imageSrc) {
-        failWith("downloading", "No generated image available to download.");
-        return false;
-      }
-
-      const claim = claimDownload();
-      if (!claim.ok) {
-        recordGenerateTrace("download-skipped", {
-          reason: claim.reason,
-          downloadClaimedAt: state.downloadClaimedAt,
-        });
-        log("warn", "download: claim rejected", { reason: claim.reason });
-        return { ok: false, reason: claim.reason, silent: true };
-      }
-
-      const startedAt = Date.now();
-      state.download = {
-        status: "downloading",
-        startedAt,
-        filename: null,
-        relativePath: null,
-        downloadId: null,
-        sourceType: "image-src",
-        error: null,
-        // Legacy fields preserved for callers that read these:
-        ok: false,
-        finalFilename: null,
-      };
-
-      try {
-        const res = await deps.downloadImage({
-          imageSrc: state.generation.imageSrc,
-          basename,
-          projectId,
-          mimeOrExt,
-          alt: state.generation.alt,
-        });
-        const ok = !!(res && res.ok);
-        state.download = {
-          ...state.download,
-          ok,
-          downloadId: res?.downloadId ?? null,
-          finalFilename: res?.finalFilename ?? null,
-          filename: res?.finalFilename ?? null,
-          relativePath: res?.finalFilename ?? null,
-          error: res?.error ?? null,
-          status: ok ? "complete" : "error",
-          completedAt: Date.now(),
-        };
-        if (!ok) {
-          failWith(
-            "downloading",
-            state.download.error || "Download failed.",
-          );
-          return false;
-        }
-        transition("complete", { download: state.download });
-        return true;
-      } catch (e) {
-        state.download = {
-          ...state.download,
-          ok: false,
-          downloadId: null,
-          finalFilename: null,
-          filename: null,
-          relativePath: null,
-          error: e?.message ?? String(e),
-          status: "error",
-          completedAt: Date.now(),
-        };
-        failWith("downloading", state.download.error);
-        return false;
-      }
     }
 
     async function inspectComposer(expectedPrompt, expectedRefCount) {
@@ -1169,6 +1090,9 @@
 
     /**
      * One-shot detection retry: attempts to find the new result without resending.
+     * Sets state.generation.imageSrc on success and transitions to "downloading"
+     * to mirror generateTask's terminal image-detection transition. The side
+     * panel then drives the download lifecycle via triggerAutoDownloadViaOfficialControl.
      */
     async function retryDetection(baseline) {
       try {
@@ -1184,7 +1108,12 @@
             downloadControl: res.downloadControl ?? null,
             error: null,
           };
-          transition("generated", { generation: state.generation });
+          // Mirror generateTask's post-detection transition. The side panel
+          // owns the download lifecycle from here.
+          transition("downloading", {
+            generation: state.generation,
+            viaRetryDetection: true,
+          });
           return true;
         }
         return false;
@@ -1584,8 +1513,7 @@
       send,
       captureBaseline,
       waitForGeneratedImage,
-      download,
-      // v0.9.98: idempotency guard for auto-download
+      // v0.9.98: idempotency guard for auto-download (still used by side panel)
       claimDownload,
       // v0.10: clean-conversation lifecycle transitions
       markTaskComplete,

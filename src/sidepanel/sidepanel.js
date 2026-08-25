@@ -438,8 +438,8 @@
   }
 
   function setStatusLine(state, text) {
-    statusEl.dataset.state = state;
-    statusText.textContent = text;
+    if (statusEl) statusEl.dataset.state = state;
+    if (statusText) statusText.textContent = text;
   }
 
   function setBusy(busy) {
@@ -1239,14 +1239,24 @@
       return;
     }
 
+    // Task is not yet generated and the download is not complete.
+    // The user wants the chat reset before loading the next task, so we
+    // allow navigation without a full reset in this case. We surface a
+    // warning so the user knows the previous image may not be persisted.
+    appendNextTrace("navigation-without-reset", {
+      reason: "previous-task-not-generated",
+      note: "advancing without Gemini chat reset (download not complete)",
+    });
     const nextId = projectLib.nextTaskId(state.source?.project, state.currentTaskId);
     if (!nextId) {
       appendNextTrace("next-blocked", { reason: "no-next-task" });
       setStatusLine("info", "All tasks completed in project.");
       return;
     }
-
-    appendNextTrace("navigation-started", { targetTaskId: nextId, directNavigate: true });
+    setStatusLine(
+      "info",
+      `Previous task not generated — advancing without chat reset. Click "Reset Gemini Conversation" if needed.`,
+    );
     navigate(nextId).then(() => {
       appendNextTrace("next-task-selected", { taskId: nextId });
       appendNextTrace("next-complete", { success: true });
@@ -1366,11 +1376,90 @@
       advanceToNext,
     });
 
-    // 4. Reset conversation via DOM adapter.
+    // 4. Reset conversation: prefer SW-driven tab reload (forces a full
+    //    page rebuild so the Angular host cannot leave stale state).
     orchestrator.beginConversationReset();
     setStatusLine("info", "Resetting Gemini conversation…");
     renderWorkflowState();
 
+    // 4a. v0.10.x: open a brand-new Gemini tab (most reliable). The
+    //    old tab is closed so we end up with exactly one Gemini tab.
+    //    The new tab has 100% fresh Angular state — no SPA cache, no
+    //    stale click handlers — guaranteed good download behaviour.
+    let newTabId = null;
+    try {
+      const res = await new Promise((resolve) => {
+        chrome.runtime.sendMessage(
+          {
+            type: "GEMINI_ASSISTANT_OPEN_NEW_TAB",
+            url: "https://gemini.google.com/app",
+            closeOldTabId: pinnedGeminiTabId,
+            makeActive: true,
+          },
+          (resp) => {
+            if (chrome.runtime.lastError) {
+              resolve({ ok: false, error: chrome.runtime.lastError.message });
+              return;
+            }
+            resolve(resp || { ok: false, error: "no-response" });
+          },
+        );
+      });
+      appendResetTrace("new-tab-opened-attempt", {
+        ok: !!res?.ok,
+        newTabId: res?.tabId ?? null,
+        closedOldTabId: pinnedGeminiTabId,
+        error: res?.error ?? null,
+      });
+      if (res && res.ok && typeof res.tabId === "number") {
+        newTabId = res.tabId;
+        // Update pinned tab so subsequent messages go to the new tab.
+        pinnedGeminiTabId = newTabId;
+        appendResetTrace("pinned-tab-updated", {
+          previousPinnedTabId: pinnedGeminiTabId,
+          newPinnedTabId: newTabId,
+        });
+      }
+    } catch (e) {
+      appendResetTrace("new-tab-open-exception", {
+        error: e?.message ?? String(e),
+      });
+    }
+
+    // 4b. fallback: ask the service worker to force-reload the tab
+    //    in place. Used when the new-tab approach failed (e.g. pinned
+    //    tab was null).
+    if (!newTabId) {
+      try {
+        const reloadRes = await new Promise((resolve) => {
+          chrome.runtime.sendMessage(
+            {
+              type: "GEMINI_ASSISTANT_RELOAD_TAB",
+              tabId: pinnedGeminiTabId,
+              url: "https://gemini.google.com/app",
+            },
+            (resp) => {
+              if (chrome.runtime.lastError) {
+                resolve({ ok: false, error: chrome.runtime.lastError.message });
+                return;
+              }
+              resolve(resp || { ok: false, error: "no-response" });
+            },
+          );
+        });
+        appendResetTrace("tab-reload-fallback-attempted", {
+          ok: !!reloadRes?.ok,
+          tabId: pinnedGeminiTabId,
+          error: reloadRes?.error ?? null,
+        });
+      } catch (e) {
+        appendResetTrace("tab-reload-fallback-exception", {
+          error: e?.message ?? String(e),
+        });
+      }
+    }
+
+    // 4c. final fallback: ask the content script to navigate in-place.
     let resetRes;
     try {
       resetRes = await sendToGemini(
@@ -1415,7 +1504,7 @@
     try {
       verifyRes = await sendToGemini(
         "GEMINI_ASSISTANT_WAIT_FOR_CLEAN_CONVERSATION",
-        { timeoutMs: 10000 },
+        { timeoutMs: 20000 },
       );
     } catch (e) {
       verifyRes = { ok: false, error: e?.message ?? String(e) };
@@ -3098,6 +3187,17 @@
       );
       forceUnlockAllButtons();
     } else if (msg.state === "in_progress") {
+      logWorkflow(
+        "info",
+        "applyDownloadStateChange: in_progress",
+        {
+          downloadId: msg.downloadId ?? null,
+          filename: msg.filename ?? null,
+          curTaskId: cur?.taskId ?? null,
+          curStatus: cur?.status ?? null,
+          executionId: orchestrator?.state?.executionId ?? null,
+        },
+      );
       // DownloadId acquired; clear acquisition timer and start 30s completion watchdog
       try {
         if (cur.__acquisitionTimer) clearTimeout(cur.__acquisitionTimer);
@@ -3107,6 +3207,14 @@
       if (!cur.__completionTimer) {
         const DOWNLOAD_COMPLETION_TIMEOUT_MS = 30000;
         cur.timeoutDeadline = Date.now() + DOWNLOAD_COMPLETION_TIMEOUT_MS;
+        // Capture the stable orchestrator-scoped identifiers at scheduling
+        // time. Reading from the orchestrator inside the setTimeout closure
+        // is safer than relying on the outer `cur` (which is `state.download`,
+        // a mutable object that may be reassigned by the time the 30s
+        // watchdog fires — see lines below where `orchestrator.state.download`
+        // is replaced with a spread).
+        const capturedExecutionId = orchestrator.state.executionId ?? null;
+        const capturedTaskId = orchestrator.state.taskId ?? null;
         cur.__completionTimer = setTimeout(() => {
           if (!orchestrator || !orchestrator.state || !orchestrator.state.download) return;
           const d = orchestrator.state.download;
@@ -3115,8 +3223,8 @@
             timeoutMs: DOWNLOAD_COMPLETION_TIMEOUT_MS,
             downloadStatus: d.status,
             downloadId: d.downloadId ?? null,
-            executionId: orchestrator.state.executionId,
-            taskId: cur.taskId ?? null,
+            executionId: capturedExecutionId,
+            taskId: capturedTaskId,
             reason: "browser-download-completion-timeout",
           });
           try {
@@ -3188,7 +3296,28 @@
     workflowLogEl.hidden = false;
     const li = document.createElement("li");
     li.dataset.level = level;
-    li.textContent = `[${level}] ${message}`;
+    // Compose the visible text. When info is provided we serialise the
+    // primitive fields so the Debug card becomes useful for triaging live
+    // errors (e.g. ReferenceError "cur is not defined") without needing to
+    // open Chrome DevTools.
+    let text = `[${level}] ${message}`;
+    if (info && typeof info === "object") {
+      const parts = [];
+      for (const k of Object.keys(info)) {
+        const v = info[k];
+        if (v === undefined || v === null) continue;
+        if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") {
+          parts.push(`${k}=${JSON.stringify(v)}`);
+        } else if (v instanceof Error) {
+          parts.push(`${k}=Error(${v.message})`);
+        } else if (typeof v === "object") {
+          try { parts.push(`${k}=${JSON.stringify(v).slice(0, 240)}`); } catch (_) {}
+        }
+      }
+      if (parts.length > 0) text += ` ${parts.join(" ")}`;
+    }
+    li.textContent = text;
+    li.title = text;
     workflowLogEl.appendChild(li);
     // Cap log size.
     while (workflowLogEl.children.length > 50) {
@@ -3353,7 +3482,7 @@
       // 5e. Task Complete
       let taskStatus = "waiting";
       let taskLabel = "Task complete";
-      if (s.phase === "task-complete" || (cur && cur.status === "generated")) {
+      if (s.phase === "task-complete" || (task && task.status === "generated")) {
         taskStatus = "ok";
         taskLabel = "Task complete (✓)";
       }
@@ -3684,7 +3813,8 @@
     if (orchestrator) return orchestrator;
     orchestrator = orchestratorLib.createOrchestrator({
       sendToTab: (msg) => sendToGemini(msg.type, msg),
-      downloadImage: downloadImageViaServiceWorker,
+      // Note: download lifecycle is owned by the side panel (triggerAutoDownloadViaOfficialControl).
+      // The orchestrator no longer accepts a downloadImage dependency.
       onPhaseChange: (phase, info) => {
         logWorkflow("phase", `${info?.prev ?? "?"} → ${phase}`);
         renderWorkflowState();
@@ -3713,69 +3843,6 @@
       },
     });
     return orchestrator;
-  }
-
-  /**
-   * Fetch the generated image (via the content script, where session
-   * cookies are available) and forward the bytes to the service worker
-   * for chrome.downloads.
-   */
-  async function downloadImageViaServiceWorker({ imageSrc, basename, projectId, mimeOrExt }) {
-    if (!orchestrator) {
-      return { ok: false, error: "no orchestrator" };
-    }
-    // 1. Ask the content script to fetch the image as ArrayBuffer.
-    let fetched;
-    try {
-      fetched = await sendToGemini("GEMINI_ASSISTANT_FETCH_IMAGE", {
-        url: imageSrc,
-      });
-    } catch (e) {
-      return { ok: false, error: `fetch via content script failed: ${e?.message ?? String(e)}` };
-    }
-    if (!fetched || !fetched.ok) {
-      return { ok: false, error: fetched?.error || "fetch failed" };
-    }
-
-    // 2. Compute filename and folder via outputLib.
-    const folder = outputLib.buildDownloadFolder(projectId);
-    const file = outputLib.buildDownloadFilename(basename, fetched.mime || mimeOrExt);
-    if (!file) {
-      return { ok: false, error: "Could not derive filename (basename or mime invalid)" };
-    }
-    const finalFilename = folder ? `${folder}/${file}` : file;
-
-    // 3. Forward to service worker for chrome.downloads.
-    let dl;
-    try {
-      dl = await new Promise((resolve, reject) => {
-        chrome.runtime.sendMessage(
-          {
-            type: "GEMINI_ASSISTANT_DOWNLOAD_BLOB",
-            arrayBuffer: fetched.arrayBuffer, // structured-cloned across contexts
-            filename: finalFilename,
-            mime: fetched.mime || mimeOrExt || "application/octet-stream",
-          },
-          (resp) => {
-            if (chrome.runtime.lastError) {
-              reject(new Error(chrome.runtime.lastError.message));
-              return;
-            }
-            resolve(resp);
-          },
-        );
-      });
-    } catch (e) {
-      return { ok: false, error: `download bridge failed: ${e?.message ?? String(e)}` };
-    }
-    if (!dl || !dl.ok) {
-      return { ok: false, error: dl?.error || "download failed" };
-    }
-    return {
-      ok: true,
-      downloadId: dl.downloadId,
-      finalFilename: dl.finalFilename,
-    };
   }
 
   async function onEnsureImageMode() {
@@ -4055,6 +4122,19 @@
    * Retry Download button.
    */
   async function triggerBlobExtractionFallback(cur, baseline) {
+    try {
+    logWorkflow(
+      "info",
+      "triggerBlobExtractionFallback entered",
+      {
+        hasOrchestrator: !!orchestrator,
+        hasCur: !!cur,
+        curId: cur?.id ?? null,
+        curIsCancelled: orchestrator?.state?.cancelled ?? null,
+        curDlStatus: orchestrator?.state?.download?.status ?? null,
+        curDlDownloadId: orchestrator?.state?.download?.downloadId ?? null,
+      },
+    );
     if (!orchestrator || !cur) return false;
     if (orchestrator.state.cancelled) return false;
     const cur_dl = orchestrator.state.download;
@@ -4067,12 +4147,24 @@
       });
       return false;
     }
+    // If status is error/failed, recover by clearing the error state
+    // and resetting downloadClaimedAt so the SW can re-acquire.
     if (cur_dl.status === "complete" || cur_dl.status === "error") {
-      appendDownloadTrace("blob-fallback-skipped", {
-        reason: "download-already-terminal",
-        status: cur_dl.status,
-      });
-      return false;
+      logWorkflow(
+        "info",
+        "Blob-fallback recovering from terminal status",
+        { priorStatus: cur_dl.status, priorError: cur_dl.error ?? null },
+      );
+      // Recover: clear error state, keep the download slot available.
+      orchestrator.state.download = {
+        ...cur_dl,
+        status: "blob-fallback-recovering",
+        ok: false,
+        error: null,
+        completedAt: null,
+      };
+      orchestrator.state.downloadClaimedAt = null;
+      // Fall through to blob fetch — do NOT return false.
     }
 
     appendDownloadTrace("blob-fallback-started", {
@@ -4193,9 +4285,34 @@
     renderWorkflowState();
     setStatusLine("info", `Blob fallback download ${dl.downloadId} armed. Awaiting browser completion…`);
     return true;
+    } catch (e) {
+      logWorkflow("error", "triggerBlobExtractionFallback THREW", {
+        error: e?.message ?? String(e),
+        name: e?.name,
+        stack: typeof e?.stack === "string" ? e.stack.split("\n").slice(0, 8).join(" | ") : null,
+        taskId: cur?.id ?? null,
+      });
+      appendDownloadTrace("blob-fallback-threw", {
+        error: e?.message ?? String(e),
+      });
+      return false;
+    }
   }
 
   async function triggerAutoDownloadViaOfficialControl(cur) {
+    logWorkflow(
+      "info",
+      "triggerAutoDownload entered",
+      {
+        curDefined: cur !== undefined,
+        curNull: cur === null,
+        curType: typeof cur,
+        curId: cur?.id ?? null,
+        curHasTitle: typeof cur?.title === "string",
+        executionId: orchestrator?.state?.executionId ?? null,
+        orchPhase: orchestrator?.state?.phase ?? null,
+      },
+    );
     appendDownloadTrace("auto-download-function-entered", {
       taskId: cur?.id ?? null,
       executionId: orchestrator?.state?.executionId ?? null,
@@ -4297,6 +4414,16 @@
           },
         );
       });
+      logWorkflow(
+        "info",
+        "SW arm-download responded",
+        {
+          ok: !!armRes?.ok,
+          error: armRes?.error ?? null,
+          claim: armRes?.claim ? { taskId: armRes.claim.taskId, desiredFilename: armRes.claim.desiredFilename } : null,
+          taskId: cur?.id ?? null,
+        },
+      );
       if (!armRes || !armRes.ok) {
         const armErr = (armRes && armRes.error) || "arm-failed";
         orchestrator.state.download = {
@@ -4362,6 +4489,18 @@
     const clickRes = await sendToGemini(
       "GEMINI_ASSISTANT_CLICK_OFFICIAL_DOWNLOAD",
       { baseline },
+    );
+    logWorkflow(
+      "info",
+      "Official-click responded",
+      {
+        ok: !!clickRes?.ok,
+        error: clickRes?.error ?? null,
+        reason: clickRes?.reason ?? null,
+        ariaLabel: clickRes?.ariaLabel ?? null,
+        candidateCount: clickRes?.candidateCountGlobal ?? clickRes?.candidateCountInsideCurrentResponse ?? null,
+        taskId: cur?.id ?? null,
+      },
     );
     if (!clickRes || !clickRes.ok) {
       const clickErr = (clickRes && (clickRes.reason || clickRes.error)) || "click-failed";
@@ -4459,9 +4598,28 @@
         clearTimeout(activeBlobFallback);
       }
     } catch (_) {}
+    logWorkflow(
+      "info",
+      "Scheduling blob-extraction fallback",
+      {
+        afterMs: FALLBACK_BLOB_AFTER_MS,
+        downloadStatus: orchestrator?.state?.download?.status ?? null,
+        taskId: cur?.id ?? null,
+      },
+    );
     activeBlobFallback = setTimeout(() => {
       activeBlobFallback = null;
       const cur = orchestrator.state.download;
+      logWorkflow(
+        "info",
+        "Blob-fallback timer fired",
+        {
+          hasCur: !!cur,
+          curStatus: cur?.status ?? null,
+          curDownloadId: cur?.downloadId ?? null,
+          taskId: capturedTaskId,
+        },
+      );
       if (!cur) return;
       if (cur.downloadId) {
         appendDownloadTrace("blob-fallback-noop", {
@@ -4470,10 +4628,17 @@
         });
         return;
       }
+      // If the watchdog already fired and flipped status to error, the
+      // blob fallback MUST still run — that's the whole point of having
+      // a fallback. We accept status === "error" as well and recover
+      // from it; the orchestrator.markDownloadFailed state is reset
+      // implicitly when status flips to blob-fallback-fetching below.
       if (
         cur.status !== "waiting-browser-download" &&
         cur.status !== "clicking" &&
-        cur.status !== "arming"
+        cur.status !== "arming" &&
+        cur.status !== "error" &&
+        cur.status !== "failed"
       ) {
         appendDownloadTrace("blob-fallback-noop", {
           reason: "status-not-eligible",
@@ -4481,29 +4646,43 @@
         });
         return;
       }
-      appendDownloadTrace("blob-fallback-triggered", {
-        afterMs: FALLBACK_BLOB_AFTER_MS,
-        status: cur.status,
+      // v0.10.x: KICK OFF THE BLOB FETCH IMMEDIATELY (no 4s wait).
+      // The Gemini Angular host's click handler is unreliable after a
+      // conversation reset — sometimes the button is visually present
+      // but clicking it does NOT dispatch a real chrome.downloads
+      // event. Running the blob fetch in parallel with the click (and
+      // no delay) guarantees we have a working download path even when
+      // the official click fails.
+      //
+      // The fetch is idempotent: if the click succeeds first and sets
+      // downloadId, the fetch path will skip itself (see early-return
+      // in triggerBlobExtractionFallback when cur_dl.downloadId is set).
+      const task = currentTask();
+      appendDownloadTrace("parallel-blob-fetch-started", {
         executionId: capturedExecutionId,
         taskId: capturedTaskId,
+        note: "v0.10.x: bypasses 4s wait — runs in parallel with official click",
       });
-      // Re-enter the click handler's scope: re-read `cur` (the
-      // function parameter shadows the outer cur used by retry).
-      const task = currentTask();
       triggerBlobExtractionFallback(task || cur, capturedBaseline)
         .then((ok) => {
-          appendDownloadTrace("blob-fallback-finished", { ok });
+          appendDownloadTrace("parallel-blob-fetch-finished", { ok });
         })
         .catch((e) => {
-          appendDownloadTrace("blob-fallback-finished", {
+          appendDownloadTrace("parallel-blob-fetch-finished", {
             ok: false,
             error: e?.message ?? String(e),
           });
         });
-    }, FALLBACK_BLOB_AFTER_MS);
+    }, 0); // 0ms delay — fire immediately, in parallel with official click
 
     // 8-second Acquisition Watchdog
-    const DOWNLOAD_ACQUISITION_TIMEOUT_MS = 8000;
+    // NOTE: When the blob-fallback timer is scheduled, we extend the
+    // watchdog timeout to give the fallback fetch a fair chance to
+    // complete (it may take 5-10s to fetch from Google's CDN with
+    // session cookies). The fallback cancels the watchdog explicitly
+    // when it succeeds via downloadId acquisition.
+    const fallbackIsScheduled = !!activeBlobFallback;
+    const DOWNLOAD_ACQUISITION_TIMEOUT_MS = fallbackIsScheduled ? 30000 : 8000;
     try {
       if (orchestrator.state.download.__acquisitionTimer) {
         clearTimeout(orchestrator.state.download.__acquisitionTimer);
@@ -4816,11 +4995,28 @@
         appendDownloadTrace("workflow-unlocked", {
           reason: "download-arm-exception",
           error: e?.message ?? String(e),
+          errorName: e?.name,
+          stackHead: typeof e?.stack === "string" ? e.stack.split("\n").slice(0, 5).join(" | ") : null,
           previousDownloadClaim: downloadStateBeforeArm.activeDownloadClaim,
           currentDownloadClaim: downloadStateAfterArm.activeDownloadClaim,
           downloadStateBeforeArm,
           downloadStateAfterArm,
         });
+        // Emit to the on-screen Debug card so the user can see the error
+        // without opening DevTools. Include error name + first 5 lines of
+        // stack so we can pinpoint the exact frame that triggered the throw.
+        logWorkflow(
+          "error",
+          "Auto-download exception",
+          {
+            error: e?.message ?? String(e),
+            name: e?.name,
+            stack: typeof e?.stack === "string" ? e.stack.split("\n").slice(0, 5).join(" | ") : null,
+            taskId: cur?.id ?? null,
+            executionId: orchestrator?.state?.executionId ?? null,
+            orchPhase: orchestrator?.state?.phase ?? null,
+          },
+        );
         setStatusLine("error", `Auto-download error: ${e?.message ?? String(e)}`);
       }
     } else if (isSilentBail) {
@@ -4914,24 +5110,22 @@
     const orch = ensureOrchestrator();
     const detected = await orch.retryDetection();
     if (detected) {
-      setStatusLine("info", "Result found! Downloading image…");
+      setStatusLine("info", "Result found! Triggering download…");
+      // v0.10.x: drive the same official-control flow used by onGenerateTask.
+      // Manual retry-detection no longer goes through the legacy orch.download
+      // path (removed in this revision). All downloads now share one lifecycle:
+      // arm claim → click official button → wait for SW → reconcile state.
       const cur = currentTask();
-      const basename =
-        (outputLib &&
-          projectLib.resolveTaskOutputBasename(state.source.project, cur.id)) ||
-        cur.id;
-      const dlOk = await orch.download(basename, state.source.project.project.id, "image/png");
-      if (dlOk) {
-        const cur_mut = currentMutable();
-        if (cur_mut && cur_mut.status !== "generated") {
-          cur_mut.status = "generated";
-          await persistState();
-          renderProgress();
+      try {
+        const dlOk = await triggerAutoDownloadViaOfficialControl(cur);
+        if (!dlOk) {
+          setStatusLine(
+            "error",
+            "Download was not detected by Chrome. Use Retry Download.",
+          );
         }
-        setStatusLine("ok", `Generated ${cur.title || cur.id}. Downloaded ${orch.state.download?.finalFilename || basename + ".png"}.`);
-        try { await orch.clearComposer(); } catch (_) {}
-      } else {
-        setStatusLine("error", `Download failed: ${orch.state.download?.error || "unknown"}`);
+      } catch (e) {
+        setStatusLine("error", `Retry detection download error: ${e?.message ?? String(e)}`);
       }
     } else {
       setStatusLine("error", "Retry detection: No new generated image found yet.");

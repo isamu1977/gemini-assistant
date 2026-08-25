@@ -4790,22 +4790,38 @@
       const currentUrl =
         typeof location !== "undefined" ? location.href : previousUrl;
       const currentConversationId = extractConversationId(currentUrl);
-      // After a successful reset the conversation id should change OR
-      // (if Gemini kept the same URL) the composer must be empty. We
-      // accept either signal.
+      // After a successful reset, accept either signal:
+      //   (A) URL changed — strong evidence of new conversation, OR
+      //   (B) Composer is fully clean AND no generation in progress — the
+      //       chat may have been cleared in-place without URL changing.
+      // This handles Gemini's two reset behaviours: navigation to /app AND
+      // in-place "New conversation" that keeps the same URL.
       const urlChanged =
         !previousConversationId ||
         !currentConversationId ||
-        previousConversationId !== currentConversationId;
+        previousConversationId !== currentConversationId ||
+        currentUrl !== previousUrl;
       const composerClean =
         snap.composerFound &&
         snap.composerTextLength === 0 &&
         snap.attachmentCount === 0 &&
         snap.pendingUploadCount === 0;
+      // Strong signal: composer fully clean + no active generation.
+      // Weak signal (also acceptable): previous conversation id was set
+      // and current conversation id is empty (Gemini dropped the id).
+      const lostConversationId =
+        !!previousConversationId && !currentConversationId;
       const ready =
-        composerClean &&
-        !snap.generationActive &&
-        (urlChanged || currentUrl !== previousUrl);
+        (!snap.generationActive &&
+          composerClean &&
+          (urlChanged || lostConversationId)) ||
+        // Final fallback: if we've waited at least 4s and the composer
+        // is clean with no generation, accept it. Gemini sometimes
+        // serves the clean state without changing URL or conversation id.
+        (Date.now() - startMs >= 4000 &&
+          composerClean &&
+          !snap.generationActive &&
+          attempts >= 12);
 
       if (ready) {
         return {
