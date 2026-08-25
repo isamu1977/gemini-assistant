@@ -154,11 +154,14 @@ Schema v3 introduces the `generation` block, enabling global style definitions t
 
 ```text
 Side Panel (UI)
-  │  Uses projectLib, storageLib, assetsLib, outputLib
-  │  State machine: idle → preparing → ready → generating → downloading → complete
+  │  Uses projectLib, storageLib, assetsLib, outputLib, orchestratorLib
+  │  Per-task state machine: idle → preparing → ready → generating → downloading → complete
+  │  Batch (v0.9.0+): Generate All Pending drives runBatch() across all pending tasks
   ▼
 Service Worker (Background)
-  │  Manages Side Panel registration & hooks chrome.downloads.onDeterminingFilename
+  │  Manages Side Panel registration, chrome.downloads lifecycle,
+  │  new-tab reset (GEMINI_ASSISTANT_OPEN_NEW_TAB), force-reload reset
+  │  (GEMINI_ASSISTANT_RELOAD_TAB)
   ▼
 Content Script (Runs in gemini.google.com)
   │  Message bridge (GEMINI_ASSISTANT_*) via src/lib/messaging.js
@@ -167,6 +170,9 @@ Gemini DOM Adapter (src/dom/geminiDomAdapter.js)
   │  ⭐ Isolated DOM manipulation: composer input, file upload DataTransfer,
   │  mode toggle, response detection, official download button triggering
 ```
+
+For details on the batch processing architecture (lifecycle, callbacks,
+state, error handling, debugging), see [`docs/BATCH_PROCESSING.md`](docs/BATCH_PROCESSING.md).
 
 ---
 
@@ -185,6 +191,12 @@ node tests/run.js
 - Messaging protocol, watchdog timers, download lifecycle, and race condition recovery.
 
 ---
+
+## Documentation
+
+- **[`docs/BATCH_PROCESSING.md`](docs/BATCH_PROCESSING.md)** — Detailed architecture, lifecycle, and operational notes for the v0.9.0 Generate All Pending workflow.
+- **[`AGENTS.md`](AGENTS.md)** — Authoritative specification for AI agents generating Project JSON packages for Gemini Assistant.
+- **[`tests/MANUAL_TESTS_V0_6.md`](tests/MANUAL_TESTS_V0_6.md)** — Manual test matrix for end-to-end verification in a real Chrome browser.
 
 ## Release History Summary
 
