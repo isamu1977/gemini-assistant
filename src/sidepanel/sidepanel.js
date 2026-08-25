@@ -5380,13 +5380,18 @@
    * {generated, approved}. We preserve the project's task order.
    */
   async function onGenerateAll() {
-    if (!orchestrator) {
-      setStatusLine("error", "Orchestrator not ready.");
-      return;
-    }
     if (!state.source || !state.source.project) {
       setStatusLine("error", "No project loaded. Import a project JSON first.");
       return;
+    }
+    // Lazy-init: orchestrator is created on first use. Match the
+    // pattern used by onGenerateTask / onRetryDownload / etc.
+    if (!orchestrator) {
+      const created = ensureOrchestrator();
+      if (!created) {
+        setStatusLine("error", "Orchestrator not ready.");
+        return;
+      }
     }
     const project = state.source.project;
     const allTasks = Array.isArray(project.tasks) ? project.tasks : [];
