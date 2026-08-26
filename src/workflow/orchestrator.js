@@ -1679,7 +1679,27 @@
             reset({ id: taskId });
 
             // 1. Prepare
-            const prepOk = await prepareTask({ taskId, prompt: null });
+            // The orchestrator's prepareTask requires a prompt string
+            // (orchestrator.js line 1058: "isString(params.prompt)"). We
+            // resolve the prompt + resolvedRefs from the side panel's
+            // taskResolverLookup hook (set via runBatch params). This
+            // keeps the orchestrator itself free of UI/Project JSON
+            // concerns.
+            const taskInput =
+              typeof params.taskResolverLookup === "function"
+                ? params.taskResolverLookup(taskId)
+                : null;
+            if (!taskInput || !isString(taskInput.prompt)) {
+              throw new Error(
+                `runBatch: taskResolverLookup('${taskId}') did not return a valid prompt. ` +
+                  `Supply params.taskResolverLookup in the side-panel runBatch wrapper.`,
+              );
+            }
+            const prepOk = await prepareTask({
+              taskId,
+              prompt: taskInput.prompt,
+              resolvedRefs: taskInput.resolvedRefs || null,
+            });
             if (!prepOk) {
               throw new Error(
                 `prepareTask failed: ${state.error?.error || "unknown"}`,

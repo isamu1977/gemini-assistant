@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Assistant",
-  "version": "0.9.4",
+  "version": "0.9.5",
   "description": "Generic project and task manager for gemini.google.com. v0.8.0: full single-task workflow (Prepare Task -> User Review -> Generate Task -> Detect Result -> Download -> Rename -> Complete).",
   "minimum_chrome_version": "116",
 

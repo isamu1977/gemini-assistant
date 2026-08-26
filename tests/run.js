@@ -2001,6 +2001,10 @@ test("orchestrator: runBatch processes multiple tasks and reports summary", asyn
   const events = [];
   const { orch } = makeOrchestrator();
   const resetCalls = [];
+  // v0.9.4: prepareTask needs a prompt; runBatch now resolves it via
+  // the taskResolverLookup callback. Provide a stub that returns the
+  // same shape the side panel does.
+  const fakeResolved = [makeFakeResolvedRef("a", "A")];
   const summary = await orch.runBatch({
     taskIds: ["scene-001", "scene-002", "scene-003"],
     resetConversation: async () => {
@@ -2009,6 +2013,12 @@ test("orchestrator: runBatch processes multiple tasks and reports summary", asyn
     },
     shouldContinue: () => true,
     maxRetries: 0,
+    taskResolverLookup: () => ({
+      prompt: "fake-prompt",
+      resolvedRefs: fakeResolved,
+      basename: "scene",
+      projectId: "proj",
+    }),
     onBatchProgress: (e) => events.push({ type: e.type, total: e.total }),
     onBatchComplete: () => {},
   });

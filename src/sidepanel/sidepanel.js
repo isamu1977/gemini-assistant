@@ -5379,6 +5379,52 @@
    * "Pending" = tasks whose mutable status is missing or not in
    * {generated, approved}. We preserve the project's task order.
    */
+  /**
+   * Resolve the prompt string + references for a given task id, in the
+   * same shape that the manual Prepare Task path uses (buildFinalPrompt
+   * + resolvedRefsCache). Used by runBatch via the taskResolverLookup
+   * callback so the orchestrator never has to know about the project
+   * JSON directly.
+   *
+   * Returns { prompt, resolvedRefs, basename, projectId } or null when
+   * the task cannot be resolved (project not loaded, task missing,
+   * references not resolved yet).
+   */
+  async function resolveTaskInputForBatch(taskId) {
+    const project = state.source && state.source.project;
+    if (!project) return null;
+    const task = project.tasks.find((t) => t && t.id === taskId);
+    if (!task) return null;
+    const liveTask = state.tasks && state.tasks[taskId];
+    // Use the live editable prompt if the user has edited it; otherwise
+    // the project JSON's prompt.
+    const prompt = (liveTask && liveTask.prompt) || task.prompt || "";
+    if (!prompt) return null;
+    const finalPrompt = projectLib.buildFinalPrompt(project, {
+      ...task,
+      id: taskId,
+      prompt,
+    });
+    // Resolved refs must come from the live resolvedRefsCache; if the
+    // cache is null, the user hasn't bound a folder or hasn't run Prepare
+    // yet. In that case, fall back to an empty resolvedRefs array — the
+    // orchestrator will skip attachment if there are none.
+    const refs = Array.isArray(resolvedRefsCache) ? resolvedRefsCache : [];
+    // Filter to only refs that match this task's references array.
+    const taskRefIds = new Set(task.references || []);
+    const filteredRefs = refs.filter((r) => taskRefIds.has(r.id));
+    const basename =
+      (liveTask && liveTask.output && liveTask.output.basename) ||
+      (task.output && task.output.basename) ||
+      taskId;
+    return {
+      prompt: finalPrompt,
+      resolvedRefs: filteredRefs,
+      basename,
+      projectId: project.project && project.project.id,
+    };
+  }
+
   async function onGenerateAll() {
     logWorkflow("info", "Generate All clicked (v0.9.2 debug)", {
       hasSource: !!state.source,
@@ -5507,6 +5553,7 @@
 
     const summary = await orchestrator.runBatch({
       taskIds: targetIds,
+      taskResolverLookup: resolveTaskInputForBatch,
       resetConversation,
       shouldContinue,
       maxRetries: 1,
