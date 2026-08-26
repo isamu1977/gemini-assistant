@@ -5380,6 +5380,17 @@
    * {generated, approved}. We preserve the project's task order.
    */
   async function onGenerateAll() {
+    logWorkflow("info", "Generate All clicked (v0.9.2 debug)", {
+      hasSource: !!state.source,
+      hasProject: !!(state.source && state.source.project),
+      taskCount:
+        state.source && state.source.project
+          ? (state.source.project.tasks || []).length
+          : 0,
+      orchestratorDefined: typeof orchestrator !== "undefined",
+      orchestratorNotNull: !!orchestrator,
+      stateKeys: state ? Object.keys(state).slice(0, 8) : [],
+    });
     if (!state.source || !state.source.project) {
       setStatusLine("error", "No project loaded. Import a project JSON first.");
       return;
@@ -5388,6 +5399,11 @@
     // pattern used by onGenerateTask / onRetryDownload / etc.
     if (!orchestrator) {
       const created = ensureOrchestrator();
+      logWorkflow("info", "ensureOrchestrator returned", {
+        ok: !!created,
+        type: typeof created,
+        orchestratorNowSet: !!orchestrator,
+      });
       if (!created) {
         setStatusLine("error", "Orchestrator not ready.");
         return;
