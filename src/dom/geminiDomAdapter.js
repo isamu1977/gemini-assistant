@@ -2649,6 +2649,23 @@
       // icons (typically <50px) and not-yet-loaded placeholders.
       if (w < 100 && h < 100) continue;
 
+      // v0.9.11: reject blob: URLs. The Gemini Angular host renders
+      // images the user just attached (and previews of the most recent
+      // generation) as <img src='blob:https://gemini.google.com/...'>.
+      // Those are uploaded files or attachment previews, NOT new
+      // generations: alt is typically 'Uploaded image preview' and the
+      // response container has no 'Baixar imagem' button. The
+      // orchestrator was treating them as completion in <100ms, so the
+      // batch download never found a real download control and aborted
+      // every task.
+      //
+      // A real generation lands in the same response container but with
+      // a stable lh3.googleusercontent.com/gg-dl/... URL — those survive
+      // our filter and feed the SW download path normally.
+      if (/^blob:/i.test(src)) {
+        continue;
+      }
+
       // Try to find a download control near this image for observability.
       const container = typeof img.closest === "function"
         ? img.closest("model-response, .model-response, [data-test-id='model-response']")
