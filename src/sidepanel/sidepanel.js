@@ -5467,10 +5467,42 @@
       orchestratorDefined: typeof orchestrator !== "undefined",
       orchestratorNotNull: !!orchestrator,
       stateKeys: state ? Object.keys(state).slice(0, 8) : [],
+      hasResolvedRefsCache: Array.isArray(resolvedRefsCache),
+      resolvedRefsCacheLength: Array.isArray(resolvedRefsCache)
+        ? resolvedRefsCache.length
+        : 0,
     });
     if (!state.source || !state.source.project) {
       setStatusLine("error", "No project loaded. Import a project JSON first.");
       return;
+    }
+    // v0.9.10: Refuse to start if Prepare Task has never been run.
+    // Without resolvedRefsCache, every task would generate with empty
+    // references — Gemini attaches the images uploaded by the side
+    // panel's file picker, then 'completes' in <100ms with
+    // alt='Uploaded image preview' and no download button. Folding
+    // that mistake into the batch aborts every task and burns an
+    // entire batch on a known-broken precondition.
+    if (
+      !Array.isArray(resolvedRefsCache) ||
+      resolvedRefsCache.length === 0
+    ) {
+      const proceedAnyway = window.confirm(
+        `Prepare Task has not been run yet, so the references folder is not bound.\n\n` +
+          `If you continue now, every task in the batch will generate WITHOUT its reference images. ` +
+          `Gemini will likely respond to the bare prompt by previewing whatever is already attached to the chat, ` +
+          `completing in milliseconds with no "Baixar imagem" button — leading to download failures.\n\n` +
+          `Recommended: Cancel and click "Prepare Task" once first.\n\n` +
+          `Press OK to continue anyway (NOT recommended).\n` +
+          `Press Cancel to go back.`,
+      );
+      if (!proceedAnyway) {
+        setStatusLine("info", "Batch cancelled. Run Prepare Task once first.");
+        return;
+      }
+      logWorkflow("warn", "Batch starting without resolved refs cache", {
+        note: "user accepted the warning",
+      });
     }
     // Lazy-init: orchestrator is created on first use. Match the
     // pattern used by onGenerateTask / onRetryDownload / etc.

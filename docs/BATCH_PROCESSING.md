@@ -163,6 +163,12 @@ Result: **444/444 pass**.
 
 ## Operational Notes
 
+- **Prepare Task prerequisite**: v0.9.10+ refuses to start a batch if
+  `resolvedRefsCache` is empty. The user must run Prepare Task once on
+  any task (binds the references folder, populates the ref cache) before
+  Generate All Pending will function correctly. The button still
+  triggers, but a confirmation dialog warns and recommends the user
+  cancel, run Prepare Task, and try again.
 - **Mid-batch cancellation**: the user can press Cancel Batch at any
   time. The orchestrator checks `batch.cancelled` between every
   internal phase transition (before each task, before each retry,
