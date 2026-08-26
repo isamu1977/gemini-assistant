@@ -1740,37 +1740,56 @@
             }
 
             // 2. Generate (status will go through sending ->
-            //    submitted -> waiting-for-generation -> generating ->
-            //    downloading -> task-complete).
-            batch.currentPhase = "generating";
-            onBatchProgress({
-              type: "phase",
-              taskId,
-              index: i,
-              phase: "generating",
-              attempt: attempts,
-            });
-            const genResult = await generateTask({
-              taskId,
-              prompt: null,
-              resolvedRefs: null,
-              generationStartTimeoutMs: 15000,
-              generationTimeoutMs: 60000,
-            });
-            const silentBail =
-              genResult &&
-              typeof genResult === "object" &&
-              genResult.silent === true;
-            if (silentBail) {
-              throw new Error(
-                `generateTask silent-bail: ${genResult.reason || "unknown"}`,
-              );
-            }
-            if (genResult !== true) {
-              throw new Error(
-                `generateTask returned ${JSON.stringify(genResult)}`,
-              );
-            }
+                        //    submitted -> waiting-for-generation -> generating ->
+                        //    downloading -> task-complete).
+                        batch.currentPhase = "generating";
+                        onBatchProgress({
+                          type: "phase",
+                          taskId,
+                          index: i,
+                          phase: "generating",
+                          attempt: attempts,
+                        });
+                        const genResult = await generateTask({
+                          taskId,
+                          prompt: taskInput.prompt,
+                          resolvedRefs: taskInput.resolvedRefs || null,
+                          generationStartTimeoutMs: 15000,
+                          generationTimeoutMs: 60000,
+                        });
+                        const silentBail =
+                          genResult &&
+                          typeof genResult === "object" &&
+                          genResult.silent === true;
+                        if (silentBail) {
+                          throw new Error(
+                            `generateTask silent-bail: ${genResult.reason || "unknown"}`,
+                          );
+                        }
+                        if (genResult !== true) {
+                          throw new Error(
+                            `generateTask returned ${JSON.stringify(genResult)}`,
+                          );
+                        }
+
+                        // 2b. v0.9.9: trigger the actual browser download. The
+                        // orchestrator transitions into 'downloading' phase but
+                        // does NOT fire the download — that's the side panel's
+                        // job (triggerAutoDownloadViaOfficialControl or the
+                        // parallel blob-extraction fallback). Without this call,
+                        // state.download never gets populated and the
+                        // waitForDownloadComplete poll would spin until timeout.
+                        if (typeof params.triggerDownload === "function") {
+                          batch.currentPhase = "downloading";
+                          onBatchProgress({
+                            type: "phase",
+                            taskId,
+                            index: i,
+                            phase: "downloading",
+                            attempt: attempts,
+                          });
+                          await params.triggerDownload({ taskId });
+                        }
 
             // 3. Wait for SW to confirm download.
             batch.currentPhase = "downloading";

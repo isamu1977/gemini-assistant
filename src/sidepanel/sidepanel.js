@@ -5585,6 +5585,27 @@
     const summary = await orchestrator.runBatch({
       taskIds: targetIds,
       taskResolverLookup: resolveTaskInputForBatch,
+      // v0.9.9: trigger the actual download after each task generates.
+      // The orchestrator drives Prepare → Generate → {downloads} → Reset.
+      // 'downloads' requires the side panel to call
+      // triggerAutoDownloadViaOfficialControl because only the side
+      // panel owns the download lifecycle (SW claims, official click,
+      // blob fallback).
+      triggerDownload: async ({ taskId: batchTaskId } = {}) => {
+        const cur = currentTask();
+        if (!cur) {
+          setStatusLine("warn", `No current task for download trigger (${batchTaskId}).`);
+          return;
+        }
+        try {
+          await triggerAutoDownloadViaOfficialControl(cur);
+        } catch (e) {
+          logWorkflow("error", "triggerDownload failed", {
+            taskId: batchTaskId,
+            error: e?.message ?? String(e),
+          });
+        }
+      },
       resetConversation,
       shouldContinue,
       maxRetries: 1,
