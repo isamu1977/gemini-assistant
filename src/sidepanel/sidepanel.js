@@ -5417,13 +5417,22 @@
     }
 
     // Pending = not yet generated (or marked redo).
-    const pending = allTasks
+    const projectTasks = Array.isArray(project.tasks) ? project.tasks : [];
+    const debugStatuses = [];
+    const pending = projectTasks
       .filter((t) => {
         const live = state.tasks && state.tasks[t.id];
         const status = (live && live.status) || t.status || "pending";
+        debugStatuses.push({ id: t.id, liveStatus: live?.status, taskStatus: t.status, resolved: status });
         return status !== "generated" && status !== "approved";
       })
       .map((t) => t.id);
+
+    logWorkflow("info", "Batch pending filter", {
+      total: projectTasks.length,
+      pending: pending.length,
+      statuses: debugStatuses,
+    });
 
     if (pending.length === 0) {
       setStatusLine("info", "All tasks already generated. Nothing to do.");
