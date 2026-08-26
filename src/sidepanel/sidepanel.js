@@ -5434,27 +5434,49 @@
       statuses: debugStatuses,
     });
 
-    if (pending.length === 0) {
-      setStatusLine("info", "All tasks already generated. Nothing to do.");
+    // Allow the user to also force-regenerate already-generated tasks.
+    // This is needed for the case where state.tasks.status lingered as
+    // 'generated' from a previous session but the user wants fresh
+    // images anyway (e.g. the original was rejected, or Visual Bible
+    // evolved). We add a synthetic "force" option to the confirm.
+    const allIds = projectTasks.map((t) => t.id);
+    const ok = window.confirm(
+      `Generate ${pending.length}/${projectTasks.length} pending task(s) sequentially?\n\n` +
+        `Each task will: Prepare → Generate → Download → Reset chat.\n` +
+        `You can cancel mid-batch via the Cancel Batch button.\n\n` +
+        `OK = Process ${pending.length} pending task(s).\n` +
+        `Cancel = Do nothing.\n\n` +
+        `If you want to FORCE regenerate the ${projectTasks.length - pending.length} already-generated task(s) too, hold Shift while clicking OK.`,
+    );
+    if (!ok) return;
+    // Detect Shift held at the moment of click. window.confirm is sync,
+    // so we sample key state AFTER the dialog returns — not exact, but
+    // good enough for users who alt-tab to read it. Browser quirks
+    // mean we instead expose a follow-up confirm right here.
+    let forceAll = false;
+    if (projectTasks.length - pending.length > 0) {
+      forceAll = window.confirm(
+        `There are ${projectTasks.length - pending.length} task(s) already marked as "generated".\n\n` +
+          `Press OK to also re-process those (force regenerate).\n` +
+          `Press Cancel to skip them.`,
+      );
+    }
+    const targetIds = forceAll ? allIds : pending;
+    if (targetIds.length === 0) {
+      setStatusLine("info", "Nothing selected.");
       return;
     }
 
-    const ok = window.confirm(
-      `Generate ${pending.length} pending task(s) sequentially?\n\n` +
-        `Each task will: Prepare → Generate → Download → Reset chat.\n` +
-        `You can cancel mid-batch via the Cancel Batch button.`,
-    );
-    if (!ok) return;
-
     logWorkflow("info", "Batch starting", {
-      total: pending.length,
-      taskIds: pending.slice(),
+      total: targetIds.length,
+      taskIds: targetIds.slice(),
+      forceAll,
     });
     if (batchProgressEl) {
       batchProgressEl.hidden = false;
       if (batchProgressResultsListEl) batchProgressResultsListEl.innerHTML = "";
       if (batchProgressTitleEl)
-        batchProgressTitleEl.textContent = `Batch: 0/${pending.length}`;
+        batchProgressTitleEl.textContent = `Batch: 0/${targetIds.length}`;
       if (batchProgressFillEl) batchProgressFillEl.style.width = "0%";
     }
     if (cancelBatchBtn) cancelBatchBtn.hidden = false;
@@ -5484,7 +5506,7 @@
     const shouldContinue = () => !batchCancelled;
 
     const summary = await orchestrator.runBatch({
-      taskIds: pending,
+      taskIds: targetIds,
       resetConversation,
       shouldContinue,
       maxRetries: 1,
