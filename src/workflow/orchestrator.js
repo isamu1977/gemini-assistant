@@ -1685,10 +1685,19 @@
             // taskResolverLookup hook (set via runBatch params). This
             // keeps the orchestrator itself free of UI/Project JSON
             // concerns.
-            const taskInput =
-              typeof params.taskResolverLookup === "function"
-                ? params.taskResolverLookup(taskId)
-                : null;
+            //
+            // v0.9.7: the hook is async — it may resolve the
+            // references from the File System Access API on-demand, so
+            // we must await the promise rather than treat it as a
+            // synchronous object (which would silently turn .prompt
+            // into undefined and trip the isString guard below).
+            if (typeof params.taskResolverLookup !== "function") {
+              throw new Error(
+                `runBatch: params.taskResolverLookup is not a function. ` +
+                  `Supply params.taskResolverLookup in the side-panel runBatch wrapper.`,
+              );
+            }
+            const taskInput = await params.taskResolverLookup(taskId);
             if (!taskInput || !isString(taskInput.prompt)) {
               throw new Error(
                 `runBatch: taskResolverLookup('${taskId}') did not return a valid prompt. ` +
