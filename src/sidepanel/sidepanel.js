@@ -5392,14 +5392,43 @@
    */
   async function resolveTaskInputForBatch(taskId) {
     const project = state.source && state.source.project;
-    if (!project) return null;
+    if (!project) {
+      logWorkflow("warn", "taskResolverLookup: no project", { taskId });
+      return null;
+    }
     const task = project.tasks.find((t) => t && t.id === taskId);
-    if (!task) return null;
+    if (!task) {
+      logWorkflow("warn", "taskResolverLookup: task not in project", {
+        taskId,
+        knownTaskIds: project.tasks.map((t) => t.id),
+      });
+      return null;
+    }
     const liveTask = state.tasks && state.tasks[taskId];
     // Use the live editable prompt if the user has edited it; otherwise
     // the project JSON's prompt.
     const prompt = (liveTask && liveTask.prompt) || task.prompt || "";
-    if (!prompt) return null;
+    logWorkflow("info", "taskResolverLookup trace", {
+      taskId,
+      liveTaskExists: !!liveTask,
+      liveTaskKeys: liveTask ? Object.keys(liveTask) : null,
+      liveTaskStatus: liveTask?.status,
+      liveTaskPromptType: typeof (liveTask && liveTask.prompt),
+      liveTaskPromptLength:
+        liveTask && liveTask.prompt ? String(liveTask.prompt).length : 0,
+      taskPromptLength: task.prompt ? String(task.prompt).length : 0,
+      resolvedPromptLength: prompt.length,
+      stateHasTasks: !!state.tasks,
+      stateTasksKeys: state.tasks ? Object.keys(state.tasks) : null,
+    });
+    if (!prompt) {
+      logWorkflow("warn", "taskResolverLookup: empty prompt", {
+        taskId,
+        liveTask,
+        taskPromptType: typeof task.prompt,
+      });
+      return null;
+    }
     const finalPrompt = projectLib.buildFinalPrompt(project, {
       ...task,
       id: taskId,
