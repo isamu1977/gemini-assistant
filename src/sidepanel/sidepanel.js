@@ -5359,6 +5359,8 @@
     const msg =
       `Task "${info.taskId}" failed at index ${info.index + 1}/${info.total}:\n\n` +
       `${info.error}\n\n` +
+      `Common cause: did you run "Prepare Task" once first to bind the references folder?\n` +
+      `Without Prepare Task, Gemini may treat the prompt as an upload and skip the download button.\n\n` +
       `What would you like to do?\n` +
       `OK = Stop batch\n` +
       `Cancel = Skip this task and continue with the next\n\n` +

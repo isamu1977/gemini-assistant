@@ -1678,6 +1678,30 @@
             // Reset orchestrator state for this task.
             reset({ id: taskId });
 
+            // v0.9.8: Reset the chat between retries. After a failure
+            // (download timeout, prepare-failed, etc.) the Angular
+            // host is left in an inconsistent state — generating the
+            // same prompt again without a full rebuild would just
+            // attach uploaded images, not create a real download
+            // button. We let the SW-side resetConversation callback
+            // handle this so retries always start from a fresh page.
+            if (attempts > 1) {
+              try {
+                const resetOk = await resetConversation();
+                recordGenerateTrace("batch-retry-reset", {
+                  taskId,
+                  attempt: attempts,
+                  ok: !!resetOk,
+                });
+              } catch (e) {
+                recordGenerateTrace("batch-retry-reset-error", {
+                  taskId,
+                  attempt: attempts,
+                  error: e?.message ?? String(e),
+                });
+              }
+            }
+
             // 1. Prepare
             // The orchestrator's prepareTask requires a prompt string
             // (orchestrator.js line 1058: "isString(params.prompt)"). We
@@ -1852,7 +1876,22 @@
             typeof decision === "string"
               ? decision
               : (decision && decision.action) || "stop";
-          if (action === "retry" && attempts <= maxRetries) {
+          // v0.9.8: detect download-timeout and recommend skip
+          // rather than retry — retries on the same Angular host
+          // produce attachment-as-upload images instead of real
+          // generations.
+          const isDownloadTimeout =
+            typeof taskError === "string" &&
+            (taskError.includes("download timeout") ||
+              taskError.includes("browser-download-not-detected"));
+          recordGenerateTrace("batch-failure-decision", {
+            taskId,
+            attempt: attempts,
+            error: taskError,
+            isDownloadTimeout,
+            userAction: action,
+          });
+          if (action === "retry" && attempts <= maxRetries && !isDownloadTimeout) {
             // Re-loop this task (attempts already incremented;
             // loop will retry up to maxRetries total).
             i--;
