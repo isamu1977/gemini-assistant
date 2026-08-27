@@ -666,11 +666,22 @@
   // ----- asset resolution -------------------------------------------------
 
   async function resolveCurrentRefs() {
+    return resolveCurrentRefsForTask(currentTaskId);
+  }
+
+  /**
+   * v0.9.12: Resolve refs for an arbitrary taskId (used by the batch
+   * loop, which needs to resolve refs for tasks other than the
+   * currently-displayed one).
+   */
+  async function resolveCurrentRefsForTask(taskId) {
     resolvedRefsCache = null;
-    const task = currentTask();
-    if (!task) return;
-    const rawRefs = projectLib.resolveReferences(state.source.project, task.id);
-    if (rawRefs.length === 0) return;
+    if (!taskId) return;
+    const rawRefs = projectLib.resolveReferences(state.source.project, taskId);
+    if (rawRefs.length === 0) {
+      resolvedRefsCache = [];
+      return;
+    }
     if (!folderHandle) {
       resolvedRefsCache = rawRefs.map((r) => ({
         id: r.id,
@@ -682,33 +693,44 @@
         error: "Bind the project folder to enable Attach",
         diagnostic: null,
       }));
+      resolvedRefsCache.__taskId = taskId;
       return;
     }
-    const results = await assetsLib.resolveReferences(folderHandle, rawRefs);
-    resolvedRefsCache = results.map((res, i) => {
-      const r = rawRefs[i];
-      const diagnostic =
-        res.state === "missing"
-          ? assetsLib.buildMissingDiagnostic({
-              asset: r,
-              directoryHandle: folderHandle,
-              expectedRelativePath: res.path,
-            })
-          : null;
-      return {
-        id: r.id,
-        label: r.label,
-        type: r.type,
-        file: r.file,
-        state: res.state,
-        fileObj: res.file ?? null,
-        error: res.error ?? null,
-        fileName: res.fileName ?? null,
-        fileType: res.fileType ?? null,
-        fileSize: res.fileSize ?? null,
-        diagnostic,
-      };
-    });
+    const previousTaskId = state.currentTaskId;
+    state.currentTaskId = taskId;
+    try {
+      const results = await assetsLib.resolveReferences(
+        folderHandle,
+        rawRefs,
+      );
+      resolvedRefsCache = results.map((res, i) => {
+        const r = rawRefs[i];
+        const diagnostic =
+          res.state === "missing"
+            ? assetsLib.buildMissingDiagnostic({
+                asset: r,
+                directoryHandle: folderHandle,
+                expectedRelativePath: res.path,
+              })
+            : null;
+        return {
+          id: r.id,
+          label: r.label,
+          type: r.type,
+          file: r.file,
+          state: res.state,
+          fileObj: res.file ?? null,
+          error: res.error ?? null,
+          fileName: res.fileName ?? null,
+          fileType: res.fileType ?? null,
+          fileSize: res.fileSize ?? null,
+          diagnostic,
+        };
+      });
+      resolvedRefsCache.__taskId = taskId;
+    } finally {
+      state.currentTaskId = previousTaskId;
+    }
   }
 
   // ----- render -----------------------------------------------------------
@@ -5410,19 +5432,6 @@
     // Use the live editable prompt if the user has edited it; otherwise
     // the project JSON's prompt.
     const prompt = (liveTask && liveTask.prompt) || task.prompt || "";
-    logWorkflow("info", "taskResolverLookup trace", {
-      taskId,
-      liveTaskExists: !!liveTask,
-      liveTaskKeys: liveTask ? Object.keys(liveTask) : null,
-      liveTaskStatus: liveTask?.status,
-      liveTaskPromptType: typeof (liveTask && liveTask.prompt),
-      liveTaskPromptLength:
-        liveTask && liveTask.prompt ? String(liveTask.prompt).length : 0,
-      taskPromptLength: task.prompt ? String(task.prompt).length : 0,
-      resolvedPromptLength: prompt.length,
-      stateHasTasks: !!state.tasks,
-      stateTasksKeys: state.tasks ? Object.keys(state.tasks) : null,
-    });
     if (!prompt) {
       logWorkflow("warn", "taskResolverLookup: empty prompt", {
         taskId,
@@ -5436,14 +5445,62 @@
       id: taskId,
       prompt,
     });
+    // v0.9.12: Make sure resolvedRefsCache is populated for THIS task.
+    // Each batch reset opens a new Gemini tab (clean state, no DOM
+    // attachments) but the in-memory cache persists across resets
+    // because resetConversationAndAdvance fires on the side panel's
+    // tab control, not by re-running Prepare. However, resolvedRefsCache
+    // is keyed to whichever task was CURRENT the last time Prepare ran
+    // — for batch we need it keyed to the new task. We force a
+    // re-resolve here when the requested taskId doesn't match what the
+    // cache was built for.
+    const cacheTaskId =
+      resolvedRefsCache && resolvedRefsCache.__taskId
+        ? resolvedRefsCache.__taskId
+        : null;
+    if (
+      !Array.isArray(resolvedRefsCache) ||
+      resolvedRefsCache.length === 0 ||
+      (cacheTaskId && cacheTaskId !== taskId)
+    ) {
+      try {
+        // Navigate to the task so currentTask() returns it, then
+        // resolveRefs. The reactive navigation also flips the side panel
+        // so the user sees progress even before the batch fires Generate.
+        // We avoid this when the cache is already populated for this
+        // task (the prepareTask that the user did once at the start).
+        await resolveCurrentRefsForTask(taskId);
+      } catch (e) {
+        logWorkflow("warn", "taskResolverLookup: failed to resolve refs", {
+          taskId,
+          error: e?.message ?? String(e),
+        });
+      }
+    }
     // Resolved refs must come from the live resolvedRefsCache; if the
     // cache is null, the user hasn't bound a folder or hasn't run Prepare
     // yet. In that case, fall back to an empty resolvedRefs array — the
     // orchestrator will skip attachment if there are none.
     const refs = Array.isArray(resolvedRefsCache) ? resolvedRefsCache : [];
     // Filter to only refs that match this task's references array.
+    // v0.9.12: log raw inputs so we can see WHY the filter ends up
+    // empty when the JSON declares refs but the resolvedRefsCache
+    // has a different id shape.
     const taskRefIds = new Set(task.references || []);
     const filteredRefs = refs.filter((r) => taskRefIds.has(r.id));
+    if (
+      task.references &&
+      task.references.length > 0 &&
+      filteredRefs.length === 0
+    ) {
+      logWorkflow("warn", "taskResolverLookup: no refs survived filter", {
+        taskId,
+        taskReferences: Array.from(taskRefIds),
+        cacheRefsCount: refs.length,
+        cacheRefIds: refs.map((r) => r.id),
+        cacheRefStates: refs.map((r) => ({ id: r.id, state: r.state })),
+      });
+    }
     const basename =
       (liveTask && liveTask.output && liveTask.output.basename) ||
       (task.output && task.output.basename) ||
