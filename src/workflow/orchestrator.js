@@ -434,22 +434,57 @@
 
         const realSize = arrayBuffer ? arrayBuffer.byteLength : ref.fileSize;
 
-        let res;
-        try {
-          res = await sendToTab({
-            type: "GEMINI_ASSISTANT_ATTACH_WITH_MENU",
-            file: ref.fileObj,
-            arrayBuffer,
-            byteArray: arrayBuffer ? Array.from(new Uint8Array(arrayBuffer)) : undefined,
-            fileName: ref.fileName,
-            fileType: ref.fileType,
-            fileSize: realSize,
-            sha256,
-            lastModified: ref.fileObj?.lastModified,
-            executionId: state.executionId,
-          });
-        } catch (e) {
-          res = { ok: false, error: e?.message ?? String(e) };
+        // v0.9.13 FIX: retry transient "Receiving end does not exist"
+        // errors caused by Gemini's Angular SPA tearing down the content
+        // port mid-batch (e.g. after a New Chat / reset). The 1st attach
+        // often succeeds because the page just navigated; the 2nd fires
+        // before Angular has rebound the handlers, and chrome.tabs
+        // .sendMessage rejects with runtime.lastError. After ~500ms the
+        // port is restored — we retry up to 3 times with backoff before
+        // surfacing the failure. This guarantees that a fully-prepared
+        // reference set always lands in the composer.
+        let res = null;
+        let lastTransientErr = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            res = await sendToTab({
+              type: "GEMINI_ASSISTANT_ATTACH_WITH_MENU",
+              file: ref.fileObj,
+              arrayBuffer,
+              byteArray: arrayBuffer ? Array.from(new Uint8Array(arrayBuffer)) : undefined,
+              fileName: ref.fileName,
+              fileType: ref.fileType,
+              fileSize: realSize,
+              sha256,
+              lastModified: ref.fileObj?.lastModified,
+              executionId: state.executionId,
+            });
+            if (res && res.ok) break;
+            // Non-ok response — check if it's the transient port error.
+            const errText = (res && (res.error || res.reason)) || "";
+            if (!/Receiving end does not exist|port closed|disconnected/i.test(errText)) {
+              // Not transient. Skip remaining retries.
+              break;
+            }
+            lastTransientErr = errText;
+            await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+          } catch (e) {
+            const errMsg = e?.message ?? String(e);
+            if (!/Receiving end does not exist|port closed|disconnected/i.test(errMsg)) {
+              res = { ok: false, error: errMsg };
+              break;
+            }
+            lastTransientErr = errMsg;
+            await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+          }
+        }
+        if (!res) {
+          res = {
+            ok: false,
+            error: lastTransientErr
+              ? `transient port error after 3 retries: ${lastTransientErr}`
+              : "no response from content script",
+          };
         }
 
         const entry = {
@@ -1639,7 +1674,7 @@
           if (dl && dl.ok === true && dl.status === "complete" && Number.isInteger(dl.downloadId)) {
             return true;
           }
-          if (dl && dl.status === "error") {
+          if (dl && (dl.status === "error" || dl.status === "failed")) {
             return false;
           }
           await new Promise((r) => setTimeout(r, 250));

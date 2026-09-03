@@ -278,6 +278,15 @@
 
     switch (msg.type) {
       case "GEMINI_ASSISTANT_PING": {
+        // v0.9.13 FIX: distinguish between "content script loaded but the
+        // DOM adapter (geminiDomAdapter.js) hasn't registered yet" and
+        // "everything is wired up". Sidepanel's waitForTabContentScriptReady
+        // now requires selfTest to be present (not just the content
+        // script). Without this, the ready-gate returns ok:true on the
+        // very first PING — before RedSunDomAdapter exists — and the
+        // orchestrator proceeds to sendTabMessage, which lands on a port
+        // that has nothing attached and gets "Receiving end does not
+        // exist" from the runtime.
         const adapter = globalThis.RedSunDomAdapter;
         let selfTestSafe = null;
         if (adapter && typeof adapter.selfTest === "function") {
@@ -288,11 +297,18 @@
             selfTestSafe = { error: e?.message ?? String(e) };
           }
         }
+        const adapterReady = !!(adapter && adapter.attachFileWithMenu);
         sendResponse({
-          ok: true,
+          ok: adapterReady,
           url: typeof location !== "undefined" ? location.href : "",
-          ready: !!adapter,
+          ready: adapterReady,
+          adapterLoaded: !!adapter,
           selfTest: selfTestSafe,
+          reason: adapterReady
+            ? null
+            : (adapter
+                ? "adapter-loaded-but-attach-method-missing"
+                : "adapter-not-yet-registered"),
         });
         return false;
       }
@@ -941,7 +957,7 @@
           sendResponse({ ok: false, error: "invalid url" });
           return false;
         }
-        fetch(url, { credentials: "include" })
+        fetch(url)
           .then(async (resp) => {
             if (!resp.ok) {
               sendResponse({
@@ -950,11 +966,22 @@
               });
               return;
             }
-            const mime = resp.headers.get("content-type") || "";
+            const mime = resp.headers.get("content-type") || "image/png";
             const ab = await resp.arrayBuffer();
+            const bytes = new Uint8Array(ab);
+            let binary = "";
+            const len = bytes.length;
+            const chunkSize = 32768;
+            for (let i = 0; i < len; i += chunkSize) {
+              binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunkSize, len)));
+            }
+            const base64 = btoa(binary);
+            const dataUrl = `data:${mime};base64,${base64}`;
             sendResponse({
               ok: true,
               arrayBuffer: ab,
+              base64,
+              dataUrl,
               mime,
               contentLength: ab.byteLength,
               finalUrl: resp.url || url,

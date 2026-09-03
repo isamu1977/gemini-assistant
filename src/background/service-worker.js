@@ -132,10 +132,21 @@ function isAcceptableFilename(filename) {
   return true;
 }
 
+function arrayBufferToDataUrl(arrayBuffer, mime) {
+  const bytes = new Uint8Array(arrayBuffer);
+  let binary = "";
+  const len = bytes.length;
+  const chunkSize = 32768;
+  for (let i = 0; i < len; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + chunkSize, len)));
+  }
+  return `data:${mime || "image/png"};base64,${btoa(binary)}`;
+}
+
 async function handleDownloadBlob(msg, sender) {
   const arrayBuffer = msg.arrayBuffer;
   const filename = msg.filename;
-  if (!arrayBuffer || typeof filename !== "string") {
+  if ((!arrayBuffer && !msg.dataUrl && !msg.base64) || typeof filename !== "string") {
     return { ok: false, error: "missing arrayBuffer or filename" };
   }
   if (!isAcceptableFilename(filename)) {
@@ -145,15 +156,22 @@ async function handleDownloadBlob(msg, sender) {
     return { ok: false, error: "chrome.downloads API unavailable" };
   }
 
-  let blob;
-  try {
-    blob = new Blob([arrayBuffer], {
-      type: typeof msg.mime === "string" ? msg.mime : "application/octet-stream",
-    });
-  } catch (e) {
-    return { ok: false, error: `Blob construction failed: ${e?.message ?? "unknown"}` };
+  let url = msg.dataUrl || (msg.base64 ? `data:${msg.mime || "image/png"};base64,${msg.base64}` : null);
+  if (!url && typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
+    try {
+      const blob = new Blob([arrayBuffer], {
+        type: typeof msg.mime === "string" ? msg.mime : "application/octet-stream",
+      });
+      url = URL.createObjectURL(blob);
+    } catch (_) {}
   }
-  const url = URL.createObjectURL(blob);
+  if (!url && arrayBuffer) {
+    try {
+      url = arrayBufferToDataUrl(arrayBuffer, msg.mime);
+    } catch (e) {
+      return { ok: false, error: `Data URL generation failed: ${e?.message ?? "unknown"}` };
+    }
+  }
   try {
     const downloadId = await chrome.downloads.download({
       url,
@@ -161,11 +179,30 @@ async function handleDownloadBlob(msg, sender) {
       conflictAction: "uniquify",
       saveAs: false,
     });
+    // v0.9.12 FIX: SW-initiated downloads (e.g. via blob fallback) must
+    // be tracked so chrome.downloads.onChanged can recognise them and
+    // post GEMINI_ASSISTANT_DOWNLOAD_STATE_CHANGED to the side panel.
+    // Without this, onChanged's trackedDownloads.get(d.id) lookup
+    // returns undefined and the listener silently no-ops, producing
+    // a 90-second "download timeout" even though the file was saved
+    // correctly to ~/Downloads/<folder>/<filename>.png.
+    trackDownload(
+      downloadId,
+      filename,
+      typeof msg.executionId === "string" ? msg.executionId : null,
+      typeof msg.taskId === "string" ? msg.taskId : null,
+    );
+    appendDownloadTrace("sw-trackDownload-blob-fallback", {
+      downloadId,
+      executionId: typeof msg.executionId === "string" ? msg.executionId : null,
+      taskId: typeof msg.taskId === "string" ? msg.taskId : null,
+      filename,
+    });
     return {
       ok: true,
       downloadId,
       finalFilename: filename,
-      bytes: arrayBuffer.byteLength ?? null,
+      bytes: (arrayBuffer && typeof arrayBuffer.byteLength === "number") ? arrayBuffer.byteLength : null,
     };
   } catch (e) {
     return {
@@ -173,13 +210,15 @@ async function handleDownloadBlob(msg, sender) {
       error: `chrome.downloads.download failed: ${e?.message ?? "unknown"}`,
     };
   } finally {
-    setTimeout(() => {
-      try {
-        URL.revokeObjectURL(url);
-      } catch (_) {
-        /* ignore */
-      }
-    }, 60_000);
+    if (url && url.startsWith("blob:") && typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") {
+      setTimeout(() => {
+        try {
+          URL.revokeObjectURL(url);
+        } catch (_) {
+          /* ignore */
+        }
+      }, 60_000);
+    }
   }
 }
 
@@ -387,6 +426,10 @@ if (
       url: (download.url || "").slice(0, 256),
     });
 
+    const isTracked = trackedDownloads.has(download.id);
+    const isGemini = isGeminiOriginatedDownload(download);
+    if (!isTracked && !isGemini) return;
+
     let matched = null;
     for (const [execId, claim] of expectedDownloadClaims) {
       if (claim.downloadId === download.id) {
@@ -394,8 +437,22 @@ if (
         break;
       }
     }
+    if (!matched && isTracked) {
+      const tracked = trackedDownloads.get(download.id);
+      if (tracked && tracked.executionId && expectedDownloadClaims.has(tracked.executionId)) {
+        matched = { execId: tracked.executionId, claim: expectedDownloadClaims.get(tracked.executionId) };
+      } else if (tracked) {
+        matched = {
+          execId: tracked.executionId || "tracked",
+          claim: {
+            taskId: tracked.taskId || null,
+            desiredFilename: tracked.requestedFilename,
+          },
+        };
+      }
+    }
     if (!matched) {
-      if (!isGeminiOriginatedDownload(download)) return;
+      if (!isGemini) return;
       matched = findActiveClaimForDownload(download);
       if (!matched) {
         appendDownloadTrace("filename-suggested", {
@@ -406,7 +463,7 @@ if (
       }
     }
 
-    if (!isGeminiOriginatedDownload(download)) {
+    if (!isTracked && !isGemini) {
       appendDownloadTrace("filename-suggested", {
         result: "not-gemini",
         downloadId: download.id,

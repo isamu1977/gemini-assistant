@@ -1,6 +1,10 @@
 # Gemini Assistant
 
-> **Status:** Active development (`v0.9.0+`). Plain JavaScript (Manifest V3 Side Panel) — no build step or bundler required.
+> [!WARNING]
+> **Status:** Projeto estacionado provisoriamente / Project temporarily on hold.
+> O desenvolvimento deste projeto está pausado no momento.
+
+> **Tech:** Plain JavaScript (Manifest V3 Side Panel) — no build step or bundler required.
 
 **Gemini Assistant** is a Chrome extension that turns `gemini.google.com` into a structured, scriptable target for multi-scene creative workflows. It is driven by a **Project JSON**, a **bound local project folder**, and a **list of tasks**. 
 
@@ -172,7 +176,7 @@ Gemini DOM Adapter (src/dom/geminiDomAdapter.js)
 ```
 
 For details on the batch processing architecture (lifecycle, callbacks,
-state, error handling, debugging), see [`docs/BATCH_PROCESSING.md`](docs/BATCH_PROCESSING.md).
+state, error handling, debugging), see [`docs/BATCH_PROCESSING.md`](docs/BATCH_PROCESSING.md). When the batch -> download -> rename pipeline breaks, start with [`docs/DIAGNOSTICO_BATCH_DOWNLOAD.md`](docs/DIAGNOSTICO_BATCH_DOWNLOAD.md) for an end-to-end flowchart and trace inspection guide..
 
 ---
 

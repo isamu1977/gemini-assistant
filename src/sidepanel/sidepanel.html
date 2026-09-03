@@ -399,12 +399,19 @@
       </div>
     </div>
 
+    <!--
+      Script load order matches tests/run.js: output.js MUST be loaded
+      BEFORE project.js so globalThis.GeminiAssistantOutput exists when
+      project.js validates the optional `task.output` block at parse
+      time. If you reorder, also keep them in sync with the comment at
+      the top of tests/run.js.
+    -->
+    <script src="../lib/output.js"></script>
+    <script src="../lib/storage.js"></script>
+    <script src="../lib/assets.js"></script>
+    <script src="../lib/messaging.js"></script>
     <script src="../lib/project.js"></script>
-      <script src="../lib/storage.js"></script>
-      <script src="../lib/assets.js"></script>
-      <script src="../lib/output.js"></script>
-      <script src="../lib/messaging.js"></script>
-      <script src="../workflow/orchestrator.js"></script>
-      <script src="sidepanel.js"></script>
+    <script src="../workflow/orchestrator.js"></script>
+    <script src="sidepanel.js"></script>
   </body>
 </html>

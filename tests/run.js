@@ -9697,6 +9697,112 @@ test("Race G: goNext and resetConversationAndAdvance emit forensic trace steps",
   assert(/--- NEXT TASK FORENSIC TRACE ---/.test(sp), "refreshSelfTest must expose NEXT TASK FORENSIC TRACE");
 });
 
+
+// ----- v0.9.12 fixes: blob-fallback trackDownload regression -----
+test("v0.9.12.fix1: handleDownloadBlob calls trackDownload so onChanged recognises blob-fallback downloads", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/background/service-worker.js"), "utf8");
+  const match = src.match(/async function handleDownloadBlob\([\s\S]*?\n\}\n/);
+  assert(match !== null, "could not locate handleDownloadBlob function body");
+  const body = match[0];
+  assert(
+    /trackDownload\s*\(/.test(body),
+    "handleDownloadBlob must call trackDownload() after chrome.downloads.download resolves",
+  );
+  assert(
+    /msg\.executionId/.test(body),
+    "handleDownloadBlob must forward executionId from msg into trackDownload",
+  );
+  assert(
+    /msg\.taskId/.test(body),
+    "handleDownloadBlob must forward taskId from msg into trackDownload",
+  );
+});
+
+test("v0.9.12.fix2: sidepanel DOWNLOAD_BLOB payload includes executionId and taskId", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // Pick the LAST occurrence (the one inside chrome.runtime.sendMessage).
+  const lastIdx = src.lastIndexOf("GEMINI_ASSISTANT_DOWNLOAD_BLOB");
+  assert(lastIdx >= 0, "DOWNLOAD_BLOB send not found in sidepanel.js");
+  const window = src.substring(Math.max(0, lastIdx - 100), lastIdx + 700);
+  assert(
+    /executionId\s*:/.test(window),
+    "sidepanel DOWNLOAD_BLOB send must include executionId field",
+  );
+  assert(
+    /taskId\s*:/.test(window),
+    "sidepanel DOWNLOAD_BLOB send must include taskId field",
+  );
+  // Sanity: executionId value must reference the orchestrator state.
+  assert(
+    /executionId:\s*orchestrator\.state\.executionId/.test(window),
+    "sidepanel DOWNLOAD_BLOB must read executionId from orchestrator.state",
+  );
+});
+
+
+test("v0.9.13.fix1: sidepanel defines waitForTabContentScriptReady helper", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  assert(
+    /async function waitForTabContentScriptReady\s*\(\s*tabId\s*,\s*timeoutMs\s*\)/.test(src),
+    "waitForTabContentScriptReady(tabId, timeoutMs) must be defined",
+  );
+  // Helper must reference PING message type.
+  assert(
+    /GEMINI_ASSISTANT_PING/.test(src),
+    "helper must send GEMINI_ASSISTANT_PING to probe the content script",
+  );
+});
+
+test("v0.9.13.fix2: OPEN_NEW_TAB path waits for content script before continuing", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  // The OPEN_NEW_TAB branch must call waitForTabContentScriptReady on the new tabId.
+  const openIdx = src.indexOf("GEMINI_ASSISTANT_OPEN_NEW_TAB");
+  assert(openIdx >= 0, "OPEN_NEW_TAB send not found");
+  const window = src.substring(openIdx, openIdx + 2400);
+  assert(
+    /waitForTabContentScriptReady\s*\(\s*newTabId/.test(window),
+    "OPEN_NEW_TAB branch must call waitForTabContentScriptReady(newTabId, ...)",
+  );
+  // Must emit a 'new-tab-ready' trace for observability.
+  assert(
+    /appendResetTrace\(\s*["']new-tab-ready["']/.test(window),
+    "OPEN_NEW_TAB must record a new-tab-ready trace step",
+  );
+});
+
+test("v0.9.13.fix3: RELOAD_TAB fallback path also waits for content script", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/sidepanel/sidepanel.js"), "utf8");
+  const reloadIdx = src.indexOf("GEMINI_ASSISTANT_RELOAD_TAB");
+  assert(reloadIdx >= 0, "RELOAD_TAB send not found");
+  const window = src.substring(reloadIdx, reloadIdx + 2400);
+  assert(
+    /waitForTabContentScriptReady\s*\(\s*pinnedGeminiTabId/.test(window),
+    "RELOAD_TAB fallback must await waitForTabContentScriptReady(pinnedGeminiTabId, ...)",
+  );
+});
+
+
+test("v0.9.13.fix4: orchestrator attachAll retries transient 'Receiving end does not exist' errors", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/workflow/orchestrator.js"), "utf8");
+  // Find attachAll's sendToTab region
+  const match = src.match(/async function attachAll\s*\([\s\S]*?\n\s{4}\}\s*\n/);
+  assert(match !== null, "could not locate attachAll function");
+  const body = match[0];
+  // Must contain a retry loop with backoff
+  assert(
+    /for\s*\(\s*let\s+attempt\s*=\s*0/.test(body),
+    "attachAll must have a retry loop around sendToTab",
+  );
+  assert(
+    /Receiving end does not exist/.test(body),
+    "attachAll retry must specifically catch 'Receiving end does not exist'",
+  );
+  assert(
+    /transient port error after 3 retries/.test(body),
+    "attachAll retry must surface a clear error after 3 attempts",
+  );
+});
+
 // ----- end ----------------------------------------------------------------
 
 

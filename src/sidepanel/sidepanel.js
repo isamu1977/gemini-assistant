@@ -517,6 +517,99 @@
     return tab;
   }
 
+
+  // v0.9.13 FIX: Wait until a Gemini tab's content script is reachable.
+  // chrome.tabs.create() returns a tabId almost instantly (the tab is
+  // still loading). Calling chrome.tabs.sendMessage on a tab whose
+  // content script isn't registered yet fails with
+  //   "Could not establish connection. Receiving end does not exist."
+  // which previously killed every retry and ended the batch on the
+  // first failure. Polling the PING endpoint until the content script
+  // replies — or the timeout fires — guarantees a hardened ready state.
+  //
+  // @param {number} tabId
+  // @param {number} timeoutMs  default 20000
+  // @returns {Promise<{ok: true, elapsedMs}|{ok: false, error, elapsedMs}>}
+  async function waitForTabContentScriptReady(tabId, timeoutMs) {
+    const start = Date.now();
+    const budget =
+      typeof timeoutMs === "number" && timeoutMs > 0 ? timeoutMs : 20000;
+    const POLL_MS = 250;
+
+    // Validate tab existence first (the new tab could be killed by the
+    // user between OPEN_NEW_TAB returning ok and us getting here).
+    try {
+      const tab = await new Promise((resolve, reject) => {
+        try {
+          chrome.tabs.get(tabId, (t) => {
+            if (chrome.runtime && chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            resolve(t || null);
+          });
+        } catch (e) {
+          reject(e instanceof Error ? e : new Error(String(e)));
+        }
+      });
+      if (!tab || !isGeminiUrl(tab.url)) {
+        return {
+          ok: false,
+          error: "tab-not-gemini-or-gone",
+          elapsedMs: Date.now() - start,
+          tabId,
+        };
+      }
+    } catch (e) {
+      return {
+        ok: false,
+        error: e?.message ?? String(e),
+        elapsedMs: Date.now() - start,
+        tabId,
+      };
+    }
+
+    while (Date.now() - start < budget) {
+      try {
+        const resp = await new Promise((resolve, reject) => {
+          chrome.tabs.sendMessage(
+            tabId,
+            { type: "GEMINI_ASSISTANT_PING" },
+            (r) => {
+              if (chrome.runtime && chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+                return;
+              }
+              resolve(r || null);
+            },
+          );
+        });
+        // v0.9.13 FIX: require BOTH ok:true AND ready:true. The content
+        // script may load before geminiDomAdapter.js self-registers
+        // (the manifest runs them sequentially but adapter has many
+        // class declarations before the globalThis.RedSunDomAdapter
+        // assignment, so there's a window where the port is up but
+        // attachFileWithMenu is undefined). Sending an attach call
+        // during that window produces "Could not establish connection.
+        // Receiving end does not exist." at the moment sendTabMessage's
+        // callback fires from a stale previous mount.
+        if (resp && resp.ok === true && resp.ready === true) {
+          return { ok: true, elapsedMs: Date.now() - start, tabId, response: resp };
+        }
+      } catch (_) {
+        /* still spinning up; keep polling */
+      }
+      await new Promise((r) => setTimeout(r, POLL_MS));
+    }
+
+    return {
+      ok: false,
+      error: "content-script-never-responded",
+      elapsedMs: Date.now() - start,
+      tabId,
+    };
+  }
+
   // High-level: resolve tab + send typed message. The orchestrator uses
   // this; the legacy single-attach / probe paths still use sendMessage
   // directly because they already validated the tab.
@@ -1455,6 +1548,36 @@
           previousPinnedTabId: pinnedGeminiTabId,
           newPinnedTabId: newTabId,
         });
+        // v0.9.13 FIX: chrome.tabs.create() returns instantly, but the
+        // content script is registered only AFTER the page loads. Block
+        // here until the new tab responds to PING (or the timeout
+        // fires). Without this, the next sendToGemini call — which is
+        // the prepareTask attach sequence — lands on the still-loading
+        // tab and chrome.tabs.sendMessage fails with "Receiving end
+        // does not exist", killing the batch.
+        try {
+          const ready = await waitForTabContentScriptReady(newTabId, 20000);
+          appendResetTrace("new-tab-ready", {
+            tabId: newTabId,
+            ok: !!ready?.ok,
+            elapsedMs: ready?.elapsedMs ?? null,
+            error: ready?.error ?? null,
+          });
+          if (!ready?.ok) {
+            appendResetTrace("new-tab-not-ready-warning", {
+              tabId: newTabId,
+              error: ready?.error ?? null,
+            });
+            // Continue anyway — the calling code will retry once or the
+            // user can recover via Retry Generate. We do NOT treat this
+            // as a hard failure because the user might have manually
+            // finished loading the page in the meantime.
+          }
+        } catch (e) {
+          appendResetTrace("new-tab-ready-exception", {
+            error: e?.message ?? String(e),
+          });
+        }
       }
     } catch (e) {
       appendResetTrace("new-tab-open-exception", {
@@ -1488,6 +1611,21 @@
           tabId: pinnedGeminiTabId,
           error: reloadRes?.error ?? null,
         });
+        // v0.9.13 FIX: same ready-gate as OPEN_NEW_TAB. chrome.tabs.update
+        // returns before the new page is loaded — wait for the content
+        // script to respond before subsequent sends.
+        if (reloadRes && reloadRes.ok && pinnedGeminiTabId != null) {
+          const ready = await waitForTabContentScriptReady(
+            pinnedGeminiTabId,
+            20000,
+          );
+          appendResetTrace("reload-tab-ready", {
+            tabId: pinnedGeminiTabId,
+            ok: !!ready?.ok,
+            elapsedMs: ready?.elapsedMs ?? null,
+            error: ready?.error ?? null,
+          });
+        }
       } catch (e) {
         appendResetTrace("tab-reload-fallback-exception", {
           error: e?.message ?? String(e),
@@ -4195,7 +4333,7 @@
     }
     // If status is error/failed, recover by clearing the error state
     // and resetting downloadClaimedAt so the SW can re-acquire.
-    if (cur_dl.status === "complete" || cur_dl.status === "error") {
+    if (cur_dl.status === "complete" || cur_dl.status === "error" || cur_dl.status === "failed") {
       logWorkflow(
         "info",
         "Blob-fallback recovering from terminal status",
@@ -4284,8 +4422,12 @@
           {
             type: "GEMINI_ASSISTANT_DOWNLOAD_BLOB",
             arrayBuffer: fetched.arrayBuffer,
+            dataUrl: fetched.dataUrl || null,
+            base64: fetched.base64 || null,
             filename: finalFilename,
             mime: fetched.mime || "image/png",
+            executionId: orchestrator.state.executionId,
+            taskId: cur?.id ?? null,
           },
           (resp) => {
             if (chrome.runtime.lastError) {
@@ -4550,26 +4692,18 @@
     );
     if (!clickRes || !clickRes.ok) {
       const clickErr = (clickRes && (clickRes.reason || clickRes.error)) || "click-failed";
-      orchestrator.state.download = {
-        ...orchestrator.state.download,
-        status: "failed",
-        ok: false,
-        error: clickErr,
-        downloadControlDetection:
-          (clickRes && clickRes.downloadControlDetection) || null,
-      };
+      logWorkflow(
+        "warn",
+        "Official download click was not available; transitioning immediately to blob fallback",
+        { reason: clickErr, taskId: cur?.id ?? null }
+      );
       appendDownloadTrace("official-download-control-click-attempt", {
         result: "failed",
         reason: clickErr,
         clickResponse: clickRes,
       });
-      if (typeof orchestrator.markDownloadFailed === "function") {
-        orchestrator.markDownloadFailed(clickErr);
-      }
-      setStatusLine("error", "Download was not detected by Chrome.");
-      forceUnlockAllButtons();
-      renderWorkflowState();
-      return false;
+      const task = (cur?.id && state.source?.project?.tasks?.find((t) => t.id === cur.id)) || currentTask() || cur;
+      return await triggerBlobExtractionFallback(task, orchestrator.state.baseline || baseline || null);
     }
 
     const pre = clickRes.preClick || {};
@@ -5681,7 +5815,7 @@
       // panel owns the download lifecycle (SW claims, official click,
       // blob fallback).
       triggerDownload: async ({ taskId: batchTaskId } = {}) => {
-        const cur = currentTask();
+        const cur = (batchTaskId && state.source?.project?.tasks?.find((t) => t.id === batchTaskId)) || currentTask();
         if (!cur) {
           setStatusLine("warn", `No current task for download trigger (${batchTaskId}).`);
           return;

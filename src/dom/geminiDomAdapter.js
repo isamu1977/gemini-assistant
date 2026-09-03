@@ -2924,7 +2924,7 @@
     // Tier 2: aria-label exact match.
     if (!button) {
       const labels = OFFICIAL_DOWNLOAD_ARIA_LABELS;
-      const candidates = Array.from(container.querySelectorAll("button, a, [role='button']"));
+      const candidates = Array.from(container.querySelectorAll("button, a, [role='button'], gem-icon-button, gem-button"));
       for (const b of candidates) {
         const aria = (b.getAttribute("aria-label") || "").trim();
         if (!aria) continue;
@@ -2940,7 +2940,7 @@
 
     // Tier 3: partial aria-label or tooltip match.
     if (!button) {
-      const candidates = Array.from(container.querySelectorAll("button, a, [role='button']"));
+      const candidates = Array.from(container.querySelectorAll("button, a, [role='button'], gem-icon-button, gem-button"));
       for (const b of candidates) {
         const aria = (b.getAttribute("aria-label") || b.getAttribute("data-tooltip") || "").toLowerCase();
         if (
@@ -2960,11 +2960,11 @@
 
     // Tier 4: mat-icon text content match (e.g. "download", "file_download").
     if (!button) {
-      const icons = Array.from(container.querySelectorAll("mat-icon"));
+      const icons = Array.from(container.querySelectorAll("mat-icon, gem-icon"));
       for (const icon of icons) {
         const txt = (icon.textContent || "").trim().toLowerCase();
-        if (txt === "download" || txt === "file_download" || txt === "get_app") {
-          button = icon.closest("button, [role='button'], a");
+        if (txt === "download" || txt === "file_download" || txt === "get_app" || txt === "save_alt") {
+          button = icon.closest("button, [role='button'], a, gem-icon-button, gem-button");
           if (button) break;
         }
       }
